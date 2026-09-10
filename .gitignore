@@ -3,6 +3,7 @@ __pycache__/
 *.log
 .pytest_cache/
 .mypy_cache/
+.ruff_cache/
 .coverage
 .venv/
 venv/
@@ -11,6 +12,10 @@ logs/
 captures/
 screenshots/
 *.csv
+*.avi
+*.mov
+*.mp4
+*.mkv
 .env
 .env.*
 !.env.example
