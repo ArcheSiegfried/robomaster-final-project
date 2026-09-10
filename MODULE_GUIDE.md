@@ -1,5 +1,9 @@
 # 模块接口与协作说明
 
+公共接口版本：**v0.1（2026-09-11 核验冻结）**。本轮没有改变字段或运行语义。
+
+`models.py`、`camera_source.py`、`runtime.py`、`motion_output.py` 和 `main.py` 构成公共边界。**普通模块开发者不得自行修改；需要变更时先向项目负责人提出。** v0.1 冻结的是现有字段、单位和调用顺序，不代表巡线参数已经实车验证。
+
 ## 1. 当前结构与启动
 
 生产路径：
@@ -159,7 +163,7 @@ class ExampleTask:
         )
 ```
 
-完整的接管、完成和恢复流程见 `examples/offline_takeover.py`，使用 `python -m examples.offline_takeover` 运行。该示例没有接入正式 `main.py`。
+完整的接管、完成和恢复流程见 `examples/offline_takeover.py`，使用 `python -m examples.offline_takeover` 运行。它用内存中的 `FakeChassis` 实际调用 `MotionOutput.claim()`、`send()` 和 `hard_stop()`，不会连接 SDK，也没有接入正式 `main.py`。
 
 ## 4. 独立测试方法
 
@@ -185,10 +189,10 @@ python -m unittest discover -s tests -v
 - 输入假设、关键阈值和场地依赖；
 - 没有虚拟环境、缓存、日志、密钥或大批原始录像。
 
-如果需要修改 `models.py`、`runtime.py`、`motion_output.py` 或 `main.py`，先说明现有接口为何不足，由项目维护者统一协调。不要在任务分支中顺手重构公共代码。
+如果需要修改 `models.py`、`camera_source.py`、`runtime.py`、`motion_output.py` 或 `main.py`，先说明现有接口为何不足，由整合负责人统一协调。不要在任务分支中顺手重构公共代码。
 
 ## 6. 最简 Git 协作
 
-领取任务后先同步基线，再使用短分支名，例如 `task/traffic-light`。一次提交只处理一个可说明的问题；提交前运行对应模块测试和完整离线测试。不要提交 `.venv`、缓存、日志、密钥或运行截图目录。
+领取任务后先同步 `integration`，再使用短分支名，例如 `feat/traffic-light` 或 `fix/line-loss`。一次提交只处理一个可说明的问题；提交前运行对应模块测试和完整离线测试。PR 目标必须是 `integration`。不要提交 `.venv`、缓存、日志、密钥或运行截图目录。
 
-熟悉 PR 的成员可以推送分支并提交 PR；尚不熟悉 PR 的成员可以配对开发，或向维护者交回源码、测试、样图和验证结果，由维护者统一集成。无论采用哪种方式，公共接口和主程序变更都先由项目维护者协调。
+完整的新手步骤见 `COLLABORATION_GUIDE.md`。尚不熟悉 PR 的成员可以配对开发，但仍应保留任务分支、源码、测试、样图和验证结果。公共接口和主程序变更都先由整合负责人协调。

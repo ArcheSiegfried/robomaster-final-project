@@ -220,6 +220,7 @@ class OfflineTests(unittest.TestCase):
                 "owner:external",
                 "task:running",
                 "task:completed",
+                "owner:line",
                 "line:TRACKING",
             ],
         )
