@@ -47,14 +47,15 @@ class _Checker(unittest.TestCase):
 def resolve(module_name):
     """Return (class, is_observer) for a registered module.
 
-    Accepts the registered `name` ("obstacle") or the file stem ("obstacle"), so
-    either spelling a member remembers will work.
+    Accepts the registered `name` ("obstacle"), the file stem ("obstacle") or
+    the file name ("obstacle.py"), so whatever a member types will work.
     """
+    wanted = module_name[:-3] if module_name.endswith(".py") else module_name
     for cls in task_registry.MOTION_TASK_CLASSES:
-        if module_name in (cls.name, pathlib.Path(module_file_for(cls)).stem):
+        if wanted in (cls.name, pathlib.Path(module_file_for(cls)).stem):
             return cls, False
     for cls in task_registry.OBSERVER_CLASSES:
-        if module_name in (cls.name, pathlib.Path(module_file_for(cls)).stem):
+        if wanted in (cls.name, pathlib.Path(module_file_for(cls)).stem):
             return cls, True
     return None, None
 
