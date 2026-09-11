@@ -170,7 +170,8 @@ class MainWiringTests(unittest.TestCase):
     def test_build_coordinator_wires_every_registered_module(self):
         follower = LineFollower(CONFIG)
         output = MotionOutput(FakeChassis(), CONFIG)
-        coordinator = main.build_coordinator(follower, output)
+        # capture_directory=None：测试不许在仓库里留 captures/。
+        coordinator = main.build_coordinator(follower, output, capture_directory=None)
         self.assertEqual(
             len(coordinator.motion_tasks), len(task_registry.MOTION_TASK_CLASSES)
         )
@@ -179,15 +180,23 @@ class MainWiringTests(unittest.TestCase):
         )
         self.assertIs(coordinator.follower, follower)
         self.assertIs(coordinator.output, output)
+        coordinator.close()
 
     def test_built_coordinator_keeps_the_robot_stopped_on_a_blank_frame(self):
         chassis = FakeChassis()
         follower = LineFollower(CONFIG)
         output = MotionOutput(chassis, CONFIG)
-        coordinator = main.build_coordinator(follower, output)
+        coordinator = main.build_coordinator(follower, output, capture_directory=None)
         coordinator.step(FramePacket(line_frame(), 1, 1.0), 1.0)
         self.assertFalse(chassis.motion_calls)
         self.assertEqual(coordinator.step(FramePacket(line_frame(), 2, 1.05), 1.05).owner, "line")
+        coordinator.close()
+
+    def test_evidence_recording_is_off_unless_a_directory_is_given(self):
+        """默认不写盘：observer 构造时零副作用，测试不会污染仓库。"""
+        for observer in task_registry.build_observers():
+            with self.subTest(observer=observer.name):
+                self.assertFalse(getattr(observer, "enabled", False))
 
 
 if __name__ == "__main__":

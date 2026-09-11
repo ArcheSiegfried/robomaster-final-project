@@ -40,6 +40,20 @@ def build_motion_tasks():
     return tuple(cls() for cls in MOTION_TASK_CLASSES)
 
 
-def build_observers():
-    """Instantiate every registered observer module."""
-    return tuple(cls() for cls in OBSERVER_CLASSES)
+def build_observers(capture_directory=None):
+    """Instantiate every registered observer module.
+
+    `capture_directory` 是证据记录的输出目录：
+      * `None`（这里是默认值）= **完全不写盘**，测试和离线工具用它；
+      * 真实运行由 `main.build_coordinator()` 传入 `captures/`。
+
+    默认不写盘是刻意的：观察者必须在被创建时零副作用，否则跑一次测试就会在
+    仓库里留下一个 captures/ 目录。
+    """
+    built = []
+    for cls in OBSERVER_CLASSES:
+        if cls is EvidenceRecorder:
+            built.append(cls(directory=capture_directory))
+        else:
+            built.append(cls())
+    return tuple(built)
