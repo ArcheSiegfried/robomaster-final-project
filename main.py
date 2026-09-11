@@ -6,34 +6,57 @@ import cv2
 
 from camera_source import LatestFrameSource
 from config import CONFIG
+from coordinator import TaskCoordinator
 from motion_output import MotionOutput
 from runtime import LineFollower
+from task_registry import build_motion_tasks, build_observers
+
+
+def build_coordinator(follower, output, settings=CONFIG):
+    """Wire every registered module into the coordinator.
+
+    Kept as a named factory so tests can build the real wiring, and assert that
+    every module in task_registry is actually reachable, without any hardware.
+    """
+    return TaskCoordinator(
+        settings,
+        follower,
+        output,
+        motion_tasks=build_motion_tasks(),
+        observers=build_observers(),
+    )
 
 
 def draw_debug(frame, decision):
     shown = frame.copy()
-    left, top, right, bottom = decision.detection.roi
-    cv2.rectangle(shown, (left, top), (right, bottom), (180, 180, 180), 1)
-    if decision.detection.contour is not None:
-        cv2.drawContours(
-            shown, [decision.detection.contour], -1, (0, 255, 0), 2
+    line = decision.line
+    if line is not None:
+        left, top, right, bottom = line.detection.roi
+        cv2.rectangle(shown, (left, top), (right, bottom), (180, 180, 180), 1)
+        if line.detection.contour is not None:
+            cv2.drawContours(
+                shown, [line.detection.contour], -1, (0, 255, 0), 2
+            )
+        points = (
+            (line.detection.near_point, (0, 255, 255)),
+            (line.detection.far_point, (255, 255, 0)),
         )
-    points = (
-        (decision.detection.near_point, (0, 255, 255)),
-        (decision.detection.far_point, (255, 255, 0)),
-    )
-    for point, color in points:
-        if point is not None:
-            cv2.circle(shown, point, 5, color, -1)
+        for point, color in points:
+            if point is not None:
+                cv2.circle(shown, point, 5, color, -1)
     label = (
-        f"{decision.state} "
+        f"{decision.state} owner={decision.owner} "
         f"v={decision.command.forward:.2f} "
         f"yaw={decision.command.yaw:.0f}"
     )
+    if decision.task_name:
+        label = f"{label} task={decision.task_name}"
     color = (0, 0, 255) if decision.force_stop else (0, 255, 0)
     cv2.putText(
         shown, label, (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2
     )
+    if line is not None:
+        cv2.imshow("Line mask", line.detection.mask)
     return shown
 
 
@@ -81,6 +104,7 @@ def main() -> None:
     try:
         ep_robot.initialize(conn_type="ap", proto_type="udp")
         output = MotionOutput(ep_robot.chassis, CONFIG)
+        coordinator = build_coordinator(follower, output)
         _align_camera(ep_robot, output, robot)
         resolution_name = f"STREAM_{CONFIG.camera_resolution.upper()}"
         resolution = getattr(camera, resolution_name)
@@ -97,7 +121,10 @@ def main() -> None:
         if CONFIG.display:
             cv2.namedWindow("Low-speed line base")
             cv2.namedWindow("Line mask")
-        print("Ready and stopped. SPACE resume/pause, R reset, Q/ESC quit.")
+        print(
+            "Ready and stopped. SPACE resume/pause, R reset, Q/ESC quit. "
+            f"{len(coordinator.motion_tasks)} task module(s) registered."
+        )
 
         while True:
             if not _main_window_open():
@@ -108,26 +135,19 @@ def main() -> None:
             now = time.monotonic()
             if packet is None:
                 if have_frame:
-                    decision = follower.process_video_gap(source.age(now), now)
+                    decision = coordinator.video_gap(source.age(now), now)
                     if decision.force_stop:
                         output.hard_stop()
                 key = cv2.waitKey(1) & 0xFF if CONFIG.display else -1
             else:
                 have_frame = True
                 last_sequence = packet.sequence
-                decision = follower.process_frame(
-                    packet.image, packet.captured_at
-                )
-                if decision.force_stop:
-                    output.hard_stop()
-                elif follower.motion_enabled:
-                    output.send("line", decision.command)
+                decision = coordinator.step(packet, now)
                 if CONFIG.display:
                     cv2.imshow(
                         "Low-speed line base",
                         draw_debug(packet.image, decision),
                     )
-                    cv2.imshow("Line mask", decision.detection.mask)
                 key = cv2.waitKey(1) & 0xFF if CONFIG.display else -1
 
             if not _main_window_open():
@@ -136,15 +156,11 @@ def main() -> None:
             if key in (ord("q"), 27):
                 break
             if key == ord("r"):
-                follower.reset_fault(now)
-                output.hard_stop()
-                print("Reset: stopped; show a valid line, then press SPACE.")
+                print(coordinator.human_reset(now))
             elif key == ord(" "):
-                if follower.motion_enabled:
-                    follower.pause(now)
-                    output.hard_stop()
-                    print("Paused.")
-                elif follower.resume(now):
+                if coordinator.task_active or follower.motion_enabled:
+                    print(coordinator.human_stop(now))
+                elif coordinator.human_resume(now):
                     print("Resumed on a fresh valid line.")
                 else:
                     print("Resume refused: reset fault and show a fresh line.")
