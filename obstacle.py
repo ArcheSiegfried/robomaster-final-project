@@ -26,9 +26,19 @@
   * 绕完之后"硬停车 -> 交回巡线 -> 清历史 -> 等一张新鲜有效线 -> 自动恢复"。
     所以这里绕完直接返回 COMPLETED，不自己判断"线回来了没有"。
 
+交回要求 v2（针对 v1 审核报告的两条实车风险做的修改）：
+  * 风险 1「暗色 HSV 区间太宽，会把车的影子当障碍」-> 默认**只留橙色系**，
+    暗色那一档注释掉了，现场确认道具颜色后再决定是否打开。
+  * 风险 2「同一个障碍反复触发绕行」-> 冷却从 1.5 秒提到 5 秒，
+    并加"同一段路最多连绕 MAX_CONSECUTIVE_DODGES 次"的上限：
+    到达上限后接管一帧、下一帧直接 FAILED，让协调器硬停车要人来看，
+    而不是没完没了地绕。障碍消失 CLEAR_SECONDS 之后计数归零。
+  * 另：去掉 `import cv2` 的静默兜底（缺 OpenCV 时直接 import 失败，别悄悄变成"永远没障碍"）；
+    绕行途中不再重复跑检测。
+
 我自己拍板的假设（不知道真场地规则，先按这组来；全部是下面一节的常量，随时能改）
   假设 1：障碍是一个立在路线上、挡住去路的东西，颜色明显区别于蓝色跑道和浅色地面。
-          默认按"橙色系 + 暗色系"两段 HSV 区间找；**真道具什么颜色必须现场调参**。
+          默认只按"橙色系"一段 HSV 区间找；**真道具什么颜色必须现场调参**。
   假设 2：赛道够宽，车往一侧平移大约半个车身就能绕过去。默认往**左**绕
           （MotionCommand 约定 lateral 正值向右，所以往左是负值）。
   假设 3：绕行用三段式够用——先侧移让开、再直行越过、再侧移回中线。
@@ -39,6 +49,9 @@
 
 from typing import Optional
 
+import cv2
+import numpy as np
+
 from models import (
     FramePacket,
     MotionCommand,
@@ -46,13 +59,6 @@ from models import (
     TaskUpdate,
     VisualDetection,
 )
-
-try:  # 让本文件在没装 OpenCV 的机器上也能被 import
-    import cv2
-    import numpy as np
-except Exception:  # pragma: no cover
-    cv2 = None
-    np = None
 
 KIND = "obstacle"
 
@@ -78,7 +84,9 @@ T_BACK_TIME = 0.90           # 第 3 段：往回收、回到线的附近
 # --- 硬性保护 ---
 MAX_TOTAL_TIME = 6.00        # 整段绕行最长 6 秒，超了立刻停车报 FAILED
 CONFIRM_FRAMES = 3           # 连续 3 帧都看到障碍，才算"真有障碍"
-REARM_SECONDS = 1.50         # 一次绕行结束后，这段时间内不再重新接管
+REARM_SECONDS = 5.00         # 一次绕行结束后，这段时间内不再重新接管
+MAX_CONSECUTIVE_DODGES = 2   # 同一段路最多连绕 2 次，第 3 次直接停车要人来看
+CLEAR_SECONDS = 3.00         # 画面里连续这么久没有障碍，就认为换了段路，连绕计数归零
 
 # --- 障碍检测：ROI（画面比例 x1, y1, x2, y2），只看画面下半部分中间这条带 ---
 OBSTACLE_ROI = (0.20, 0.45, 0.80, 0.95)
@@ -101,10 +109,15 @@ SCORE_WIDTH_W = 0.6          # 越宽（越挡路）优先
 SCORE_TOTAL_W = SCORE_AREA_W + SCORE_LOWER_W + SCORE_CENTER_W + SCORE_WIDTH_W
 
 # --- 障碍颜色（HSV，OpenCV 的 H 是 0~179）---
-# 默认取"橙色系"和"暗色系（偏黑）"两组。真道具换成什么颜色，改这里即可。
+# 默认**只留橙色系**。真道具换成什么颜色，改这里即可。
+#
+# 关于"暗色系"：曾经加过一条 ((0,0,0),(180,255,70))，含义是"H 0~180 全色相、S 0~255 全饱和、V<=70"，
+# 也就是"任何够暗的像素，不管什么颜色"。审核用合成灰阶实测过：亮度 <=70 的灰块 100% 被判成障碍，
+# 而车自己的影子、场地深色接缝、桌腿阴影全都在这个范围里，面积轻松超过下面两个面积阈值。
+# 所以**默认关掉**。现场确认道具确实是黑色、且不受阴影干扰时，再把下面那行注释打开。
 OBSTACLE_HSV_RANGES = (
     ((5, 90, 80), (25, 255, 255)),      # 橙色系
-    ((0, 0, 0), (180, 255, 70)),        # 暗色系
+    # ((0, 0, 0), (180, 255, 70)),      # 暗色系：误吞阴影，现场确认后再打开
 )
 
 
@@ -133,7 +146,7 @@ class ObstacleDetector:
     def detect(self, image) -> VisualDetection:
         """返回整幅图像坐标的 VisualDetection；没有障碍返回 no_result。"""
         self.last_candidates = 0
-        if cv2 is None or np is None or image is None:
+        if image is None:
             return VisualDetection.no_result(KIND)
 
         height, width = image.shape[:2]
@@ -233,6 +246,13 @@ class ObstacleTask:
         self.segment_started_at = None
         self.hit_frames = 0
         self.finished_at = None
+        # 同一段路上连续绕了几次；连绕太多说明"障碍"很可能根本绕不过去，
+        # 或者那压根不是障碍（比如永久阴影），这时候停车让人来看，比一直绕安全。
+        self.dodge_count = 0
+        self.last_seen_at = None
+        # 到达连绕上限后置位：不再接管，免得变成"每几秒停一下"的走走停停。
+        # 只有障碍消失 CLEAR_SECONDS 之后才解锁。
+        self.locked = False
 
     # ---------------- 对外 ----------------
 
@@ -242,18 +262,26 @@ class ObstacleTask:
 
     def step(self, frame: FramePacket, now: float) -> TaskUpdate:
         """主循环每帧调用一次，必须立刻返回。"""
-        detection = self.detect(frame.image)
-        self.last_detection = detection
-
         if self.stage == "IDLE":
+            detection = self.detect(frame.image)
+            self.last_detection = detection
             return self._step_idle(detection, now)
+        # 绕行途中不再重复检测：结果只用于上报，不参与决策，没必要白烧 CPU
         return self._step_active(now)
 
     # ---------------- 还没接管：判断要不要管 ----------------
 
     def _step_idle(self, detection: VisualDetection, now: float) -> TaskUpdate:
+        # 画面里障碍消失够久 -> 认为换了一段路，连绕计数归零、解锁
+        if detection.valid:
+            self.last_seen_at = now
+        elif self.last_seen_at is not None and now - self.last_seen_at >= CLEAR_SECONDS:
+            self.dodge_count = 0
+            self.locked = False
+            self.last_seen_at = None
+
         if self.finished_at is not None and now - self.finished_at < REARM_SECONDS:
-            # 刚绕完，别对着同一个（可能还在画面里的）障碍再来一次
+            # 刚绕完，别对着同一个（可能还在画面里的）障碍马上再来一次
             return TaskUpdate(
                 TaskStatus.NOT_TRIGGERED, detection=detection, message="re-arm cooldown"
             )
@@ -264,6 +292,15 @@ class ObstacleTask:
                 TaskStatus.NOT_TRIGGERED, detection=detection, message="no obstacle"
             )
 
+        if self.locked:
+            # 已经连绕到上限、也失败过一次了：不再插手，等障碍消失后再解锁。
+            return TaskUpdate(
+                TaskStatus.NOT_TRIGGERED,
+                detection=detection,
+                message="locked after %d dodges; waiting for the obstacle to clear"
+                % self.dodge_count,
+            )
+
         self.hit_frames += 1
         if self.hit_frames < CONFIRM_FRAMES:
             # 连确认帧数都不够，还不能接管
@@ -271,6 +308,22 @@ class ObstacleTask:
                 TaskStatus.NOT_TRIGGERED,
                 detection=detection,
                 message="candidate %d/%d" % (self.hit_frames, CONFIRM_FRAMES),
+            )
+
+        if self.dodge_count >= MAX_CONSECUTIVE_DODGES:
+            # 已经连绕这么多次、障碍还在：先接管（协调器只认 RUNNING），
+            # 下一帧立刻 FAILED，让它硬停车交给人看；同时上锁不再接管，
+            # 免得变成"每几秒停一下"的走走停停。
+            self.locked = True
+            self.stage = "ABORT"
+            self.started_at = now
+            self.segment_started_at = now
+            return TaskUpdate(
+                TaskStatus.RUNNING,
+                motion=MotionCommand(),
+                detection=detection,
+                message="dodged %d times in a row and it is still there; stopping"
+                % self.dodge_count,
             )
 
         self.stage = "HOLD"
@@ -286,6 +339,14 @@ class ObstacleTask:
     # ---------------- 已经接管：一步一步绕 ----------------
 
     def _step_active(self, now: float) -> TaskUpdate:
+        if self.stage == "ABORT":
+            return self._finish(
+                TaskStatus.FAILED,
+                "obstacle still there after %d dodges; stopped for a human check"
+                % self.dodge_count,
+                now,
+            )
+
         if now - self.started_at > MAX_TOTAL_TIME:
             return self._finish(
                 TaskStatus.FAILED,
@@ -330,6 +391,9 @@ class ObstacleTask:
         self.segment_started_at = now
 
     def _finish(self, status: TaskStatus, message: str, now: float) -> TaskUpdate:
+        if status is TaskStatus.COMPLETED:
+            # 只有真正绕过去一次才计数；连绕太多会触发上面的 ABORT 保护
+            self.dodge_count += 1
         self.stage = "IDLE"
         self.hit_frames = 0
         self.started_at = None
