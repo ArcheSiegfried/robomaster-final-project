@@ -209,7 +209,8 @@ python -m unittest discover -s tests -v
 | `traffic_light.py` | `TrafficLightTask` | 接管型 |
 | `obstacle.py` | `ObstacleTask` | 接管型 |
 | `route.py` | `RouteTask` | 接管型 |
-| `junction.py` | `JunctionTask` | 接管型 |
+| `green_junction.py` | `GreenJunctionTask` | 接管型 |
+| `free_junction.py` | `FreeJunctionTask` | 接管型 |
 | `evidence.py` | `EvidenceRecorder` | 观察型（基础设施，由整合负责人维护，不占名额） |
 
 每个文件已在 `task_registry.py` 里登记好，组员**只替换文件内容**即可：

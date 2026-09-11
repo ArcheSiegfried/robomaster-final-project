@@ -11,7 +11,8 @@
 """
 
 from evidence import EvidenceRecorder
-from junction import JunctionTask
+from free_junction import FreeJunctionTask
+from green_junction import GreenJunctionTask
 from number_marker import NumberMarkerTask
 from obstacle import ObstacleTask
 from route import RouteTask
@@ -21,8 +22,9 @@ from traffic_light import TrafficLightTask
 MOTION_TASK_CLASSES = (
     TrafficLightTask,  # 红灯是停车条件，最先判断
     NumberMarkerTask,
-    JunctionTask,
-    RouteTask,
+    GreenJunctionTask,  # 绿灯岔路
+    FreeJunctionTask,  # 无拥堵岔路
+    RouteTask,  # 长断线巡回
     ObstacleTask,  # 动作最复杂，放最后
 )
 

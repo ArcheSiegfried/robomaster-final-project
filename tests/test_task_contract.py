@@ -36,7 +36,8 @@ EXPECTED_MODULE_FILES = {
     "traffic_light.py": "step",
     "obstacle.py": "step",
     "route.py": "step",
-    "junction.py": "step",
+    "green_junction.py": "step",
+    "free_junction.py": "step",
     "evidence.py": "observe",
 }
 
