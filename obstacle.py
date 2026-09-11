@@ -33,8 +33,8 @@
 轮廓筛选框架可以借 blue_line_following/blue_line_detector.py:186-236。
 横移量级参考竞速工程 config.py 的 MAX_LATERAL_SPEED=0.25 m/s。
 
-先看 tests/test_obstacle_task.py 的用例区再动手。
-单独自测：python scripts/check_module.py obstacle_task
+先看 tests/test_obstacle.py 的用例区再动手。
+单独自测：python scripts/check_module.py obstacle
 """
 
 from typing import Optional

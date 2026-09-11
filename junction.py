@@ -32,8 +32,8 @@
   * 单个任务连续接管超过 20 秒会被强制释放并硬停车；
   * 完成后骨架会硬停车、清巡线历史、等一张新鲜有效路线再恢复。
 
-先看 tests/test_junction_task.py 的用例区再动手。
-单独自测：python scripts/check_module.py junction_task
+先看 tests/test_junction.py 的用例区再动手。
+单独自测：python scripts/check_module.py junction
 """
 
 from typing import Optional

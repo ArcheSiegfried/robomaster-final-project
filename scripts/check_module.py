@@ -47,8 +47,8 @@ class _Checker(unittest.TestCase):
 def resolve(module_name):
     """Return (class, is_observer) for a registered module.
 
-    Accepts either the registered `name` ("route") or the file stem
-    ("route_task"), because members will type whichever one they remember.
+    Accepts the registered `name` ("obstacle") or the file stem ("obstacle"), so
+    either spelling a member remembers will work.
     """
     for cls in task_registry.MOTION_TASK_CLASSES:
         if module_name in (cls.name, pathlib.Path(module_file_for(cls)).stem):
@@ -62,8 +62,8 @@ def resolve(module_name):
 def module_file_for(cls):
     """The real source file of a registered class.
 
-    A module's `name` and its filename need not match (obstacle -> obstacle_task.py),
-    so never guess the filename from the name.
+    Filenames and `name` values are 1:1 by convention (obstacle -> obstacle.py),
+    but never guess the path from the name: read it from the imported class.
     """
     return pathlib.Path(inspect.getsourcefile(cls)).name
 

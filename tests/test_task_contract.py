@@ -28,14 +28,15 @@ from models import FramePacket, TaskUpdate
 from motion_output import MotionOutput
 from runtime import LineFollower
 
-# The six module slots that ship with the skeleton. Each one is one person's
-# file. "step" means it may take over motion; "observe" means it never may.
+# One file per person, one person per file. "step" means the module may take
+# over motion; "observe" means it never may.
+# evidence.py is infrastructure owned by the integration person, not a slot.
 EXPECTED_MODULE_FILES = {
     "number_marker.py": "step",
     "traffic_light.py": "step",
-    "obstacle_task.py": "step",
-    "route_task.py": "step",
-    "junction_task.py": "step",
+    "obstacle.py": "step",
+    "route.py": "step",
+    "junction.py": "step",
     "evidence.py": "observe",
 }
 

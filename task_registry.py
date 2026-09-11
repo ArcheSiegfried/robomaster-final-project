@@ -11,13 +11,13 @@
 """
 
 from evidence import EvidenceRecorder
-from junction_task import JunctionTask
+from junction import JunctionTask
 from number_marker import NumberMarkerTask
-from obstacle_task import ObstacleTask
-from route_task import RouteTask
+from obstacle import ObstacleTask
+from route import RouteTask
 from traffic_light import TrafficLightTask
 
-# 可以接管运动的模块，顺序即优先级。
+# 功能模块：一个文件 = 一个名额 = 一个人。顺序即接管优先级。
 MOTION_TASK_CLASSES = (
     TrafficLightTask,  # 红灯是停车条件，最先判断
     NumberMarkerTask,
@@ -26,7 +26,8 @@ MOTION_TASK_CLASSES = (
     ObstacleTask,  # 动作最复杂，放最后
 )
 
-# 每帧都会看到，但永远不能接管运动的模块。
+# 基础设施观察者：每帧都能看到，但永远不能接管运动。
+# 这**不是**功能模块名额，由整合负责人维护，不单独占一个人。
 OBSERVER_CLASSES = (
     EvidenceRecorder,
 )

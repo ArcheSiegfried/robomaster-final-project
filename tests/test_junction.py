@@ -18,13 +18,13 @@ from tests.task_harness import (  # noqa: E402
     assert_module_source_is_clean,
 )
 
-from junction_task import JunctionTask  # noqa: E402
+from junction import JunctionTask  # noqa: E402
 
 
 class JunctionContractTests(unittest.TestCase):
     def test_module_source_obeys_the_safety_rules(self):
         """不得碰 SDK、相机、MotionOutput，不得阻塞或写死绝对路径。"""
-        assert_module_source_is_clean(self, "junction_task.py")
+        assert_module_source_is_clean(self, "junction.py")
 
     def test_does_not_take_over_on_a_single_line_frame(self):
         """合成帧里只有一条线，没有岔路。
@@ -47,7 +47,7 @@ class JunctionContractTests(unittest.TestCase):
 # 所以这个名额是从零写，先和负责人确认场地几何再动手。
 #
 # 单独自测命令：
-#   python scripts/check_module.py junction_task
+#   python scripts/check_module.py junction
 # ============================================================================
 
 

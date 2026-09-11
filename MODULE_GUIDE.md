@@ -201,7 +201,18 @@ python -m unittest discover -s tests -v
 
 ### 6.1 文件与登记
 
-每个模块一个文件放在仓库根目录，并在 `task_registry.py` 里登记一次：
+**一个文件 = 一个功能模块 = 一个人**，文件名与模块名一一对应：
+
+| 文件 | 类 | 类型 |
+|---|---|---|
+| `number_marker.py` | `NumberMarkerTask` | 接管型 |
+| `traffic_light.py` | `TrafficLightTask` | 接管型 |
+| `obstacle.py` | `ObstacleTask` | 接管型 |
+| `route.py` | `RouteTask` | 接管型 |
+| `junction.py` | `JunctionTask` | 接管型 |
+| `evidence.py` | `EvidenceRecorder` | 观察型（基础设施，由整合负责人维护，不占名额） |
+
+每个文件已在 `task_registry.py` 里登记好，组员**只替换文件内容**即可：
 
 ```python
 MOTION_TASK_CLASSES = (TrafficLightTask, NumberMarkerTask, ...)  # 可接管运动，顺序即优先级

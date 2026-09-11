@@ -18,13 +18,13 @@ from tests.task_harness import (  # noqa: E402
     assert_module_source_is_clean,
 )
 
-from obstacle_task import ObstacleTask  # noqa: E402
+from obstacle import ObstacleTask  # noqa: E402
 
 
 class ObstacleContractTests(unittest.TestCase):
     def test_module_source_obeys_the_safety_rules(self):
         """不得碰 SDK、相机、MotionOutput，不得阻塞或写死绝对路径。"""
-        assert_module_source_is_clean(self, "obstacle_task.py")
+        assert_module_source_is_clean(self, "obstacle.py")
 
     def test_does_not_take_over_on_a_plain_line_frame(self):
         """合成帧里只有一条蓝线，没有任何障碍。
@@ -49,7 +49,7 @@ class ObstacleContractTests(unittest.TestCase):
 # 轮廓筛选框架可以借 blue_line_detector.py:186-236。
 #
 # 单独自测命令：
-#   python scripts/check_module.py obstacle_task
+#   python scripts/check_module.py obstacle
 # ============================================================================
 
 

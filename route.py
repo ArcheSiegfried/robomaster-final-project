@@ -45,8 +45,8 @@ lost_grace_seconds（0.28 秒）来冒充。基础底座的短时容错归巡线
   * blue_line_following/race_v32_config.py:58-63
       —— 断口两侧真实线段按几何关系续连的参数（GAP_FRAGMENT_*）
 
-先看 tests/test_route_task.py 的用例区再动手。
-单独自测：python scripts/check_module.py route_task
+先看 tests/test_route.py 的用例区再动手。
+单独自测：python scripts/check_module.py route
 """
 
 from typing import Optional

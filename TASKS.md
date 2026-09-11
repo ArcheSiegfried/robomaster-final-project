@@ -4,6 +4,30 @@
 
 公共高冲突文件：`models.py`、`camera_source.py`、`runtime.py`、`motion_output.py`、`main.py`。普通模块开发者不得自行修改；确需变更时先向整合负责人说明接口缺口。
 
+## 文件与名额对照（一个文件 = 一个名额 = 一个人）
+
+骨架（`v0.2-task-skeleton`）已经为每个功能模块建好一个**空文件**，并登记进 `task_registry.py`。
+组员只要**替换文件内容**即可接入主流程，不需要改 `main.py`、注册表或任何公共文件。
+
+| 名额 | 文件 | 空文件里的类 | 职责 | 难度 |
+|---|---|---|---|---|
+| 基础底座 | `config.py` + 实车验证记录（不新增文件） | — | 基础巡线实车验证与参数 | — |
+| 功能 1 | `number_marker.py` | `NumberMarkerTask` | 数字标识 1~5 | 难 |
+| 功能 2 | `traffic_light.py` | `TrafficLightTask` | 红绿灯 | 易 |
+| 功能 3 | `obstacle.py` | `ObstacleTask` | 障碍检测与绕行 | 难 |
+| 功能 4 | `route.py` | `RouteTask` | 长断线巡回 | 难 |
+| 功能 5 | `junction.py` | `JunctionTask` | 两类岔路 | 难 |
+| 整合 | `main.py`、`coordinator.py`、`task_registry.py` | — | 把已验收模块接进主流程 + 集成测试；`evidence.py`（截图记录）属于基础设施，挂在整合负责人名下，**不单独占名额** | 中 |
+
+测试文件与模块文件一一对应：`tests/test_<模块文件>.py`，前面是必须一直通过的契约测试，
+后面是留给你补的用例区。单独测试自己的模块：
+
+```powershell
+python scripts/check_module.py number_marker
+```
+
+接口协议、接管时机、安全护栏和接管顺序见 `MODULE_GUIDE.md` 第 6 节。
+
 ## WP1 基础巡线修复与实车参数
 
 - 目标：证明基础巡线和全部停车路径在实机上的最低可用性，留下可复现参数，不扩张算法。
@@ -27,7 +51,7 @@
 - 优先级：**P0**，但样式未知时先做数据集和接口测试。
 - 输入：同一 `FramePacket`、正式标识样图/尺寸/距离、任务上下文。
 - 输出：`VisualDetection(kind="number_marker", target_id, center, box, confidence)`；任务阶段返回 `TaskUpdate` 与可选 `MotionCommand`。
-- 负责文件：建议新增 `number_marker.py`、`number_task.py`、对应测试和少量 `tests/data/markers/` 样图。
+- 负责文件：`number_marker.py`（骨架已建空文件，替换内容即可）、`tests/test_number_marker.py`、少量 `tests/data/markers/` 样图。
 - 允许修改：本模块、模块配置和测试；不自行开相机。
 - 禁止自行修改：公共高冲突文件。
 - 依赖项：接口只依赖 v0.1；运动接入依赖 WP1，总体流程依赖 WP7。
@@ -44,7 +68,7 @@
 - 优先级：**P0**，规则/灯具未知时先收集样本。
 - 输入：共享 `FramePacket`、灯具样图与位置规则、单调时间。
 - 输出：`VisualDetection(kind="traffic_light", color="red"|"green", ...)` 和非阻塞 `TaskUpdate`。
-- 负责文件：建议新增 `traffic_light.py`、`traffic_light_task.py`、对应测试及少量样图。
+- 负责文件：`traffic_light.py`（骨架已建空文件，替换内容即可）、`tests/test_traffic_light.py` 及少量样图。
 - 允许修改：本模块阈值、连续确认状态和测试。
 - 禁止自行修改：公共高冲突文件；不得默认“没看到红灯就是绿灯”。
 - 依赖项：v0.1；停车/恢复行为参考 WP1；接入依赖 WP7。
@@ -61,7 +85,7 @@
 - 优先级：**P1**。
 - 输入：`FramePacket`、`VisualDetection`、`TaskUpdate`、运行 ID 和事件时间。
 - 输出：标注图片相对路径与轻量事件记录；不输出运动。
-- 负责文件：建议新增 `evidence.py`、`tests/test_evidence.py`；运行文件写入被忽略的 `captures/`。
+- 负责文件：`evidence.py`（骨架已建空文件）、`tests/test_evidence.py`；运行文件写入被忽略的 `captures/`。**这是基础设施，不单独占名额，挂在整合负责人名下。**
 - 允许修改：本模块、格式说明、临时目录测试和 `.gitignore` 的必要补充。
 - 禁止自行修改：公共高冲突文件。
 - 依赖项：可先独立开发；正式字段/触发依赖 WP2、WP3，总体接入依赖 WP7。
@@ -78,7 +102,7 @@
 - 优先级：**P1**；场地和距离来源不明时不得定轨迹。
 - 输入：共享帧、障碍样式/尺寸、确认可用的距离信息、时间和路线检测。
 - 输出：`VisualDetection`、`TaskUpdate`、受限 `MotionCommand`；失败时停车。
-- 负责文件：建议 `obstacle_detector.py`、`obstacle_task.py` 及各自测试。
+- 负责文件：`obstacle.py`（骨架已建空文件，替换内容即可）、`tests/test_obstacle.py`。
 - 允许修改：模块状态、动作参数、测试夹具；每一步快速返回。
 - 禁止自行修改：公共高冲突文件；不得直接调用 SDK 或无限动作。
 - 依赖项：WP1；场地/传感器确认；接入依赖 WP7。
@@ -95,7 +119,7 @@
 - 优先级：**P1**，高度依赖场地；规则迟迟不明时降为 P2。
 - 输入：共享 `FramePacket`、`LineDetection`、底层 `LINE_LOST`、灯/机器人检测和已确认场地规则。
 - 输出：有触发条件、硬超时和失败停车的 `TaskUpdate` / `MotionCommand`。
-- 负责文件：建议 `route_task.py`、`junction_detector.py` 及对应测试；优先先写一个明确场景。
+- 负责文件：`route.py`（长断线巡回）与 `junction.py`（两类岔路）——骨架已各建一个空文件，这是**两个名额、两个人**，不要塞进同一个分支；优先先写一个明确场景。
 - 允许修改：外部任务模块、场景配置、假数据/回放测试。
 - 禁止自行修改：公共高冲突文件；不得延长 `lost_grace_seconds` 冒充长断线，不得无限扫描。
 - 依赖项：WP1；绿灯岔路依赖 WP3；拥堵岔路依赖已确认的检测来源；接入依赖 WP7。
@@ -112,7 +136,7 @@
 - 优先级：**P0**。
 - 输入：WP1～WP6 可合并成果、共享 `FramePacket`、任务规则、证据要求。
 - 输出：每周期唯一 owner、唯一最终 `MotionCommand`、完整离线流程、分阶段实车记录和稳定标签。
-- 负责文件：整合负责人协调 `main.py`、`runtime.py`、`models.py`、`motion_output.py`、集成测试和说明。
+- 负责文件：整合负责人协调 `main.py`、`coordinator.py`、`task_registry.py`、`runtime.py`、`models.py`、`motion_output.py`、集成测试和说明。
 - 允许修改：经评审的集成代码；公共接口变化必须说明原因、影响并更新版本。
 - 禁止自行修改：普通模块开发者不得各自改主流程或新增 SDK 出口。
 - 依赖项：先用假模块验证框架；正式完成度取决于 WP1～WP6 与规则。
