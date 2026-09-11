@@ -52,6 +52,28 @@ class ControlConfig:
     recovery_ramp_seconds: float = 0.20
 
 @dataclass(frozen=True)
+class TaskConfig:
+    """Safety envelope for external task takeover, not per-module tuning.
+
+    These bounds are enforced by coordinator.TaskCoordinator, so a module bug
+    cannot command more than these limits and cannot hold control forever.
+    A module may keep its own smaller limits inside its own file.
+    """
+
+    # A single continuous takeover longer than this is aborted and released.
+    max_task_seconds: float = 20.0
+    # After a task releases, wait this long for a fresh valid line before
+    # giving up and requiring a human SPACE press.
+    release_resume_timeout: float = 2.0
+    # One step()/observe() call slower than this is recorded as an error.
+    max_step_seconds: float = 0.02
+    # Hard caps applied to every task MotionCommand before it is sent.
+    task_max_forward: float = 0.30
+    task_max_lateral: float = 0.25
+    task_max_yaw: float = 90.0
+
+
+@dataclass(frozen=True)
 class RuntimeConfig:
     camera_resolution: str = "360p"
     camera_strategy: str = "newest"
@@ -65,5 +87,6 @@ class RuntimeConfig:
     display: bool = True
     vision: VisionConfig = field(default_factory=VisionConfig)
     control: ControlConfig = field(default_factory=ControlConfig)
+    tasks: TaskConfig = field(default_factory=TaskConfig)
 
 CONFIG = RuntimeConfig()

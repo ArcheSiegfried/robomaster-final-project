@@ -2,6 +2,10 @@
 
 公共接口版本：**v0.1（2026-09-11 核验冻结）**。本轮没有改变字段或运行语义。
 
+骨架版本：**v0.2-task-skeleton**（第 6 节）。骨架只做了**附加**：新增协调层 `coordinator.py`、
+注册表 `task_registry.py`、任务安全参数 `config.TaskConfig` 和模块协议。`models.py` 与
+`MODULE_GUIDE.md` 第 2 节里 v0.1 的任何字段、单位、调用顺序**都没有变化**，老模块不受影响。
+
 `models.py`、`camera_source.py`、`runtime.py`、`motion_output.py` 和 `main.py` 构成公共边界。**普通模块开发者不得自行修改；需要变更时先向项目负责人提出。** v0.1 冻结的是现有字段、单位和调用顺序，不代表巡线参数已经实车验证。
 
 ## 1. 当前结构与启动
@@ -191,7 +195,93 @@ python -m unittest discover -s tests -v
 
 如果需要修改 `models.py`、`camera_source.py`、`runtime.py`、`motion_output.py` 或 `main.py`，先说明现有接口为何不足，由整合负责人统一协调。不要在任务分支中顺手重构公共代码。
 
-## 6. 最简 Git 协作
+## 6. 任务骨架与模块接入（v0.2 骨架）
+
+骨架已经把"每帧询问模块要不要接管"接进了主循环，所以新增模块**不再需要改 `main.py`**。
+
+### 6.1 文件与登记
+
+**一个文件 = 一个功能模块 = 一个人**，文件名与模块名一一对应：
+
+| 文件 | 类 | 类型 |
+|---|---|---|
+| `number_marker.py` | `NumberMarkerTask` | 接管型 |
+| `traffic_light.py` | `TrafficLightTask` | 接管型 |
+| `obstacle.py` | `ObstacleTask` | 接管型 |
+| `route.py` | `RouteTask` | 接管型 |
+| `green_junction.py` | `GreenJunctionTask` | 接管型 |
+| `free_junction.py` | `FreeJunctionTask` | 接管型 |
+| `evidence.py` | `EvidenceRecorder` | 观察型（基础设施，由整合负责人维护，不占名额） |
+
+每个文件已在 `task_registry.py` 里登记好，组员**只替换文件内容**即可：
+
+```python
+MOTION_TASK_CLASSES = (TrafficLightTask, NumberMarkerTask, ...)  # 可接管运动，顺序即优先级
+OBSERVER_CLASSES = (EvidenceRecorder,)                            # 每帧可见，永不接管
+```
+
+漏登记不会静默失效：`tests/test_task_contract.py` 会扫出根目录下所有带
+`step(self, frame, now)` 或 `observe(self, frame, now)` 的文件，未登记就直接失败并告诉你加哪一行。
+
+### 6.2 两种协议
+
+接管型（可以拿到运动控制权）：
+
+```python
+class YourTask:
+    name = "your_task"
+
+    def step(self, frame: FramePacket, now: float) -> TaskUpdate:
+        ...
+```
+
+观察型（每帧都能看到，但**永远不能**接管运动）：
+
+```python
+class YourObserver:
+    name = "your_observer"
+
+    def observe(self, frame: FramePacket, now: float) -> None:
+        ...
+```
+
+构造函数必须能**无参调用**。`step()` / `observe()` 必须**立刻返回**。
+
+### 6.3 骨架替你保证的事（不要重复实现）
+
+| 事情 | 骨架行为 |
+|---|---|
+| 唯一运动出口 | 只有 `coordinator.py` 调用 `MotionOutput`；模块只返回 `MotionCommand` |
+| 接管时机 | 仅当基础巡线处于 `TRACKING` / `COASTING` / `LINE_LOST` 时可接管；`STOPPED`（人工暂停或复位后）和 `VIDEO_LOST` **一律不许**，模块不可能自己启动车 |
+| 接管顺序 | 按 `MOTION_TASK_CLASSES` 顺序询问，第一个返回 `RUNNING` 的拿到控制权 |
+| 唯一 owner | 接管期间其他模块不再被询问 |
+| 命令限幅 | 前进 ≤ 0.30 m/s、横移 ≤ 0.25 m/s、yaw ≤ 90 deg/s（见 `config.TaskConfig`），超限自动裁剪并写入 `decision.errors` |
+| 数值安全 | `nan` / `inf` 一律置零 |
+| 硬超时 | 单个任务连续接管超过 20 秒被强制释放并硬停车 |
+| 异常隔离 | 模块抛异常只记录到 `decision.errors`，不会打断主循环 |
+| 归还流程 | `COMPLETED` / `FAILED` → 硬停车 → `claim("line")` → 清巡线历史 → 等一张**新鲜有效**路线 → 自动恢复；2 秒内等不到就保持停车，需人工按 `SPACE` |
+| 视频中断 | 立即结束接管并停车（`VIDEO_LOST` 锁存，不会自动恢复） |
+| 人工打断 | `SPACE` / `R` 立即结束任何接管并停车，必须人工再按 `SPACE` 才恢复 |
+
+**一旦返回 `RUNNING`，就必须持续返回 `RUNNING`，直到返回 `COMPLETED` 或 `FAILED`。**
+中途返回 `NOT_TRIGGERED` 会被判为失败并强制归还控制权。
+
+### 6.4 单独测试一个模块
+
+```powershell
+python scripts/check_module.py number_marker    # 静态契约检查 + 自己的测试 + 合成帧实跑轨迹
+python scripts/check_module.py --all --quiet    # 全部模块，只报结论
+```
+
+每个模块的测试文件是 `tests/test_<模块文件>.py`，前面是必须一直通过的契约测试，
+后面是留给你补的用例区。`tests/task_harness.py` 提供 `TaskHarness`：用合成帧和假底盘把
+**单个模块**接进真实的协调器跑，不需要机器人、相机或网络。
+
+一条必须永远成立的断言：**合成帧里只有一条蓝线时，任何模块都不许接管。**
+如果实现完之后 `test_does_not_take_over_on_a_plain_line_frame` 开始失败，
+说明你的模块会误触发，必须先修误触发再谈功能。
+
+## 7. 最简 Git 协作
 
 领取任务后先同步 `integration`，再使用短分支名，例如 `feat/traffic-light` 或 `fix/line-loss`。一次提交只处理一个可说明的问题；提交前运行对应模块测试和完整离线测试。PR 目标必须是 `integration`。不要提交 `.venv`、缓存、日志、密钥或运行截图目录。
 
