@@ -103,6 +103,20 @@ class ObstacleDetectorTests(unittest.TestCase):
         self.assertFalse(self.detector.detect(line_frame()).valid)
         self.assertFalse(self.detector.detect(np.full((360, 640, 3), 210, np.uint8)).valid)
 
+    def test_ignores_a_dark_grey_shadow_block(self):
+        """审核风险 1：亮度 <=70 的灰块不许当障碍。
+
+        v1 的暗色区间是 ((0,0,0),(180,255,70))，等于"任何够暗的像素"，
+        车自己的影子 / 场地深色接缝 / 桌腿阴影全会命中。现在默认关掉了。
+        """
+        for level in (20, 40, 60, 70):
+            image = line_frame()
+            cv2.rectangle(image, (280, 280), (400, 340), (level, level, level), -1)
+            self.assertFalse(
+                self.detector.detect(image).valid,
+                "亮度 %d 的灰块被误判成障碍了" % level,
+            )
+
     def test_picks_the_bigger_nearer_candidate(self):
         """同时有两块时，选更大更靠下的那块。"""
         image = line_frame()
@@ -206,6 +220,85 @@ class ObstacleTakeoverTests(unittest.TestCase):
         self.assertEqual(decision.command.forward, 0.0)
         self.assertEqual(decision.command.lateral, 0.0)
         self.assertEqual(decision.command.yaw, 0.0)
+
+    def test_stops_after_too_many_consecutive_dodges(self):
+        """审核风险 2：障碍一直在，不许没完没了地绕。
+
+        最多连绕 MAX_CONSECUTIVE_DODGES 次，再多就直接 FAILED 停车要人来看，
+        并且**从此不再接管**（否则会变成每几秒停一下的走走停停）。
+        这里故意把障碍放在线的右侧，让巡线全程有效，好把"反复触发"跑出来。
+        """
+        harness = TaskHarness(task=ObstacleTask())
+        harness.start_line(now=1.0)
+        now = 1.05
+        image = obstacle_frame(center=(430, 310))
+        dodges = 0
+        failed = False
+        takeovers = 0
+        was_owner = False
+        for _ in range(600):                       # 模拟 30 秒
+            decision = feed_image(harness, image, now)
+            now += 0.05
+            owned = decision.task_name is not None
+            if owned and not was_owner:
+                takeovers += 1
+            was_owner = owned
+            if decision.task_update is None:
+                continue
+            if decision.task_update.status is TaskStatus.COMPLETED:
+                dodges += 1
+            elif decision.task_update.status is TaskStatus.FAILED:
+                failed = True
+
+        self.assertTrue(failed, "连绕之后没有停下来，可能又在无限绕")
+        self.assertLessEqual(
+            dodges, obstacle.MAX_CONSECUTIVE_DODGES,
+            "连绕次数超过了上限：%d 次" % dodges,
+        )
+        self.assertEqual(
+            takeovers, obstacle.MAX_CONSECUTIVE_DODGES + 1,
+            "接管次数应该正好是 %d 次绕行 + 1 次失败锁停，实际 %d 次"
+            % (obstacle.MAX_CONSECUTIVE_DODGES, takeovers),
+        )
+
+        # 锁住之后：障碍还在，但必须不再接管
+        locked_takeovers = takeovers
+        for _ in range(400):                       # 再喂 20 秒
+            decision = feed_image(harness, image, now)
+            now += 0.05
+            if decision.task_name is not None:
+                locked_takeovers += 1
+        self.assertEqual(
+            locked_takeovers, takeovers, "锁住之后又接管了，锁没生效"
+        )
+
+    def test_unlocks_once_the_obstacle_clears(self):
+        """障碍消失够久之后，应该重新愿意干活（不是永久瘫掉）。"""
+        task = ObstacleTask()
+        image = obstacle_frame(center=(430, 310))
+        now = 1.0
+        seq = 0
+        for _ in range(2400):                      # 最多模拟 120 秒
+            seq += 1
+            task.step(FramePacket(image, seq, now), now)
+            now += 0.05
+            if task.locked:
+                break
+        self.assertTrue(task.locked, "连绕到上限了却没锁住")
+        self.assertEqual(task.dodge_count, obstacle.MAX_CONSECUTIVE_DODGES)
+
+        # 把已经开始的这次失败走完，回到 IDLE
+        while task.stage != "IDLE":
+            seq += 1
+            task.step(FramePacket(image, seq, now), now)
+            now += 0.05
+
+        # 障碍消失足够久 -> 计数归零、解锁
+        now += obstacle.CLEAR_SECONDS + 0.1
+        seq += 1
+        task.step(FramePacket(line_frame(), seq, now), now)
+        self.assertEqual(task.dodge_count, 0)
+        self.assertFalse(task.locked)
 
     def test_rearm_cooldown_blocks_an_immediate_second_takeover(self):
         """刚绕完的这段时间里，同一个障碍不许把车再拉去绕一次。"""
