@@ -386,3 +386,17 @@ class TaskCoordinator:
             return False
         self._release_started = None
         return bool(self.follower.resume(now))
+
+    def close(self) -> None:
+        """Release observer resources (open files, queued rows).
+
+        Called once from the main loop's cleanup path. Never raises: a recording
+        module must not be able to break shutdown or the safety stop.
+        """
+        for observer in self.observers:
+            closer = getattr(observer, "close", None)
+            if callable(closer):
+                try:
+                    closer()
+                except Exception:
+                    pass
