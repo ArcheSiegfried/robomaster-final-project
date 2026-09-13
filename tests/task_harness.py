@@ -30,6 +30,7 @@ if str(ROOT) not in sys.path:
 
 from config import CONFIG  # noqa: E402
 from coordinator import TaskCoordinator  # noqa: E402
+from gimbal_output import GimbalOutput  # noqa: E402
 from models import FramePacket  # noqa: E402
 from motion_output import MotionOutput  # noqa: E402
 from runtime import LineFollower  # noqa: E402
@@ -44,6 +45,7 @@ INFRASTRUCTURE_FILES = {
     "controller.py",
     "runtime.py",
     "motion_output.py",
+    "gimbal_output.py",
     "coordinator.py",
     "task_registry.py",
     "main.py",
@@ -56,6 +58,8 @@ FORBIDDEN_PATTERNS = (
     (r"\bdrive_speed\b", "must not call the chassis directly"),
     (r"\bdrive_wheels\b", "must not call the chassis directly"),
     (r"\bmotion_output\b", "must not touch the motion outlet; return MotionCommand"),
+    (r"\bGimbalOutput\b", "must not touch the gimbal outlet; return GimbalCommand"),
+    (r"\.moveto\b", "must not command the gimbal directly"),
     (r"\bLatestFrameSource\b", "must not create a second camera entry"),
     (r"\bcamera_source\b", "must not create a second camera entry"),
     (r"cv2\.VideoCapture", "must not open a video capture of its own"),
@@ -99,6 +103,20 @@ class FakeChassis:
         return None
 
 
+class FakeGimbal:
+    """Records absolute view requests without importing the SDK."""
+
+    def __init__(self):
+        self.calls = []
+
+    def moveto(self, **kwargs):
+        self.calls.append(dict(kwargs))
+        return object()
+
+    def last_move(self):
+        return self.calls[-1] if self.calls else None
+
+
 def line_frame(x=320, height=360, width=640):
     """Synthetic frame holding one vertical blue tape line."""
     image = np.full((height, width, 3), 210, np.uint8)
@@ -119,12 +137,15 @@ class TaskHarness:
         self.chassis = FakeChassis()
         self.follower = LineFollower(config)
         self.output = MotionOutput(self.chassis, config)
+        self.gimbal = FakeGimbal()
+        self.gimbal_output = GimbalOutput(self.gimbal, config)
         self.coordinator = TaskCoordinator(
             config,
             self.follower,
             self.output,
             motion_tasks=() if task is None else (task,),
             observers=() if observer is None else (observer,),
+            gimbal_output=self.gimbal_output,
         )
         self.sequence = 0
         self.traces = []
@@ -137,6 +158,13 @@ class TaskHarness:
 
     def feed(self, now, x=320, blank=False):
         decision = self.coordinator.step(self.frame(now, x, blank=blank), now)
+        self.traces.append(decision)
+        return decision
+
+    def feed_image(self, now, image):
+        self.sequence += 1
+        packet = FramePacket(image, self.sequence, now)
+        decision = self.coordinator.step(packet, now)
         self.traces.append(decision)
         return decision
 

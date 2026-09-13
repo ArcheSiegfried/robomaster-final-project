@@ -32,3 +32,19 @@ line:TRACKING
 ## 未执行及待验证
 
 没有运行 `main.py`，没有连接机器人、启动视频或发送运动指令。当前没有随项目交付的真实录像或场地样图，因此仍需架空车轮验证运动符号、命令超时和急停，再在现场验证 HSV、ROI、线宽筛选、反光漏检、弯道参数和真实断网停车。
+
+## 2026-09-13 长断线第一版离线回归
+
+本轮将公共接口升级为 v0.2，在 `TaskUpdate` 末尾增加可选 `GimbalCommand`，并增加唯一动态云台出口。实际执行：
+
+```powershell
+python -m unittest tests.test_route tests.test_gimbal_output tests.test_coordinator tests.test_task_contract -v
+python scripts\check_module.py route
+powershell -ExecutionPolicy Bypass -File scripts\check_offline.ps1
+```
+
+结果：相关回归 `53/53` 通过；`route.py` 静态契约检查和 `8/8` 专测通过。同步当时最新 `integration` 后再次运行统一脚本：语法检查 `36` 个 Python 文件、完整单元测试 `239/239`、离线接管示例、全部注册模块契约检查均通过，末尾输出 `OFFLINE_CHECK_OK`。
+
+另外用 300 张 640×360 合成空白帧测量 `RouteTask.step()`：平均 `1.264 ms`，最大 `8.376 ms`。该数据只说明本机离线逐帧调用没有阻塞，不代表机器人实际帧率、网络时延或恢复成功率。
+
+本轮同样没有运行 `main.py`、连接机器人、启动视频或发送实车命令。长断线所用云台角度、扫描方向、速度、时限、真实线段筛选及不同模块的接管优先级均待负责人组织实车验证。

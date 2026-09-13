@@ -24,6 +24,7 @@ from coordinator import (
 )
 from models import (
     FramePacket,
+    GimbalCommand,
     MotionCommand,
     TaskStatus,
     TaskUpdate,
@@ -81,6 +82,23 @@ class ExplodingAfterTakeover:
         if self.calls == 1:
             return TaskUpdate(TaskStatus.RUNNING, motion=MotionCommand(forward=0.1))
         raise RuntimeError("task blew up while owning motion")
+
+
+class GimbalThenExplodes:
+    name = "gimbal_then_explodes"
+
+    def __init__(self):
+        self.calls = 0
+
+    def step(self, frame, now):
+        self.calls += 1
+        if self.calls == 1:
+            return TaskUpdate(
+                TaskStatus.RUNNING,
+                motion=MotionCommand(),
+                gimbal=GimbalCommand(pitch=CONFIG.gimbal_search_pitch),
+            )
+        raise RuntimeError("task failed after changing the view")
 
 
 class SlowTask:
@@ -455,6 +473,51 @@ class CoordinatorTests(unittest.TestCase):
         )
         self.assertEqual(after.state, LINE_FOLLOWING)
         self.assertFalse(harness.follower.motion_enabled)
+
+    def test_video_gap_restores_a_task_changed_view(self):
+        task = ScriptedTask(
+            [
+                TaskUpdate(
+                    TaskStatus.RUNNING,
+                    motion=MotionCommand(),
+                    gimbal=GimbalCommand(pitch=CONFIG.gimbal_search_pitch),
+                )
+            ]
+        )
+        harness = TaskHarness(task=task)
+        harness.start_line(now=1.0)
+        self.assertEqual(
+            harness.gimbal.last_move()["pitch"], CONFIG.gimbal_search_pitch
+        )
+        harness.coordinator.video_gap(CONFIG.video_gap_stop_seconds, 1.30)
+        self.assertEqual(harness.gimbal.last_move()["pitch"], CONFIG.gimbal_pitch)
+
+    def test_gimbal_request_without_an_outlet_fails_safe(self):
+        task = ScriptedTask(
+            [TaskUpdate(TaskStatus.RUNNING, gimbal=GimbalCommand(pitch=-5.0))]
+        )
+        harness = TaskHarness()
+        harness.coordinator = TaskCoordinator(
+            CONFIG,
+            harness.follower,
+            harness.output,
+            motion_tasks=(task,),
+            observers=(),
+            gimbal_output=None,
+        )
+        decision = harness.start_line(now=1.0)
+        self.assertEqual(decision.state, RELEASING)
+        self.assertTrue(decision.force_stop)
+        self.assertTrue(any("gimbal" in error for error in decision.errors))
+
+    def test_task_exception_after_view_change_restores_line_view(self):
+        harness = TaskHarness(task=GimbalThenExplodes())
+        harness.start_line(now=1.0)
+        decision = harness.feed_line(1.10)
+        self.assertEqual(decision.state, RELEASING)
+        self.assertTrue(decision.force_stop)
+        self.assertEqual(harness.gimbal.last_move()["pitch"], CONFIG.gimbal_pitch)
+        self.assertTrue(any("exception" in error for error in decision.errors))
 
 
 if __name__ == "__main__":

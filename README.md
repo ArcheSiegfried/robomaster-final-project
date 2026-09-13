@@ -1,17 +1,19 @@
 # RoboMaster Final Project
 
-面向期末任务的低速巡线与多人协作基线。当前真正实现的是基础路线检测、低速运动请求、普通短时漏检容错、持续丢线/视频失效锁停、暂停与显式恢复、单一运动出口和离线接管示例。数字标识、红绿灯、绕障、长断线、岔路、截图证据及完整任务流程尚未实现。
+面向期末任务的低速巡线与多人协作基线。当前实现了基础路线检测、低速运动请求、普通短时漏检容错、持续丢线/视频失效锁停、暂停与显式恢复、集中式运动/云台出口和离线接管。长断线模块已有第一版离线实现；它和其他正式任务仍未实车验证。
 
-公共接口版本为 **v0.1**；协作流程基线由标签 `v0.2-collaboration-baseline` 标识。离线测试通过不代表实车稳定。
+公共接口版本为 **v0.2**（经 Issue #15 批准增加可选云台请求）；协作流程基线由标签 `v0.2-collaboration-baseline` 标识。离线测试通过不代表实车稳定。
 
 ## 主要文件
 
-- `main.py`：唯一实车入口，目前只运行基础巡线。
+- `main.py`：唯一实车入口，装配基础巡线和 `task_registry.py` 中的任务；各任务仍须分别完成实车验收。
 - `camera_source.py`：产生共享最新帧 `FramePacket`。
 - `line_detector.py`：HSV 路线检测。
 - `controller.py`、`runtime.py`：低速控制、短时漏检、暂停/故障/恢复。
 - `motion_output.py`：唯一正常底盘运动出口。
-- `models.py`：v0.1 公共数据类型。
+- `gimbal_output.py`：唯一动态云台请求出口，逐帧请求去重且不阻塞。
+- `route.py`：长断线抬头、远端线段靠近、有限扫描和稳定重获。
+- `models.py`：v0.2 公共数据类型。
 - `examples/offline_takeover.py`：不连接机器人的接管与恢复示例。
 - `tests/`：安全离线测试。
 
@@ -48,7 +50,8 @@ python main.py
 ## 协作文档导航
 
 - [PROJECT_HANDOVER.md](PROJECT_HANDOVER.md)：负责人先读，包含真实状态、审查结论、阶段目标和首次实车清单。
-- [MODULE_GUIDE.md](MODULE_GUIDE.md)：冻结的 v0.1 类型、单位、调用顺序和模块示例。
+- [MODULE_GUIDE.md](MODULE_GUIDE.md)：冻结的 v0.2 类型、单位、调用顺序和模块示例。
+- [ROUTE_RECOVERY.md](ROUTE_RECOVERY.md)：长断线第一版状态、边界、参数和待实车事项。
 - [TASKS.md](TASKS.md)：可领取工作包、优先级、边界、依赖、验收和降级方案。
 - [COLLABORATION_GUIDE.md](COLLABORATION_GUIDE.md)：Windows 下从克隆到 PR、联调和标签的完整教程。
 - [LEAD_AGENT_GUIDE.md](LEAD_AGENT_GUIDE.md)：负责人日常组织、合并和代码 Agent 使用指令。
