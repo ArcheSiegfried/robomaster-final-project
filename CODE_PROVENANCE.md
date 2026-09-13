@@ -10,4 +10,3 @@
 | LIBRARY API USE | OpenCV / NumPy（仓库既有依赖） | `cv2.rectangle`、`cv2.getTextSize`、`cv2.putText`、数组 copy | 依各库许可证 | 只调用公开 API 生成待保存标注图，没有复制库实现。 | `render_evidence_image()`；保留完整真实场景并添加框和中心文字，不负责写盘。 |
 
 未复制或改写 Practice 5、Practice 6、race-v4、社区仓库或其他成员模块代码。没有把外部工作声明为个人原创，也没有修改 Final Requirements。
-

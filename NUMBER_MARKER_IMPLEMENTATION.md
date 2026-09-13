@@ -117,4 +117,3 @@ intent、稳定帧、同帧去重、目标丢失、陈旧帧/观测、NaN、prov
 8. 分别验证停止、目标短时丢失、观测过期、video gap、人工急停和任务超时。
 
 尚未连接机器人；`HARDWARE VERIFIED` 状态为 **NOT YET PERFORMED**。
-

@@ -25,6 +25,9 @@ def build_coordinator(
 
     Kept as a named factory so tests can build the real wiring, and assert that
     every module in task_registry is actually reachable, without any hardware.
+
+    `capture_directory` is where the evidence recorder writes; pass None to
+    disable recording entirely (tests do this so they never litter the repo).
     """
     return TaskCoordinator(
         settings,
@@ -186,6 +189,8 @@ def main() -> None:
         raise
     finally:
         if coordinator is not None:
+            # Flush and close the evidence recorder before tearing anything else
+            # down. Never raises.
             coordinator.close()
         if output is not None:
             output.hard_stop()
