@@ -1,7 +1,7 @@
 """Number-marker filtering, target choice, aiming, and evidence handoff.
 
 The task consumes the repository's shared ``FramePacket`` and returns only the
-frozen v0.1 task types. It owns no camera, vision subscription, gimbal, chassis,
+frozen v0.2 task types. It owns no camera, vision subscription, gimbal, chassis,
 or file writer. The integration layer may inject current marker observations
 and must consume/acknowledge ``EvidenceRequest`` objects.
 
@@ -18,7 +18,15 @@ from typing import Callable, FrozenSet, Iterable, Optional, Sequence, Tuple
 import cv2
 import numpy as np
 
-from models import FramePacket, MotionCommand, TaskStatus, TaskUpdate, VisualDetection
+from config import CONFIG
+from models import (
+    FramePacket,
+    GimbalCommand,
+    MotionCommand,
+    TaskStatus,
+    TaskUpdate,
+    VisualDetection,
+)
 
 KIND = "number_marker"
 VALID_MARKER_IDS: FrozenSet[str] = frozenset(("1", "2", "3", "4", "5"))
@@ -29,6 +37,11 @@ SUPPORTED_IDS = tuple(sorted(VALID_MARKER_IDS))
 # from being mistaken for a real physical-nearest measurement.
 NEAREST_PROXY = "NEAREST_PROXY_LARGEST_APPARENT_WIDTH"
 MEASURED_DISTANCE = "MEASURED_DISTANCE"
+
+# Engineering controls for integrating vertical image error into an absolute
+# gimbal target. The physical sign has not been verified on the course robot.
+PITCH_FOLLOW_SIGN = -1.0
+MAX_PITCH_INTEGRATION_DT = 0.20
 
 
 class MarkerState(str, Enum):
@@ -66,9 +79,11 @@ class NumberMarkerConfig:
     # convention says positive chassis yaw turns right, but hardware sign still
     # requires wheels-raised validation.
     yaw_direction_sign: float = 1.0
-    # Pitch is an intent only until the integration layer exposes a gimbal
-    # command. Its physical sign must be validated on the actual robot.
-    pitch_direction_sign: float = 1.0
+    # More-negative pitch normally points the camera lower, so this engineering
+    # default maps a marker above center toward a more-positive target. Flip
+    # only this sign if the real robot behaves oppositely.
+    pitch_direction_sign: float = PITCH_FOLLOW_SIGN
+    max_pitch_integration_dt: float = MAX_PITCH_INTEGRATION_DT
     max_evidence_attempts: int = 1
     team_number: Optional[str] = None
 
@@ -352,8 +367,22 @@ class NumberMarkerTask:
         self,
         settings: Optional[NumberMarkerConfig] = None,
         observation_provider: Optional[ObservationProvider] = None,
+        runtime_settings: Optional[object] = None,
     ) -> None:
         self.settings = settings or NumberMarkerConfig()
+        self.runtime_settings = CONFIG if runtime_settings is None else runtime_settings
+        self._line_pitch = float(
+            getattr(self.runtime_settings, "gimbal_pitch", CONFIG.gimbal_pitch)
+        )
+        self._gimbal_yaw = float(
+            getattr(self.runtime_settings, "gimbal_yaw", CONFIG.gimbal_yaw)
+        )
+        self._pitch_min = float(
+            getattr(self.runtime_settings, "gimbal_pitch_min", CONFIG.gimbal_pitch_min)
+        )
+        self._pitch_max = float(
+            getattr(self.runtime_settings, "gimbal_pitch_max", CONFIG.gimbal_pitch_max)
+        )
         self._validate_settings()
         self._observation_provider = observation_provider
         self._observation_lock = threading.Lock()
@@ -371,6 +400,8 @@ class NumberMarkerTask:
         self._lost_since: Optional[float] = None
         self._stable_frames = 0
         self._last_centered_sequence: Optional[int] = None
+        self._target_pitch: Optional[float] = None
+        self._last_step_at: Optional[float] = None
         self._active_evidence: Optional[EvidenceRequest] = None
         self._queued_evidence: Optional[EvidenceRequest] = None
         self._evidence_outcome: Optional[bool] = None
@@ -391,6 +422,7 @@ class NumberMarkerTask:
             self.settings.max_task_seconds,
             self.settings.max_aim_yaw_rate,
             self.settings.max_aim_pitch_rate,
+            self.settings.max_pitch_integration_dt,
         )
         if any(not math.isfinite(value) or value <= 0.0 for value in positive):
             raise ValueError("number-marker timing, tolerance, and rates must be positive")
@@ -404,10 +436,27 @@ class NumberMarkerTask:
             raise ValueError("number-marker gains and direction signs must be finite")
         if self.settings.yaw_direction_sign == 0.0 or self.settings.pitch_direction_sign == 0.0:
             raise ValueError("number-marker direction signs must be non-zero")
+        runtime_values = (
+            self._line_pitch,
+            self._gimbal_yaw,
+            self._pitch_min,
+            self._pitch_max,
+        )
+        if any(not math.isfinite(value) for value in runtime_values):
+            raise ValueError("configured gimbal view and limits must be finite")
+        if self._pitch_min > self._pitch_max:
+            raise ValueError("gimbal_pitch_min must not exceed gimbal_pitch_max")
+        self._line_pitch = self._clamp_pitch(self._line_pitch)
 
     @property
     def target_id(self) -> Optional[str]:
         return self._target_id
+
+    @property
+    def target_pitch(self) -> Optional[float]:
+        """Current absolute pitch request, exposed for diagnostics and tests."""
+
+        return self._target_pitch
 
     @property
     def pending_evidence_request(self) -> Optional[EvidenceRequest]:
@@ -478,6 +527,42 @@ class NumberMarkerTask:
             accepted = tuple(item for item in accepted if item.target_id == target_id)
         return select_target_marker(accepted)
 
+    def _clamp_pitch(self, pitch: float) -> float:
+        return max(self._pitch_min, min(float(pitch), self._pitch_max))
+
+    def _begin_pitch_tracking(self, now: float) -> None:
+        """Start this marker from the configured line-view pitch."""
+
+        self._target_pitch = self._line_pitch
+        self._last_step_at = now
+
+    def _gimbal_request(self) -> GimbalCommand:
+        pitch = self._line_pitch if self._target_pitch is None else self._target_pitch
+        return GimbalCommand(pitch=pitch, yaw=self._gimbal_yaw)
+
+    def _integrate_pitch(
+        self, intent: AimIntent, now: float
+    ) -> Optional[GimbalCommand]:
+        """Integrate a rate intent into the v0.2 absolute-pitch contract."""
+
+        if self._target_pitch is None or self._last_step_at is None:
+            self._begin_pitch_tracking(now)
+        elapsed = max(0.0, now - float(self._last_step_at))
+        dt = min(elapsed, self.settings.max_pitch_integration_dt)
+        # Advance the time origin even when already centered, otherwise a later
+        # error would integrate time spent centered and cause a sudden jump.
+        self._last_step_at = max(float(self._last_step_at), now)
+        if not intent.gimbal_pitch_required or dt <= 0.0:
+            return None
+        self._target_pitch = self._clamp_pitch(
+            float(self._target_pitch) + intent.pitch_rate * dt
+        )
+        return self._gimbal_request()
+
+    def _reset_pitch_tracking(self) -> None:
+        self._target_pitch = None
+        self._last_step_at = None
+
     def step(self, frame: FramePacket, now: float) -> TaskUpdate:
         """Run one bounded state transition for the current shared frame."""
 
@@ -490,6 +575,7 @@ class NumberMarkerTask:
 
         if self._started_at is not None and now - self._started_at > self.settings.max_task_seconds:
             self.state = MarkerState.FAILED
+            self._reset_pitch_tracking()
             return TaskUpdate(
                 TaskStatus.FAILED,
                 motion=MotionCommand(),
@@ -528,6 +614,7 @@ class NumberMarkerTask:
             self.state = MarkerState.TARGET_TOO_SMALL
             if self._target_id is not None:
                 self.state = MarkerState.FAILED
+                self._reset_pitch_tracking()
                 return TaskUpdate(
                     TaskStatus.FAILED,
                     motion=MotionCommand(),
@@ -546,6 +633,7 @@ class NumberMarkerTask:
             self._started_at = now
             self._stable_frames = 0
             self._lost_since = None
+            self._begin_pitch_tracking(now)
             self.state = MarkerState.STOPPING
             return TaskUpdate(
                 TaskStatus.RUNNING,
@@ -558,6 +646,7 @@ class NumberMarkerTask:
         self.state = MarkerState.AIMING
         intent = compute_aim_intent(candidate, width, height, self.settings)
         self.last_aim_intent = intent
+        gimbal = self._integrate_pitch(intent, now)
 
         if not is_marker_centered(candidate, width, height, self.settings):
             self._stable_frames = 0
@@ -565,12 +654,9 @@ class NumberMarkerTask:
             return TaskUpdate(
                 TaskStatus.RUNNING,
                 motion=MotionCommand(yaw=intent.yaw_rate),
+                gimbal=gimbal,
                 detection=detection,
-                message=(
-                    "AIMING:GIMBAL_PITCH_INTEGRATION_REQUIRED"
-                    if intent.gimbal_pitch_required
-                    else "AIMING"
-                ),
+                message="AIMING",
             )
 
         if self._last_centered_sequence != frame.sequence:
@@ -580,6 +666,7 @@ class NumberMarkerTask:
             return TaskUpdate(
                 TaskStatus.RUNNING,
                 motion=MotionCommand(),
+                gimbal=gimbal,
                 detection=detection,
                 message="AIMING:STABLE_{}/{}".format(
                     self._stable_frames, self.settings.aim_stable_frames
@@ -590,6 +677,7 @@ class NumberMarkerTask:
         self.aimed_ids.add(candidate.target_id)
         if not self.settings.team_number:
             self.state = MarkerState.FAILED
+            self._reset_pitch_tracking()
             return TaskUpdate(
                 TaskStatus.FAILED,
                 motion=MotionCommand(),
@@ -605,6 +693,7 @@ class NumberMarkerTask:
         return TaskUpdate(
             TaskStatus.RUNNING,
             motion=MotionCommand(),
+            gimbal=gimbal,
             detection=detection,
             message="AIM_LOCKED:EVIDENCE_PENDING",
         )
@@ -621,10 +710,15 @@ class NumberMarkerTask:
         self.state = MarkerState.LOST
         self._stable_frames = 0
         self._last_centered_sequence = None
+        # Keep the last absolute target for a brief reacquisition, but move the
+        # integration clock forward so lost time can never become pitch motion.
+        if self._last_step_at is not None:
+            self._last_step_at = max(self._last_step_at, now)
         if self._lost_since is None:
             self._lost_since = now
         if now - self._lost_since > self.settings.target_lost_timeout:
             self.state = MarkerState.FAILED
+            self._reset_pitch_tracking()
             return TaskUpdate(
                 TaskStatus.FAILED,
                 motion=MotionCommand(),
@@ -643,6 +737,7 @@ class NumberMarkerTask:
             outcome = self._evidence_outcome
         if outcome is True:
             self.state = MarkerState.COMPLETED
+            self._reset_pitch_tracking()
             return TaskUpdate(
                 TaskStatus.COMPLETED,
                 motion=MotionCommand(),
@@ -651,6 +746,7 @@ class NumberMarkerTask:
             )
         if outcome is False:
             self.state = MarkerState.FAILED
+            self._reset_pitch_tracking()
             return TaskUpdate(
                 TaskStatus.FAILED,
                 motion=MotionCommand(),
@@ -705,6 +801,7 @@ class NumberMarkerTask:
         self.last_aim_intent = None
         if active:
             self.state = MarkerState.FAILED
+            self._reset_pitch_tracking()
             return TaskUpdate(
                 TaskStatus.FAILED,
                 motion=MotionCommand(),
@@ -729,6 +826,7 @@ class NumberMarkerTask:
         self._lost_since = None
         self._stable_frames = 0
         self._last_centered_sequence = None
+        self._reset_pitch_tracking()
         with self._observation_lock:
             self._active_evidence = None
             self._queued_evidence = None

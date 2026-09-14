@@ -11,7 +11,8 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from models import FramePacket, TaskStatus  # noqa: E402
+from config import CONFIG  # noqa: E402
+from models import FramePacket, GimbalCommand, TaskStatus  # noqa: E402
 from number_marker import (  # noqa: E402
     MEASURED_DISTANCE,
     NEAREST_PROXY,
@@ -163,8 +164,8 @@ class FilteringAndSelectionTests(unittest.TestCase):
 
 
 class AimingStateTests(unittest.TestCase):
-    def begin(self, item, settings=BASE_CONFIG):
-        task = NumberMarkerTask(settings)
+    def begin(self, item, settings=BASE_CONFIG, runtime_settings=None):
+        task = NumberMarkerTask(settings, runtime_settings=runtime_settings)
         set_current(task, 1, 1.0, item)
         update = task.step(packet(1, 1.0), 1.0)
         self.assertIs(update.status, TaskStatus.RUNNING)
@@ -198,15 +199,191 @@ class AimingStateTests(unittest.TestCase):
         intent = compute_aim_intent(candidate(x=460), WIDTH, HEIGHT, settings)
         self.assertLess(intent.yaw_rate, 0.0)
 
-    def test_above_target_has_negative_vertical_intent(self):
+    def test_above_target_has_positive_vertical_intent_with_default_sign(self):
         intent = compute_aim_intent(candidate(y=80), WIDTH, HEIGHT, BASE_CONFIG)
+        self.assertGreater(intent.pitch_rate, 0.0)
+        self.assertTrue(intent.gimbal_pitch_required)
+
+    def test_below_target_has_negative_vertical_intent_with_default_sign(self):
+        intent = compute_aim_intent(candidate(y=280), WIDTH, HEIGHT, BASE_CONFIG)
         self.assertLess(intent.pitch_rate, 0.0)
         self.assertTrue(intent.gimbal_pitch_required)
 
-    def test_below_target_has_positive_vertical_intent(self):
-        intent = compute_aim_intent(candidate(y=280), WIDTH, HEIGHT, BASE_CONFIG)
-        self.assertGreater(intent.pitch_rate, 0.0)
-        self.assertTrue(intent.gimbal_pitch_required)
+    def test_centered_marker_keeps_entry_pitch_without_gimbal_command(self):
+        runtime = replace(CONFIG, gimbal_pitch=-10)
+        task = self.begin(candidate(), runtime_settings=runtime)
+        set_current(task, 2, 1.10, candidate())
+        update = task.step(packet(2, 1.10), 1.10)
+        self.assertIsNone(update.gimbal)
+        self.assertEqual(task.target_pitch, -10.0)
+
+    def test_above_marker_updates_absolute_pitch_in_default_direction(self):
+        runtime = replace(CONFIG, gimbal_pitch=-10)
+        item = candidate(y=80)
+        task = self.begin(item, runtime_settings=runtime)
+        set_current(task, 2, 1.10, item)
+        update = task.step(packet(2, 1.10), 1.10)
+        self.assertIsInstance(update.gimbal, GimbalCommand)
+        self.assertGreater(update.gimbal.pitch, -10.0)
+        self.assertEqual(update.gimbal.yaw, float(runtime.gimbal_yaw))
+
+    def test_below_marker_updates_absolute_pitch_in_opposite_direction(self):
+        runtime = replace(CONFIG, gimbal_pitch=-10)
+        item = candidate(y=280)
+        task = self.begin(item, runtime_settings=runtime)
+        set_current(task, 2, 1.10, item)
+        update = task.step(packet(2, 1.10), 1.10)
+        self.assertIsInstance(update.gimbal, GimbalCommand)
+        self.assertLess(update.gimbal.pitch, -10.0)
+
+    def test_pitch_direction_sign_can_be_flipped_in_one_setting(self):
+        runtime = replace(CONFIG, gimbal_pitch=-10)
+        item = candidate(y=80)
+        normal = self.begin(item, runtime_settings=runtime)
+        set_current(normal, 2, 1.10, item)
+        normal_update = normal.step(packet(2, 1.10), 1.10)
+
+        flipped_settings = replace(BASE_CONFIG, pitch_direction_sign=1.0)
+        flipped = self.begin(item, flipped_settings, runtime)
+        set_current(flipped, 2, 1.10, item)
+        flipped_update = flipped.step(packet(2, 1.10), 1.10)
+        self.assertGreater(normal_update.gimbal.pitch, -10.0)
+        self.assertLess(flipped_update.gimbal.pitch, -10.0)
+
+    def test_large_elapsed_time_is_limited_by_integration_dt(self):
+        runtime = replace(CONFIG, gimbal_pitch=-10)
+        item = candidate(y=80)
+        settings = replace(BASE_CONFIG, max_pitch_integration_dt=0.20)
+        task = self.begin(item, settings, runtime)
+        set_current(task, 2, 2.00, item)
+        update = task.step(packet(2, 2.00), 2.00)
+        intent = compute_aim_intent(item, WIDTH, HEIGHT, settings)
+        self.assertAlmostEqual(update.gimbal.pitch, -10.0 + intent.pitch_rate * 0.20)
+
+    def test_repeated_identical_timestamp_does_not_accumulate_pitch(self):
+        runtime = replace(CONFIG, gimbal_pitch=-10)
+        item = candidate(y=80)
+        task = self.begin(item, runtime_settings=runtime)
+        set_current(task, 2, 1.10, item)
+        first = task.step(packet(2, 1.10), 1.10)
+        set_current(task, 3, 1.10, item)
+        repeated = task.step(packet(3, 1.10), 1.10)
+        self.assertIsNone(repeated.gimbal)
+        self.assertEqual(task.target_pitch, first.gimbal.pitch)
+
+    def test_pitch_is_clamped_to_runtime_upper_bound(self):
+        runtime = replace(CONFIG, gimbal_pitch=9, gimbal_pitch_min=-25, gimbal_pitch_max=10)
+        item = candidate(y=0)
+        task = self.begin(item, runtime_settings=runtime)
+        set_current(task, 2, 1.20, item)
+        update = task.step(packet(2, 1.20), 1.20)
+        self.assertEqual(update.gimbal.pitch, 10.0)
+
+    def test_pitch_is_clamped_to_runtime_lower_bound(self):
+        runtime = replace(CONFIG, gimbal_pitch=-24, gimbal_pitch_min=-25, gimbal_pitch_max=10)
+        item = candidate(y=360)
+        task = self.begin(item, runtime_settings=runtime)
+        set_current(task, 2, 1.20, item)
+        update = task.step(packet(2, 1.20), 1.20)
+        self.assertEqual(update.gimbal.pitch, -25.0)
+
+    def test_horizontal_and_vertical_corrections_are_emitted_together(self):
+        runtime = replace(CONFIG, gimbal_pitch=-10)
+        item = candidate(x=460, y=80)
+        task = self.begin(item, runtime_settings=runtime)
+        set_current(task, 2, 1.10, item)
+        update = task.step(packet(2, 1.10), 1.10)
+        self.assertGreater(update.motion.yaw, 0.0)
+        self.assertGreater(update.gimbal.pitch, -10.0)
+
+    def test_centered_frames_lock_after_correction_without_pitch_drift(self):
+        runtime = replace(CONFIG, gimbal_pitch=-10)
+        settings = replace(BASE_CONFIG, aim_stable_frames=2)
+        item = candidate(y=80)
+        task = self.begin(item, settings, runtime)
+        set_current(task, 2, 1.10, item)
+        adjusted = task.step(packet(2, 1.10), 1.10)
+        held_pitch = adjusted.gimbal.pitch
+        for sequence, now in ((3, 1.20), (4, 1.30)):
+            centered = candidate(now=now, sequence=sequence)
+            set_current(task, sequence, now, centered)
+            update = task.step(packet(sequence, now), now)
+            self.assertIsNone(update.gimbal)
+            self.assertEqual(task.target_pitch, held_pitch)
+        self.assertIs(task.state, MarkerState.EVIDENCE_PENDING)
+
+    def test_brief_target_loss_emits_no_pitch_and_preserves_target(self):
+        runtime = replace(CONFIG, gimbal_pitch=-10)
+        item = candidate(y=80)
+        task = self.begin(item, runtime_settings=runtime)
+        set_current(task, 2, 1.10, item)
+        task.step(packet(2, 1.10), 1.10)
+        held_pitch = task.target_pitch
+        task.update_candidates(())
+        update = task.step(packet(3, 1.20), 1.20)
+        self.assertIsNone(update.gimbal)
+        self.assertEqual(task.target_pitch, held_pitch)
+
+    def test_stale_frame_emits_no_pitch_and_clears_failed_transient(self):
+        runtime = replace(CONFIG, gimbal_pitch=-10)
+        item = candidate(y=80)
+        task = self.begin(item, runtime_settings=runtime)
+        set_current(task, 2, 1.10, item)
+        task.step(packet(2, 1.10), 1.10)
+        update = task.step(packet(3, 1.10), 1.40)
+        self.assertIsNone(update.gimbal)
+        self.assertIs(update.status, TaskStatus.FAILED)
+        self.assertIsNone(task.target_pitch)
+
+    def test_evidence_pending_steps_do_not_accumulate_pitch(self):
+        runtime = replace(CONFIG, gimbal_pitch=-10)
+        settings = replace(BASE_CONFIG, aim_stable_frames=1)
+        item = candidate(y=80)
+        task = self.begin(item, settings, runtime)
+        set_current(task, 2, 1.10, item)
+        task.step(packet(2, 1.10), 1.10)
+        held_pitch = task.target_pitch
+        centered = candidate()
+        set_current(task, 3, 1.20, centered)
+        locked = task.step(packet(3, 1.20), 1.20)
+        self.assertIs(task.state, MarkerState.EVIDENCE_PENDING)
+        self.assertIsNone(locked.gimbal)
+        pending = task.step(packet(4, 1.30), 1.30)
+        self.assertIsNone(pending.gimbal)
+        self.assertEqual(task.target_pitch, held_pitch)
+
+    def test_completed_task_resets_pitch_before_next_marker(self):
+        runtime = replace(CONFIG, gimbal_pitch=-10)
+        task = NumberMarkerTask(
+            replace(BASE_CONFIG, aim_stable_frames=1), runtime_settings=runtime
+        )
+        result = advance_to_evidence(task)
+        self.assertIs(result.status, TaskStatus.RUNNING)
+        request = task.take_evidence_request()
+        task.acknowledge_evidence(request.request_id, True)
+        completed = task.step(packet(3, 1.03), 1.03)
+        self.assertIs(completed.status, TaskStatus.COMPLETED)
+        self.assertIsNone(task.target_pitch)
+        next_item = candidate("2")
+        set_current(task, 4, 1.04, next_item)
+        task.step(packet(4, 1.04), 1.04)
+        self.assertEqual(task.target_pitch, -10.0)
+
+    def test_failed_task_resets_pitch_before_next_marker(self):
+        runtime = replace(CONFIG, gimbal_pitch=-10)
+        task = NumberMarkerTask(
+            replace(BASE_CONFIG, aim_stable_frames=1), runtime_settings=runtime
+        )
+        advance_to_evidence(task)
+        request = task.take_evidence_request()
+        task.acknowledge_evidence(request.request_id, False)
+        failed = task.step(packet(3, 1.03), 1.03)
+        self.assertIs(failed.status, TaskStatus.FAILED)
+        self.assertIsNone(task.target_pitch)
+        next_item = candidate("2")
+        set_current(task, 4, 1.04, next_item)
+        task.step(packet(4, 1.04), 1.04)
+        self.assertEqual(task.target_pitch, -10.0)
 
     def test_one_centered_frame_is_not_immediate_success(self):
         settings = replace(BASE_CONFIG, aim_stable_frames=3)
@@ -347,6 +524,20 @@ class EvidenceTests(unittest.TestCase):
 
 
 class CoordinatorIntegrationTests(unittest.TestCase):
+    def test_vertical_request_reaches_existing_gimbal_output(self):
+        task = NumberMarkerTask(BASE_CONFIG)
+        harness = TaskHarness(task=task)
+        harness.start_line(now=1.0)
+
+        task.update_candidates((candidate(y=80, now=1.05),))
+        harness.feed_line(1.05)
+        task.update_candidates((candidate(y=80, now=1.15),))
+        decision = harness.feed_line(1.15)
+
+        self.assertEqual(decision.owner, "external")
+        self.assertIsInstance(decision.task_update.gimbal, GimbalCommand)
+        self.assertGreater(harness.gimbal.last_move()["pitch"], CONFIG.gimbal_pitch)
+
     def test_real_harness_stops_takes_over_and_releases_after_saved_evidence(self):
         task = NumberMarkerTask(replace(BASE_CONFIG, aim_stable_frames=1))
         harness = TaskHarness(task=task)
