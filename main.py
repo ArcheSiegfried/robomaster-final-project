@@ -39,6 +39,57 @@ def build_coordinator(
     )
 
 
+def _find_evidence_sink(coordinator):
+    """找到唯一的证据写入器（实现了 save_task_evidence 的观察者）。"""
+    for observer in getattr(coordinator, "observers", ()):
+        if callable(getattr(observer, "save_task_evidence", None)):
+            return observer
+    return None
+
+
+def service_task_evidence(coordinator) -> int:
+    """把任务模块交出来的得分截图请求交给证据层，并回传真实结果。
+
+    这是 Final 算分那条链的最后一环：
+
+        task.take_evidence_request() -> 证据层画框写字存盘 -> acknowledge_evidence()
+
+    **必须每帧在主循环里调用。** 任务在等回执期间会一直占着控制权并要求停车，
+    所以这里必须给出明确答复，绝不能让请求悬着：
+    * 存成功 -> 回传 True，任务才会 COMPLETED 并归还控制权、恢复巡线；
+    * 存失败 / 没有可用的证据写入器 -> 回传 False，任务是 FAILED 并立刻交回
+      控制权，而不是把车停在那里干等 8 秒超时。
+
+    返回这一帧真正写成的截图数（给日志和测试用）。绝不抛异常。
+    """
+    sink = _find_evidence_sink(coordinator)
+    saved_count = 0
+    for task in getattr(coordinator, "motion_tasks", ()):
+        take = getattr(task, "take_evidence_request", None)
+        acknowledge = getattr(task, "acknowledge_evidence", None)
+        if not callable(take) or not callable(acknowledge):
+            continue
+        try:
+            request = take()
+        except Exception:
+            continue
+        if request is None:
+            continue
+        saved = False
+        if sink is not None:
+            try:
+                saved = bool(sink.save_task_evidence(request))
+            except Exception:
+                saved = False
+        try:
+            acknowledge(getattr(request, "request_id", ""), saved)
+        except Exception:
+            pass
+        if saved:
+            saved_count += 1
+    return saved_count
+
+
 def draw_debug(frame, decision):
     shown = frame.copy()
     line = decision.line
@@ -160,6 +211,9 @@ def main() -> None:
                 have_frame = True
                 last_sequence = packet.sequence
                 decision = coordinator.step(packet, now)
+                # Final 的得分截图链：任务交出请求 -> 证据层画框写字存盘 ->
+                # 回传真实结果。放在 step() 之后，任务在等回执期间会保持接管。
+                service_task_evidence(coordinator)
                 if CONFIG.display:
                     cv2.imshow(
                         "Low-speed line base",
