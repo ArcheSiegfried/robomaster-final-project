@@ -90,6 +90,22 @@ def service_task_evidence(coordinator) -> int:
     return saved_count
 
 
+def record_run_events(coordinator, decision, now) -> None:
+    """把这一帧的协调器结果交给愿意记录它的观察者，用于生成运行记录。
+
+    观察者是否真的记由它自己决定（`evidence.py` 只在状态变化时记一行）。
+    绝不抛异常：记录功能不能影响控制循环。
+    """
+    for observer in getattr(coordinator, "observers", ()):
+        hook = getattr(observer, "record_decision", None)
+        if not callable(hook):
+            continue
+        try:
+            hook(decision, now)
+        except Exception:
+            pass
+
+
 def draw_debug(frame, decision):
     shown = frame.copy()
     line = decision.line
@@ -214,6 +230,8 @@ def main() -> None:
                 # Final 的得分截图链：任务交出请求 -> 证据层画框写字存盘 ->
                 # 回传真实结果。放在 step() 之后，任务在等回执期间会保持接管。
                 service_task_evidence(coordinator)
+                # 运行记录：把这一帧的接管/释放/限幅/异常写进本次运行的 report.md。
+                record_run_events(coordinator, decision, now)
                 if CONFIG.display:
                     cv2.imshow(
                         "Low-speed line base",
