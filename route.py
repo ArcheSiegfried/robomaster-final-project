@@ -40,7 +40,11 @@ REACQUIRING = "reacquiring"
 TRIGGER_MARGIN_SECONDS = 0.05
 END_PENDING_SECONDS = 0.08
 END_MISSING_SECONDS = 0.14
-END_APPROACH_MAX_SECONDS = 2.5
+# At 0.08 m/s the previous 2.5 s budget covered only about 0.20 m.  On the
+# real camera the far sample can disappear earlier than that, so the task was
+# failing at the physical endpoint before it could raise the view.  Keep this
+# phase bounded, but allow roughly 0.40 m of bottom-line following.
+END_APPROACH_MAX_SECONDS = 5.0
 END_APPROACH_SPEED = 0.08
 END_APPROACH_YAW_GAIN = 32.0
 END_APPROACH_MAX_YAW = 16.0
