@@ -99,6 +99,10 @@ class RuntimeConfig:
     #   实车第一次跑请核对 marker_source.stats() 的判断结果。
     marker_color: str = ""
     marker_coordinate_mode: str = "auto"
+    # 终端状态反馈（丢线、任务接管、异常、心跳）。False = 完全不打印。
+    console_status: bool = True
+    #: 心跳行间隔（秒）。只影响"还活着"那行的频率，不影响状态变化行。
+    console_heartbeat_seconds: float = 2.0
     display: bool = True
     vision: VisionConfig = field(default_factory=VisionConfig)
     control: ControlConfig = field(default_factory=ControlConfig)
