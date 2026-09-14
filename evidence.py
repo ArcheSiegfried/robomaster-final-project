@@ -28,7 +28,11 @@
         log.csv        每帧一行：帧号、采集时刻、循环时刻、已运行秒数、画面尺寸、亮度
         frame_000123_0006.15s.jpg   每隔一段时间存一张关键帧（运行记录用）
         task_2_000123_0006.15s.jpg  任务得分截图（带检测框 + 居中说明文字）
-        summary.json   结束时写入：总帧数、截图数、任务截图数、写入失败数、运行时长
+        log.csv / summary.json / report.md
+        report.md      运行结束时自动生成的人类可读记录：
+                       起止时间、时长、帧数、得分截图清单（含图上那句话）、
+                       任务接管时间线、出现过的限幅/超时/异常。
+                       **可以直接贴进报告发给别人**，不用再手工整理。
 
 得分截图（任务证据）——这是 Final 真正算分的东西
 ----------------------------------------------
@@ -193,6 +197,15 @@ class EvidenceRecorder:
         self.rows_written = 0
         self.duplicate_frames_skipped = 0
 
+        # 本次运行的记录：得分截图清单 + 任务接管时间线。
+        # 结束时写成 report.md，可以直接贴进报告发给别人。
+        self.task_evidence: List[dict] = []
+        self.events: List[dict] = []
+        self.event_limit = 500
+        self._last_event_key = None
+        self._last_errors: tuple = ()
+        self._last_frame_at: Optional[float] = None
+
         self.run_directory: Optional[Path] = None
         self.log_path: Optional[Path] = None
         self._csv_file = None
@@ -235,6 +248,7 @@ class EvidenceRecorder:
         if self._started_at is None:
             self._started_at = now
         elapsed = max(0.0, now - self._started_at)
+        self._last_frame_at = now
 
         image = getattr(frame, "image", None)
         height, width = (0, 0)
@@ -332,6 +346,15 @@ class EvidenceRecorder:
             return False
 
         self.task_snapshots += 1
+        self.task_evidence.append(
+            {
+                "wall_clock": datetime.now().isoformat(timespec="seconds"),
+                "elapsed_s": round(elapsed, 2),
+                "label": label,
+                "annotation": annotation,
+                "file": name,
+            }
+        )
         self.pending.append(
             {
                 "sequence": sequence,
@@ -350,8 +373,154 @@ class EvidenceRecorder:
         self._flush(None)
         return True
 
+    def record_decision(self, decision, now: float) -> None:
+        """记录主循环这一帧的结果，供运行报告使用。
+
+        只记**状态发生变化**的帧（以及任何带错误的帧），所以逐帧调用几乎不花钱，
+        报告里也不会被"每帧一行"刷屏。这是一次运行最值得留档的东西：
+        哪个模块什么时候接管、怎么结束、有没有被限幅/超时/异常。
+
+        绝不抛异常：记录功能不能影响控制循环。
+        """
+        if self._closed or self.run_directory is None:
+            return
+        try:
+            update = getattr(decision, "task_update", None)
+            status = getattr(update, "status", None)
+            key = (
+                str(getattr(decision, "state", "")),
+                str(getattr(decision, "owner", "")),
+                str(getattr(decision, "task_name", "") or ""),
+                str(getattr(status, "name", "") or ""),
+            )
+            errors = tuple(str(item) for item in (getattr(decision, "errors", ()) or ()))
+            message = str(getattr(decision, "message", "") or "")
+        except Exception:
+            return
+
+        if key == self._last_event_key and errors == self._last_errors:
+            return
+        self._last_event_key = key
+        self._last_errors = errors
+        if len(self.events) >= self.event_limit:
+            return
+
+        elapsed = None
+        if self._started_at is not None:
+            elapsed = max(0.0, float(now) - self._started_at)
+        self.events.append(
+            {
+                "wall_clock": datetime.now().isoformat(timespec="seconds"),
+                "elapsed_s": None if elapsed is None else round(elapsed, 2),
+                "state": key[0],
+                "owner": key[1],
+                "task": key[2] or None,
+                "task_status": key[3] or None,
+                "message": message,
+                "errors": errors,
+            }
+        )
+
+    def _write_report(self) -> None:
+        """把本次运行写成一份可以直接贴进报告的 report.md。绝不抛异常。"""
+        if self.run_directory is None:
+            return
+
+        def clock(seconds):
+            if seconds is None:
+                return "-"
+            return "%02d:%04.1f" % (int(seconds) // 60, seconds % 60)
+
+        frames = self.rows_written + len(self.pending)
+        duration = None
+        if self._started_at is not None and self._last_frame_at is not None:
+            duration = max(0.0, self._last_frame_at - self._started_at)
+
+        lines = [
+            "# 运行记录 %s" % self.run_directory.name,
+            "",
+            "| 项 | 值 |",
+            "|---|---|",
+            "| 开始（墙钟） | %s |" % (self._started_wall_clock or "-"),
+            "| 结束（墙钟） | %s |" % datetime.now().isoformat(timespec="seconds"),
+            "| 运行时长 | %s |" % clock(duration),
+            "| 记录帧数 | %d |" % frames,
+            "| **得分截图** | **%d 张** |" % self.task_snapshots,
+            "| 运行记录截图 | %d 张 |" % self.snapshots,
+            "| 写入失败 | %d |" % self.write_failures,
+            "| 目录 | `%s` |" % self.run_directory.name,
+            "",
+            "## 得分截图（Final 按这些图算分）",
+            "",
+        ]
+        if self.task_evidence:
+            lines += [
+                "| 墙钟 | 相对 | 标识 | 图上文字 | 文件 |",
+                "|---|---|---|---|---|",
+            ]
+            for item in self.task_evidence:
+                lines.append(
+                    "| %s | %s | %s | %s | `%s` |"
+                    % (
+                        item["wall_clock"],
+                        clock(item["elapsed_s"]),
+                        item["label"],
+                        item["annotation"],
+                        item["file"],
+                    )
+                )
+        else:
+            lines.append("本次运行没有产生得分截图。")
+        lines += ["", "## 任务接管记录", ""]
+        if self.events:
+            lines += [
+                "| 墙钟 | 相对 | 状态 | 接管者 | 任务 | 结果 | 说明 |",
+                "|---|---|---|---|---|---|---|",
+            ]
+            for event in self.events:
+                lines.append(
+                    "| %s | %s | %s | %s | %s | %s | %s |"
+                    % (
+                        event["wall_clock"],
+                        clock(event["elapsed_s"]),
+                        event["state"],
+                        event["owner"],
+                        event["task"] or "-",
+                        event["task_status"] or "-",
+                        (event["message"] or "-")[:60],
+                    )
+                )
+            problems = [e for e in self.events if e["errors"]]
+            if problems:
+                lines += ["", "### 这一轮出现过的问题", ""]
+                for event in problems:
+                    for error in event["errors"]:
+                        lines.append("- `%s` %s" % (clock(event["elapsed_s"]), error))
+        else:
+            lines.append("本次运行没有任何模块接管运动（全程基础巡线）。")
+        lines += [
+            "",
+            "---",
+            "",
+            "本文件由 `evidence.py` 在运行结束时自动生成。`captures/` 不在 git 里，",
+            "要交作业请把整个 run 目录（图和这份记录）一起复制走。",
+            "",
+        ]
+
+        target = self.run_directory / "report.md"
+        temporary = target.with_suffix(".md.tmp")
+        try:
+            temporary.write_text("\n".join(lines), encoding="utf-8")
+            temporary.replace(target)
+        except Exception:
+            self.write_failures += 1
+            try:
+                temporary.unlink()
+            except OSError:
+                pass
+
     def close(self) -> None:
-        """收尾：把剩下的行写掉、关文件、写一份 summary。绝不抛异常。"""
+        """收尾：把剩下的行写掉、关文件、写一份 summary 与运行记录。绝不抛异常。"""
         if self._closed:
             return
         self._closed = True
@@ -365,6 +534,8 @@ class EvidenceRecorder:
         self._csv_file = None
         self._writer = None
         self._write_summary()
+        # 放在 summary 之后：报告要把 write_failures 的最终值写进去。
+        self._write_report()
 
     # ------------------------------------------------------------------
     # 内部

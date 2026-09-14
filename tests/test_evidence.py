@@ -431,5 +431,85 @@ class TaskEvidenceTests(unittest.TestCase):
         self.assertEqual(task.acks, [(request.request_id, False)])
 
 
+class RunReportTests(unittest.TestCase):
+    """每次运行的独立记录：结束时写入 report.md，可以直接贴进报告发给别人。"""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.directory = self._tmp.name
+
+    def _request(self, **kwargs):
+        return _FakeRequest(line_frame(320), **kwargs)
+
+    def _decision(self, state="LINE_FOLLOWING", task_name=None, status=None,
+                  message="", errors=()):
+        from coordinator import CoordinatorDecision
+        from models import TaskStatus, TaskUpdate
+
+        update = None if status is None else TaskUpdate(TaskStatus[status])
+        return CoordinatorDecision(
+            state=state,
+            owner="line",
+            task_name=task_name,
+            task_update=update,
+            message=message,
+            errors=tuple(errors),
+        )
+
+    def test_report_lists_the_scoring_snapshot_and_the_task_timeline(self):
+        recorder = EvidenceRecorder(directory=self.directory)
+        self.addCleanup(recorder.close)
+        recorder.observe(FramePacket(line_frame(320), 1, 1.0), 1.0)
+        recorder.record_decision(self._decision(), 1.0)
+        recorder.record_decision(
+            self._decision("TASK_ACTIVE", "number_marker", "RUNNING", "task took over"),
+            1.1,
+        )
+        recorder.record_decision(
+            self._decision(
+                "RELEASING", "number_marker", "COMPLETED", "task completed",
+                errors=("number_marker step was slow: 0.030s",),
+            ),
+            1.2,
+        )
+        self.assertTrue(recorder.save_task_evidence(self._request()))
+        recorder.close()
+
+        text = (recorder.run_directory / "report.md").read_text(encoding="utf-8")
+        for expected in (
+            "得分截图",
+            "task_2_000007",
+            "Team 03 detects a marker with ID of 2",
+            "number_marker",
+            "COMPLETED",
+            "step was slow",
+        ):
+            self.assertIn(expected, text, f"运行记录里缺少 {expected!r}")
+
+    def test_record_decision_keeps_transitions_only(self):
+        """逐帧调用不能刷屏：只有状态变化或出现错误才记一行。"""
+        recorder = EvidenceRecorder(directory=self.directory)
+        self.addCleanup(recorder.close)
+        recorder.observe(FramePacket(line_frame(320), 1, 1.0), 1.0)
+        plain = self._decision()
+        recorder.record_decision(plain, 1.00)
+        recorder.record_decision(plain, 1.01)
+        recorder.record_decision(self._decision(message="still following"), 1.02)
+        self.assertEqual(len(recorder.events), 1, "同样的状态不该重复记")
+
+        recorder.record_decision(self._decision(errors=("clamped",)), 1.03)
+        self.assertEqual(len(recorder.events), 2, "出现错误必须记下来")
+
+    def test_report_says_so_when_nothing_happened(self):
+        recorder = EvidenceRecorder(directory=self.directory)
+        self.addCleanup(recorder.close)
+        recorder.observe(FramePacket(line_frame(320), 1, 1.0), 1.0)
+        recorder.close()
+        text = (recorder.run_directory / "report.md").read_text(encoding="utf-8")
+        self.assertIn("没有产生得分截图", text)
+        self.assertIn("没有任何模块接管", text)
+
+
 if __name__ == "__main__":
     unittest.main()
