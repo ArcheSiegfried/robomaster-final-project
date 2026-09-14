@@ -26,8 +26,25 @@
 
     captures/run_20260911_153045/
         log.csv        每帧一行：帧号、采集时刻、循环时刻、已运行秒数、画面尺寸、亮度
-        frame_000123_0006.15s.jpg   每隔一段时间存一张关键帧
-        summary.json   结束时写入：总帧数、截图数、写入失败数、运行时长
+        frame_000123_0006.15s.jpg   每隔一段时间存一张关键帧（运行记录用）
+        task_2_000123_0006.15s.jpg  任务得分截图（带检测框 + 居中说明文字）
+        summary.json   结束时写入：总帧数、截图数、任务截图数、写入失败数、运行时长
+
+得分截图（任务证据）——这是 Final 真正算分的东西
+----------------------------------------------
+Final 原文："The count of the saved images will be the final task score"，
+而且每张图必须带"检测框/圆 + 指定的一行说明文字"（例如
+`Team 03 detects a marker with ID of 2`）。所以**画框写字属于证据层**，
+成员模块只负责在得分那一刻把"哪一帧、框在哪、写什么字"交出来：
+
+    request = task.take_evidence_request()              # 任务交出请求
+    saved = recorder.save_task_evidence(request)        # 证据层画 + 存，返回真实结果
+    task.acknowledge_evidence(request.request_id, saved) # 回传真实结果
+
+**最后一步不能省**：任务只有在收到 True 之后才会算作完成并归还控制权；
+不回执 = 任务一直停在"接管中 + 停车"直到超时。所以调用方必须把
+`save_task_evidence()` 的返回值原样回传。谁来做这件事见 `main.py` 的
+`service_task_evidence()`。
 
 设计要点
 --------
@@ -82,6 +99,58 @@ FIELDNAMES = (
 )
 
 
+def _safe_label(text: object) -> str:
+    """把请求里的标识变成可以安全放进文件名的短标签。"""
+    raw = str(text or "task")
+    cleaned = "".join(
+        character if (character.isalnum() or character in "-_") else "_"
+        for character in raw
+    )
+    return cleaned[:48] or "task"
+
+
+def render_task_evidence(request):
+    """在**完整原始画面副本**上画检测框 + 居中说明文字。
+
+    Final 要求存图里必须有"检测到的目标框 + 一行说明文字"，所以画图属于
+    证据层，不属于某个功能模块。这里只读请求对象上的公开字段（鸭子类型），
+    因此不需要 import 任何成员模块：
+
+    * ``image``       真实的全帧 BGR 画面（只读，不修改原图）
+    * ``detection``   带 ``box=(left, top, right, bottom)`` 的检测结果，可为 None
+    * ``annotation``  要显示的说明文字
+    * ``text_anchor`` 文字锚点 ``(x, y)``，缺省用画面中心
+
+    返回标注后的新画面；字段缺失时退化成未标注的副本。取不到图才抛异常。
+    """
+    image = getattr(request, "image", None)
+    if image is None:
+        raise ValueError("evidence request carries no image")
+    shown = image.copy()
+    height, width = shown.shape[:2]
+
+    box = getattr(getattr(request, "detection", None), "box", None)
+    if box:
+        left, top, right, bottom = (int(value) for value in box)
+        cv2.rectangle(shown, (left, top), (right, bottom), (0, 255, 255), 2)
+
+    annotation = getattr(request, "annotation", "")
+    if annotation:
+        anchor = getattr(request, "text_anchor", None) or (width // 2, height // 2)
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        scale = 0.55
+        thickness = 2
+        (text_width, text_height), _ = cv2.getTextSize(
+            str(annotation), font, scale, thickness
+        )
+        x = max(0, min(width - text_width, int(anchor[0]) - text_width // 2))
+        y = max(text_height, min(height - 1, int(anchor[1])))
+        cv2.putText(
+            shown, str(annotation), (x, y), font, scale, (0, 255, 255), thickness
+        )
+    return shown
+
+
 def _resolve_directory(directory: str) -> Path:
     """相对路径按仓库根目录解析，绝对路径原样使用。
 
@@ -120,6 +189,7 @@ class EvidenceRecorder:
         self.last_snapshot: Optional[float] = None
         self.write_failures = 0
         self.snapshots = 0
+        self.task_snapshots = 0
         self.rows_written = 0
         self.duplicate_frames_skipped = 0
 
@@ -205,6 +275,81 @@ class EvidenceRecorder:
         if due_flush:
             self._flush(now)
 
+    def save_task_evidence(self, request) -> bool:
+        """把任务模块交出来的得分截图请求真正落盘，返回**真实写盘结果**。
+
+        调用方必须把这个返回值原样回传到
+        ``task.acknowledge_evidence(request.request_id, saved)``：
+        任务只有收到 True 才会 COMPLETED 并把控制权还给巡线；收不到回执
+        就会一直停在"接管中 + 停车"直到超时。
+
+        这是本模块**唯一**一处同步写盘。它是任务主动发起的，而且任务在等回执
+        期间本来就处于"已接管 + 要求停车"状态（Final 要求先停车再截图），
+        所以写一张 JPEG 不会额外增加运动风险。
+
+        绝不抛异常：任何失败都只累加 ``write_failures`` 并返回 False。
+        """
+        if not self.enabled or self._closed or self.run_directory is None:
+            return False
+
+        request_id = getattr(request, "request_id", "")
+        try:
+            sequence = int(getattr(request, "frame_sequence", 0) or 0)
+        except (TypeError, ValueError):
+            sequence = 0
+        annotation = str(getattr(request, "annotation", "") or "")
+
+        try:
+            image = render_task_evidence(request)
+        except Exception:
+            # 取不到画面。宁可如实报失败，也不要写一张充数的图上去——
+            # Final 的分数就是按这些图算的。
+            self.write_failures += 1
+            return False
+
+        try:
+            captured_at = float(getattr(request, "captured_at", 0.0) or 0.0)
+            elapsed = 0.0
+            if self._started_at is not None and captured_at:
+                elapsed = max(0.0, captured_at - self._started_at)
+            label = _safe_label(
+                getattr(request, "marker_id", None) or request_id or "task"
+            )
+            name = "task_%s_%06d_%07.2fs.jpg" % (label, sequence, elapsed)
+            target = self.run_directory / name
+            # 和关键帧一样：先编码到内存再用 Python 落盘。故意不用
+            # cv2.imwrite —— 它在 Windows 上走窄字符路径，目录名带中文
+            # （例如 E:\...\机器人期末\）时会**静默失败**，只返回 False。
+            ok, buffer = cv2.imencode(
+                ".jpg", image, [int(cv2.IMWRITE_JPEG_QUALITY), SNAPSHOT_QUALITY]
+            )
+            if not ok:
+                self.write_failures += 1
+                return False
+            target.write_bytes(buffer.tobytes())
+        except Exception:
+            self.write_failures += 1
+            return False
+
+        self.task_snapshots += 1
+        self.pending.append(
+            {
+                "sequence": sequence,
+                "captured_at": round(captured_at, 4),
+                "loop_time": round(captured_at, 4),
+                "elapsed_s": round(elapsed, 3),
+                "width": int(image.shape[1]),
+                "height": int(image.shape[0]),
+                "mean_v": "",
+                # 把说明文字写进日志，事后能把图和"哪一分"对上。
+                "note": "task_evidence %s %s" % (request_id, annotation),
+            }
+        )
+        # 立刻把这一行刷进 CSV：得分截图是分数本身，不能等节流。
+        # 传 None 表示"只刷行，不动节流时钟"。
+        self._flush(None)
+        return True
+
     def close(self) -> None:
         """收尾：把剩下的行写掉、关文件、写一份 summary。绝不抛异常。"""
         if self._closed:
@@ -286,6 +431,7 @@ class EvidenceRecorder:
             "frames_recorded": self.rows_written + len(self.pending),
             "rows_written": self.rows_written,
             "snapshots": self.snapshots,
+            "task_snapshots": self.task_snapshots,
             "duplicate_frames_skipped": self.duplicate_frames_skipped,
             "write_failures": self.write_failures,
             "flush_interval_s": self.flush_interval,

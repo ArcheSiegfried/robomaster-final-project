@@ -17,7 +17,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from models import FramePacket  # noqa: E402
+from models import FramePacket, VisualDetection  # noqa: E402
 from tests.task_harness import (  # noqa: E402
     TaskHarness,
     assert_inert_through_harness,
@@ -298,6 +298,137 @@ class GitignoreTests(unittest.TestCase):
             entries,
             "captures/ 必须在 .gitignore 里",
         )
+
+
+class _FakeRequest:
+    """一个任务模块交出来的得分截图请求（字段与 EvidenceRequest 同形）。"""
+
+    def __init__(
+        self,
+        image,
+        annotation="Team 03 detects a marker with ID of 2",
+        request_id="marker:2:frame:7:attempt:1",
+        marker_id="2",
+        sequence=7,
+        captured_at=1.5,
+        box=(240, 130, 400, 230),
+    ):
+        self.request_id = request_id
+        self.marker_id = marker_id
+        self.frame_sequence = sequence
+        self.captured_at = captured_at
+        self.annotation = annotation
+        self.text_anchor = (320, 180)
+        self.image = image
+        self.detection = VisualDetection(valid=True, kind="number_marker", box=box)
+
+
+class _FakeEvidenceTask:
+    """最小假任务：只实现"交请求 / 收回执"这一对协议。"""
+
+    name = "fake_evidence_task"
+
+    def __init__(self, request):
+        self._request = request
+        self.acks = []
+
+    def take_evidence_request(self):
+        request, self._request = self._request, None
+        return request
+
+    def acknowledge_evidence(self, request_id, saved):
+        self.acks.append((request_id, saved))
+        return True
+
+
+class _FakeCoordinator:
+    def __init__(self, task, recorder=None):
+        self.motion_tasks = () if task is None else (task,)
+        self.observers = () if recorder is None else (recorder,)
+
+
+class TaskEvidenceTests(unittest.TestCase):
+    """Final 的得分截图链：任务交请求 -> 证据层画框写字存盘 -> 回传真实结果。"""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.directory = self._tmp.name
+
+    def _request(self, **kwargs):
+        return _FakeRequest(line_frame(320), **kwargs)
+
+    def test_render_draws_on_a_copy_and_keeps_the_full_scene(self):
+        request = self._request()
+        before = request.image.copy()
+        shown = evidence.render_task_evidence(request)
+        self.assertEqual(shown.shape, before.shape)
+        self.assertTrue(np.array_equal(request.image, before), "原图不许被改")
+        self.assertFalse(np.array_equal(shown, before), "框和字应该画上去了")
+
+    def test_request_without_an_image_is_reported_as_not_saved(self):
+        recorder = EvidenceRecorder(directory=self.directory)
+        self.addCleanup(recorder.close)
+        request = self._request()
+        request.image = None
+        self.assertFalse(recorder.save_task_evidence(request))
+        self.assertEqual(recorder.task_snapshots, 0)
+        self.assertEqual(recorder.write_failures, 1)
+
+    def test_saved_snapshot_lands_on_disk_and_in_the_log(self):
+        recorder = EvidenceRecorder(directory=self.directory)
+        self.addCleanup(recorder.close)
+        self.assertTrue(recorder.save_task_evidence(self._request()))
+        self.assertEqual(recorder.task_snapshots, 1)
+
+        pictures = [path.name for path in recorder.run_directory.glob("task_*.jpg")]
+        self.assertEqual(len(pictures), 1, f"应该正好存一张，实际 {pictures}")
+        self.assertIn("2", pictures[0], "文件名里要能看出是哪个标识")
+
+        recorder.close()
+        with recorder.log_path.open(encoding="utf-8-sig") as handle:
+            notes = [row["note"] for row in csv.DictReader(handle)]
+        self.assertTrue(
+            any("Team 03 detects a marker with ID of 2" in note for note in notes),
+            f"说明文字要进日志，实际日志 {notes}",
+        )
+        summary = json.loads(
+            (recorder.run_directory / "summary.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(summary["task_snapshots"], 1)
+
+    def test_disabled_recorder_reports_failure_instead_of_pretending(self):
+        """没开记录时必须如实说"没存成"，否则任务会虚报得分。"""
+        recorder = EvidenceRecorder()
+        self.assertFalse(recorder.save_task_evidence(self._request()))
+        self.assertEqual(recorder.task_snapshots, 0)
+
+    def test_service_passes_the_real_result_back_to_the_task(self):
+        import main
+
+        recorder = EvidenceRecorder(directory=self.directory)
+        self.addCleanup(recorder.close)
+        request = self._request()
+        task = _FakeEvidenceTask(request)
+
+        saved = main.service_task_evidence(_FakeCoordinator(task, recorder))
+
+        self.assertEqual(saved, 1)
+        self.assertEqual(task.acks, [(request.request_id, True)])
+        self.assertEqual(recorder.task_snapshots, 1)
+
+    def test_service_reports_failure_when_recording_is_off(self):
+        """没有证据写入器时必须马上回 False，让任务立刻交回控制权——
+        绝不能把请求悬着，那样车会停在原地等到超时。"""
+        import main
+
+        request = self._request()
+        task = _FakeEvidenceTask(request)
+
+        saved = main.service_task_evidence(_FakeCoordinator(task))
+
+        self.assertEqual(saved, 0)
+        self.assertEqual(task.acks, [(request.request_id, False)])
 
 
 if __name__ == "__main__":
