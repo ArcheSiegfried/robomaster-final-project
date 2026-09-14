@@ -6,7 +6,7 @@ import cv2
 
 from camera_source import LatestFrameSource
 from config import CONFIG
-from coordinator import TaskCoordinator
+from coordinator import LINE_FOLLOWING, RELEASING, TASK_ACTIVE, TaskCoordinator
 from evidence import DEFAULT_CAPTURE_DIRECTORY
 from gimbal_output import GimbalOutput
 from marker_source import MarkerObservationSource
@@ -134,6 +134,147 @@ def record_run_events(coordinator, decision, now) -> None:
             pass
 
 
+#: 巡线状态 → 终端上那一行中文。丢线必须看得见，这是操作员最需要的信息。
+LINE_STATE_TEXT = {
+    "STOPPED": "巡线 STOPPED —— 已停止（还没起步，或刚复位）",
+    "TRACKING": "巡线 TRACKING —— 正常跟线",
+    "COASTING": "巡线 COASTING —— 短暂漏检，底座自己兜",
+    "LINE_LOST": "巡线 LINE_LOST —— 丢线，底座开始找回",
+    "VIDEO_LOST": "巡线 VIDEO_LOST —— 视频失效，已锁停",
+}
+
+
+class ConsoleStatus:
+    """把车的状态按**变化**打到终端，操作员在 VS Code 里就能看到出了什么事。
+
+    只打"变化"和低频心跳（默认 2 秒一行），绝不逐帧刷屏。行首记号：
+
+        （无）巡线状态变化         >>  任务接管
+        <<  任务结束              >>> 得分截图已保存
+        !!  问题/异常             --  心跳
+
+    任何打印失败都被吞掉：把状态打到屏幕这件事，绝不能影响控制循环。
+    """
+
+    def __init__(self, stream=None, heartbeat_interval: float = 2.0,
+                 enabled: bool = True) -> None:
+        self.stream = stream
+        self.heartbeat_interval = float(heartbeat_interval)
+        self.enabled = bool(enabled)
+        self.started_at = None
+        self.frames = 0
+        self.saved_evidence = 0
+        self._line_state = None
+        self._coordinator_state = None
+        self._task_name = None
+        self._lost_since = None
+        self._last_heartbeat = None
+        self._errors: tuple = ()
+
+    # -- 对外 ----------------------------------------------------------
+    def note(self, text: str) -> None:
+        """打一条与当前状态无关的说明（启动信息、人工操作结果等）。"""
+        if not self.enabled:
+            return
+        try:
+            print(text, file=self.stream, flush=True)
+        except Exception:
+            pass
+
+    def update(self, decision, now: float, saved_evidence: int = 0) -> None:
+        """每帧调用一次。只在这里判断"要不要打"，绝不抛异常。"""
+        if not self.enabled:
+            return
+        try:
+            self._update(decision, now, saved_evidence)
+        except Exception:
+            pass
+
+    # -- 内部 ----------------------------------------------------------
+    def _say(self, now: float, text: str) -> None:
+        if self.started_at is None:
+            stamp = 0.0
+        else:
+            stamp = max(0.0, now - self.started_at)
+        try:
+            print("[%6.1fs] %s" % (stamp, text), file=self.stream, flush=True)
+        except Exception:
+            pass
+
+    def _update(self, decision, now: float, saved_evidence: int) -> None:
+        if self.started_at is None:
+            self.started_at = now
+        self.frames += 1
+
+        # 先处理协调器层面（谁在开车），再处理巡线状态：接管/归还期间底座会被
+        # pause 成 STOPPED，那是过渡值，报出来只会误导操作员。
+        state = str(getattr(decision, "state", "") or "")
+        name = getattr(decision, "task_name", None)
+        if name:
+            self._task_name = name
+        if state != self._coordinator_state:
+            previous, self._coordinator_state = self._coordinator_state, state
+            message = str(getattr(decision, "message", "") or "")
+            if state == TASK_ACTIVE:
+                self._say(
+                    now,
+                    ">> %s 接管：%s" % (name or self._task_name or "?", message),
+                )
+            elif state == RELEASING and previous == TASK_ACTIVE:
+                update = getattr(decision, "task_update", None)
+                status = getattr(getattr(update, "status", None), "name", None)
+                self._say(
+                    now,
+                    "<< %s 结束（%s）：%s"
+                    % (self._task_name or "?", status or "-", message),
+                )
+            elif state == LINE_FOLLOWING and previous == RELEASING:
+                self._say(now, "巡线恢复")
+            if state != LINE_FOLLOWING:
+                # 忘掉过渡期的巡线状态，回到巡线后再重新报一次真实状态。
+                self._line_state = None
+
+        line_state = getattr(getattr(decision, "line", None), "state", None)
+        if line_state is not None and line_state != self._line_state:
+            self._line_state = line_state
+            self._lost_since = now if line_state == "LINE_LOST" else None
+            # 视频失效任何时刻都要报；其余状态只在真正巡线时报。
+            if state == LINE_FOLLOWING or line_state == "VIDEO_LOST":
+                self._say(now, LINE_STATE_TEXT.get(line_state, "巡线 %s" % line_state))
+
+        errors = tuple(getattr(decision, "errors", ()) or ())
+        if errors and errors != self._errors:
+            for item in errors:
+                self._say(now, "!! %s" % item)
+        self._errors = errors
+
+        if saved_evidence:
+            self.saved_evidence += int(saved_evidence)
+            self._say(
+                now,
+                ">>> 得分截图已保存（本次第 %d 张）" % self.saved_evidence,
+            )
+
+        if self._last_heartbeat is None:
+            # 第一帧不打心跳：启动横幅已经说明"还活着"，再打一行是噪音。
+            self._last_heartbeat = now
+        elif now - self._last_heartbeat >= self.heartbeat_interval:
+            self._last_heartbeat = now
+            self._say(now, self._heartbeat_text(decision, now))
+
+    def _heartbeat_text(self, decision, now: float) -> str:
+        bits = [
+            "运行 %.1fs" % max(0.0, now - (self.started_at or now)),
+            "帧 %d" % self.frames,
+        ]
+        state = self._line_state or "?"
+        if state == "LINE_LOST" and self._lost_since is not None:
+            state += "（已丢线 %.1fs）" % max(0.0, now - self._lost_since)
+        bits.append("巡线 %s" % state)
+        bits.append("任务 %s" % (getattr(decision, "task_name", None) or self._task_name or "无"))
+        return "-- " + " | ".join(bits)
+
+
 def draw_debug(frame, decision):
     shown = frame.copy()
     line = decision.line
@@ -232,8 +373,7 @@ def main() -> None:
             CONFIG.marker_color,
             CONFIG.marker_coordinate_mode,
         )
-        if not marker_source.start():
-            print("marker observations: NOT subscribed — 数字标识不会触发。")
+        marker_source.start()
         source = LatestFrameSource(
             ep_robot.camera,
             CONFIG.camera_strategy,
@@ -247,6 +387,22 @@ def main() -> None:
             "Ready and stopped. SPACE resume/pause, R reset, Q/ESC quit. "
             f"{len(coordinator.motion_tasks)} task module(s) registered."
         )
+        console = ConsoleStatus(
+            heartbeat_interval=CONFIG.console_heartbeat_seconds,
+            enabled=CONFIG.console_status,
+        )
+        sink = _find_evidence_sink(coordinator)
+        run_directory = getattr(sink, "run_directory", None)
+        if run_directory is not None:
+            console.note(
+                "运行记录目录：%s（结束时写 report.md）" % run_directory
+            )
+        console.note(
+            "marker 订阅：%s"
+            % ("成功" if marker_source is not None and marker_source.enabled
+               else "未订阅（数字标识不会触发）")
+        )
+        console.note("提示：丢线/接管/异常都会打在这里，不用盯 cv2 窗口。")
 
         while True:
             if not _main_window_open():
@@ -260,6 +416,7 @@ def main() -> None:
                     decision = coordinator.video_gap(source.age(now), now)
                     if decision.force_stop:
                         output.hard_stop()
+                    console.update(decision, now)
                 key = cv2.waitKey(1) & 0xFF if CONFIG.display else -1
             else:
                 have_frame = True
@@ -269,9 +426,11 @@ def main() -> None:
                 decision = coordinator.step(packet, now)
                 # Final 的得分截图链：任务交出请求 -> 证据层画框写字存盘 ->
                 # 回传真实结果。放在 step() 之后，任务在等回执期间会保持接管。
-                service_task_evidence(coordinator)
+                saved = service_task_evidence(coordinator)
                 # 运行记录：把这一帧的接管/释放/限幅/异常写进本次运行的 report.md。
                 record_run_events(coordinator, decision, now)
+                # 终端反馈：状态变化 + 心跳。丢线、接管、异常都会打出来。
+                console.update(decision, now, saved)
                 if CONFIG.display:
                     cv2.imshow(
                         "Low-speed line base",
@@ -285,14 +444,14 @@ def main() -> None:
             if key in (ord("q"), 27):
                 break
             if key == ord("r"):
-                print(coordinator.human_reset(now))
+                console.note(coordinator.human_reset(now))
             elif key == ord(" "):
                 if coordinator.task_active or follower.motion_enabled:
-                    print(coordinator.human_stop(now))
+                    console.note(coordinator.human_stop(now))
                 elif coordinator.human_resume(now):
-                    print("Resumed on a fresh valid line.")
+                    console.note("Resumed on a fresh valid line.")
                 else:
-                    print("Resume refused: reset fault and show a fresh line.")
+                    console.note("Resume refused: reset fault and show a fresh line.")
     except KeyboardInterrupt:
         print("Interrupted.")
     except Exception:
