@@ -152,6 +152,17 @@ class ObstacleDetectorTests(unittest.TestCase):
         result = self.detector.detect(robot_self_frame())
         self.assertFalse(result.valid, "把车自己身上的橙色件当成障碍了")
 
+    def test_ignores_the_measured_self_occlusion_strip(self):
+        """报告实测：车自己那块橙色件在 ROI 里是 **72×20 的扁平条**（中位数）。
+
+        426 帧原始数据里，这种尺寸的色块有 423 帧。新加的高度判据
+        （>= 22% ROI 高 = 36 px）一关就把它全部挡掉 —— 这里把它放在 ROI 正中间，
+        证明**即使位置落在 ROI 里面**也过不了。
+        """
+        image = line_frame()
+        cv2.rectangle(image, (240, 200), (312, 220), OBSTACLE_BGR, -1)   # 72 x 20
+        self.assertFalse(self.detector.detect(image).valid, "72x20 的扁条被当成障碍了")
+
     def test_ignores_a_skin_coloured_hand(self):
         """P0-1：手掌/手臂的肤色不许触发（实测 426 帧里 4 帧误触发全是手）。"""
         result = self.detector.detect(skin_frame())
