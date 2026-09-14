@@ -100,18 +100,23 @@ class TaskCoordinator:
         output,
         motion_tasks: Sequence = (),
         observers: Sequence = (),
+        gimbal_output=None,
     ) -> None:
         self.settings = settings
         self.follower = follower
         self.output = output
         self.motion_tasks = tuple(motion_tasks)
         self.observers = tuple(observers)
+        self.gimbal_output = gimbal_output
         self.state = LINE_FOLLOWING
         self.last_line_decision: Optional[RuntimeDecision] = None
         self.active_task = None
         self.active_task_name: Optional[str] = None
         self._active_started: Optional[float] = None
         self._release_started: Optional[float] = None
+        self._view_changed = False
+        self._view_ready_at: Optional[float] = None
+        self._view_restore_failed = False
 
     # -- introspection -------------------------------------------------
     @property
@@ -170,6 +175,42 @@ class TaskCoordinator:
         self.output.send(OWNER_EXTERNAL, command)
         return command
 
+    def _apply_task_gimbal(self, update: TaskUpdate, errors) -> bool:
+        if update.gimbal is None:
+            return True
+        if self.gimbal_output is None:
+            errors.append("task requested gimbal motion but no gimbal outlet is configured")
+            return False
+        try:
+            applied = self.gimbal_output.send(update.gimbal)
+        except Exception as error:
+            errors.append(f"gimbal request failed: {error}")
+            return False
+        self._view_changed = applied != self.gimbal_output.line_view
+        self._view_restore_failed = False
+        return True
+
+    def _restore_line_view(self, now: float, errors, force: bool = False) -> bool:
+        if not force and not self._view_changed and not self._view_restore_failed:
+            self._view_ready_at = None
+            return True
+        if self.gimbal_output is None:
+            errors.append("cannot restore line view: no gimbal outlet is configured")
+            self._view_restore_failed = True
+            self._view_ready_at = None
+            return False
+        try:
+            self.gimbal_output.restore_line_view()
+        except Exception as error:
+            errors.append(f"cannot restore line view: {error}")
+            self._view_restore_failed = True
+            self._view_ready_at = None
+            return False
+        self._view_changed = False
+        self._view_restore_failed = False
+        self._view_ready_at = now + self.settings.gimbal_settle_seconds
+        return True
+
     # -- per-cycle entry point -----------------------------------------
     def step(self, frame: FramePacket, now: float) -> CoordinatorDecision:
         errors = []
@@ -214,6 +255,8 @@ class TaskCoordinator:
         self.active_task_name = task.name
         self._active_started = now
         self.state = TASK_ACTIVE
+        if not self._apply_task_gimbal(update, errors):
+            return self._release(now, errors, "task gimbal request failed")
         command = self._apply_task_motion(update, errors)
         return CoordinatorDecision(
             state=TASK_ACTIVE,
@@ -239,6 +282,8 @@ class TaskCoordinator:
         if update is None:
             return self._release(now, errors, "task raised an exception")
         if update.status is TaskStatus.RUNNING:
+            if not self._apply_task_gimbal(update, errors):
+                return self._release(now, errors, "task gimbal request failed")
             command = self._apply_task_motion(update, errors)
             return CoordinatorDecision(
                 state=TASK_ACTIVE,
@@ -269,6 +314,7 @@ class TaskCoordinator:
         self.active_task_name = None
         self._active_started = None
         self._release_started = now
+        self._restore_line_view(now, errors)
         self.state = RELEASING
         return CoordinatorDecision(
             state=RELEASING,
@@ -283,6 +329,41 @@ class TaskCoordinator:
         )
 
     def _step_releasing(self, frame, now, errors) -> CoordinatorDecision:
+        if self._view_restore_failed:
+            self.output.hard_stop()
+            if now - self._release_started > self.settings.tasks.release_resume_timeout:
+                self._release_started = None
+                self.state = LINE_FOLLOWING
+                return CoordinatorDecision(
+                    state=LINE_FOLLOWING,
+                    owner=self.output.owner,
+                    line=self.last_line_decision,
+                    command=STOP_COMMAND,
+                    force_stop=True,
+                    message="line-view restore failed; reset and resume required",
+                    errors=tuple(errors),
+                )
+            return CoordinatorDecision(
+                state=RELEASING,
+                owner=self.output.owner,
+                line=self.last_line_decision,
+                command=STOP_COMMAND,
+                force_stop=True,
+                message="waiting for line-view restore",
+                errors=tuple(errors),
+            )
+
+        if self._view_ready_at is not None and now < self._view_ready_at:
+            self.output.hard_stop()
+            return CoordinatorDecision(
+                state=RELEASING,
+                owner=self.output.owner,
+                line=self.last_line_decision,
+                command=STOP_COMMAND,
+                message="waiting for gimbal to return to line view",
+                errors=tuple(errors),
+            )
+        self._view_ready_at = None
         decision = self.follower.process_frame(frame.image, frame.captured_at)
         self.last_line_decision = decision
 
@@ -328,7 +409,7 @@ class TaskCoordinator:
         message = ""
         if self.active_task is not None:
             message = f"{self.active_task_name} ended by video gap"
-            self._end_takeover(now)
+            self._end_takeover(now, errors)
         decision = self.follower.process_video_gap(frame_age, now)
         self.last_line_decision = decision
         if decision.force_stop:
@@ -344,7 +425,7 @@ class TaskCoordinator:
         )
 
     # -- human override -------------------------------------------------
-    def _end_takeover(self, now: float) -> Optional[str]:
+    def _end_takeover(self, now: float, errors=None) -> Optional[str]:
         if self.active_task is None:
             return None
         name = self.active_task_name
@@ -356,6 +437,7 @@ class TaskCoordinator:
         self._active_started = None
         self._release_started = None
         self.state = LINE_FOLLOWING
+        self._restore_line_view(now, [] if errors is None else errors)
         return name
 
     def human_stop(self, now: float) -> str:
@@ -373,8 +455,12 @@ class TaskCoordinator:
         ended = self._end_takeover(now)
         self.follower.reset_fault(now)
         self.output.hard_stop()
+        restore_errors = []
+        self._restore_line_view(now, restore_errors, force=True)
         self._release_started = None
         self.state = LINE_FOLLOWING
+        if restore_errors:
+            return "Reset: stopped; line-view restore failed. Check the gimbal."
         if ended is not None:
             return f"Reset; task {ended} ended. Show a valid line, then press SPACE."
         return "Reset: stopped; show a valid line, then press SPACE."
@@ -383,6 +469,10 @@ class TaskCoordinator:
         if self.active_task is not None:
             return False
         if self.state != LINE_FOLLOWING:
+            return False
+        if self._view_restore_failed:
+            return False
+        if self._view_ready_at is not None and now < self._view_ready_at:
             return False
         self._release_started = None
         return bool(self.follower.resume(now))

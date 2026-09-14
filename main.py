@@ -8,6 +8,7 @@ from camera_source import LatestFrameSource
 from config import CONFIG
 from coordinator import TaskCoordinator
 from evidence import DEFAULT_CAPTURE_DIRECTORY
+from gimbal_output import GimbalOutput
 from motion_output import MotionOutput
 from runtime import LineFollower
 from task_registry import build_motion_tasks, build_observers
@@ -18,6 +19,7 @@ def build_coordinator(
     output,
     settings=CONFIG,
     capture_directory=DEFAULT_CAPTURE_DIRECTORY,
+    gimbal_output=None,
 ):
     """Wire every registered module into the coordinator.
 
@@ -33,6 +35,7 @@ def build_coordinator(
         output,
         motion_tasks=build_motion_tasks(),
         observers=build_observers(capture_directory),
+        gimbal_output=gimbal_output,
     )
 
 
@@ -88,8 +91,8 @@ def _align_camera(ep_robot, output, robot_module) -> None:
     action = ep_robot.gimbal.moveto(
         pitch=CONFIG.gimbal_pitch,
         yaw=CONFIG.gimbal_yaw,
-        pitch_speed=30,
-        yaw_speed=60,
+        pitch_speed=CONFIG.gimbal_pitch_speed,
+        yaw_speed=CONFIG.gimbal_yaw_speed,
     )
     if action.wait_for_completed() is not True:
         raise RuntimeError("gimbal alignment failed")
@@ -106,6 +109,7 @@ def main() -> None:
     ep_robot = robot.Robot()
     source = None
     output = None
+    gimbal_output = None
     stream_started = False
     follower = LineFollower(CONFIG)
     coordinator = None
@@ -114,8 +118,11 @@ def main() -> None:
     try:
         ep_robot.initialize(conn_type="ap", proto_type="udp")
         output = MotionOutput(ep_robot.chassis, CONFIG)
-        coordinator = build_coordinator(follower, output)
         _align_camera(ep_robot, output, robot)
+        gimbal_output = GimbalOutput(ep_robot.gimbal, CONFIG)
+        coordinator = build_coordinator(
+            follower, output, gimbal_output=gimbal_output
+        )
         resolution_name = f"STREAM_{CONFIG.camera_resolution.upper()}"
         resolution = getattr(camera, resolution_name)
         ep_robot.camera.start_video_stream(
@@ -187,6 +194,11 @@ def main() -> None:
             coordinator.close()
         if output is not None:
             output.hard_stop()
+        if gimbal_output is not None:
+            try:
+                gimbal_output.restore_line_view()
+            except Exception:
+                pass
         if source is not None:
             source.close()
         if stream_started:

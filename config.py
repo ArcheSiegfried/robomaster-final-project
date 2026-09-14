@@ -84,6 +84,14 @@ class RuntimeConfig:
     resume_detection_max_age: float = 0.15
     gimbal_pitch: int = -25
     gimbal_yaw: int = 0
+    gimbal_search_pitch: int = -5
+    gimbal_pitch_min: int = -25
+    gimbal_pitch_max: int = 10
+    gimbal_yaw_min: int = -30
+    gimbal_yaw_max: int = 30
+    gimbal_pitch_speed: int = 30
+    gimbal_yaw_speed: int = 60
+    gimbal_settle_seconds: float = 0.45
     display: bool = True
     vision: VisionConfig = field(default_factory=VisionConfig)
     control: ControlConfig = field(default_factory=ControlConfig)

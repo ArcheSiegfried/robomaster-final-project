@@ -25,17 +25,17 @@
 
 ### 可以作为后续任务
 
-- 正式数字、灯、截图、障碍、长断线/岔路和总体任务状态机。
+- 正式数字、灯、截图、障碍、岔路和总体任务状态机；长断线第一版已离线实现，但仍需实车标定与组合场景验证。
 - 收集场地数据后调整 HSV、ROI、PD、速度及各种任务阈值。
 - 根据实际整合压力决定是否增加少量任务协调代码；当前不建立插件或事件系统。
 
 ### 不需要修改
 
 - `LatestFrameSource` 已真实产生 `FramePacket(image, sequence, captured_at)`，主循环真实消费同一包；未来检测器可共享该帧。
-- `LineDetection`、`VisualDetection`、`MotionCommand`、`TaskStatus` 和 `TaskUpdate` 已能表达第一阶段接入需求，v0.1 字段无需扩张。
+- `LineDetection`、`VisualDetection`、`MotionCommand`、`TaskStatus` 和 `TaskUpdate` 已能表达第一阶段接入需求。Issue #15 批准的 v0.2 仅在 `TaskUpdate` 末尾增加可选 `GimbalCommand`，原 v0.1 字段保持兼容。
 - `LineFollower.pause/reset_fault/resume` 已区分人工停止、故障复位和新鲜有效路线显式恢复，并清理历史。
 - `MotionOutput` 是生产代码中唯一正常底盘出口；`main.py` 没有直接调用 chassis。
-- 普通漏检最多容错 0.28 秒，持续丢线进入 `LINE_LOST` 锁停；没有搜索状态，不冒充长断线任务。
+- 普通漏检最多容错 0.28 秒，持续丢线进入 `LINE_LOST` 锁停。独立 `RouteTask` 只在该边界之后接管，不改变基础短时容错。
 - 视频无新帧使用独立 `VIDEO_LOST`，不会被当作图像漏检继续运动；异常和退出有硬停车清理。
 
 ### 必须实车确认
@@ -58,7 +58,9 @@
 
 已经编码但未实车验证：基础巡线整体表现、相机/机器人生命周期、云台对齐、命令方向/超时、键盘操作及真实断网停车。
 
-尚未实现：数字、灯、障碍、长断线、两类岔路、正式截图证据、模块协调和整场流程。14 项离线测试不能证明这些功能，更不能证明期末得分或实车稳定。
+长断线恢复第一版已实现并通过合成帧离线测试：确认长丢线后抬高云台、有限交替扫描、远端线段确认后低速靠近、三帧稳定重获、超时/人工停止/视频失效恢复巡线视角。它尚未经过任何实车、真实断口、岔路或组合场景验证。
+
+其余模块状态必须以各自最新 PR、测试和交接记录为准；正式总体任务流程仍未完成。离线测试不能证明期末得分或实车稳定。
 
 ## 4. 架构和高冲突文件
 
@@ -66,14 +68,16 @@
 main.py
   ├─ LatestFrameSource -> FramePacket（唯一相机入口）
   ├─ LineFollower -> RuntimeDecision / MotionCommand
-  └─ MotionOutput（唯一正常底盘出口）
+  ├─ TaskCoordinator -> TaskUpdate / MotionCommand / GimbalCommand
+  ├─ MotionOutput（唯一正常底盘出口）
+  └─ GimbalOutput（唯一动态云台出口）
 
 未来任务：共享 FramePacket -> VisualDetection / TaskUpdate / MotionCommand
 ```
 
-`models.py`、`camera_source.py`、`runtime.py`、`motion_output.py`、`main.py` 是高冲突公共文件，普通模块不得自行修改。接口详情以 `MODULE_GUIDE.md` 的 v0.1 为准。
+`models.py`、`camera_source.py`、`runtime.py`、`motion_output.py`、`gimbal_output.py`、`main.py` 是高冲突公共文件，普通模块不得自行修改。接口详情以 `MODULE_GUIDE.md` 的 v0.2 为准。
 
-短时漏检属于底座：`COASTING` 仅处理反光和少数帧漏检，0.28 秒后锁停。长断线属于未来外部任务：接管前暂停巡线，运动经 `MotionOutput`，步骤非阻塞且有硬超时；结束后停车、归还 owner、清历史、处理新帧并显式恢复。不得延长短时预算代替长断线。
+短时漏检属于底座：`COASTING` 仅处理反光和少数帧漏检，0.28 秒后锁停。长断线属于独立 `RouteTask`：接管前暂停巡线，底盘和云台请求分别经唯一出口，步骤非阻塞且有 5 秒硬超时；结束后停车、恢复巡线视角、归还 owner、清历史、处理新帧并显式恢复。不得延长短时预算代替长断线。
 
 ## 5. 分支用途和权限边界
 
@@ -113,7 +117,7 @@ main.py
 ## 7. 合并审查
 
 - 分支是否来自近期 `integration`，改动是否只属于一个工作包。
-- 输入是否来自共享 `FramePacket`，输出是否为 v0.1 公共类型。
+- 输入是否来自共享 `FramePacket`，输出是否为 v0.2 公共类型。
 - 是否没有第二相机、SDK 直调、阻塞循环、无限动作或绕过 `MotionOutput`。
 - 无目标、错误目标、超时、失败、完成和恢复是否有测试。
 - 公共文件变化是否已协调、解释接口缺口并补集成测试。
