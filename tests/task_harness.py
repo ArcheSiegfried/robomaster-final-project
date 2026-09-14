@@ -46,6 +46,7 @@ INFRASTRUCTURE_FILES = {
     "runtime.py",
     "motion_output.py",
     "gimbal_output.py",
+    "marker_source.py",
     "coordinator.py",
     "task_registry.py",
     "main.py",

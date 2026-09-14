@@ -9,6 +9,7 @@ from config import CONFIG
 from coordinator import TaskCoordinator
 from evidence import DEFAULT_CAPTURE_DIRECTORY
 from gimbal_output import GimbalOutput
+from marker_source import MarkerObservationSource
 from motion_output import MotionOutput
 from runtime import LineFollower
 from task_registry import build_motion_tasks, build_observers
@@ -88,6 +89,33 @@ def service_task_evidence(coordinator) -> int:
         if saved:
             saved_count += 1
     return saved_count
+
+
+def feed_marker_observations(coordinator, source, frame, now) -> int:
+    """把 SDK marker 订阅的新鲜观测推给需要它的任务。
+
+    **必须每帧在 coordinator.step() 之前调用**，否则任务这一步看到的是上一帧
+    甚至没有观测。任务自己不能碰 SDK，所以这条通道由主循环统一喂。
+
+    返回这一帧被喂到的任务数（给日志和测试用）。绝不抛异常。
+    """
+    if source is None:
+        return 0
+    try:
+        candidates = source.candidates(frame, now)
+    except Exception:
+        candidates = ()
+    fed = 0
+    for task in getattr(coordinator, "motion_tasks", ()):
+        push = getattr(task, "update_candidates", None)
+        if not callable(push):
+            continue
+        try:
+            push(candidates)
+            fed += 1
+        except Exception:
+            pass
+    return fed
 
 
 def record_run_events(coordinator, decision, now) -> None:
@@ -177,6 +205,7 @@ def main() -> None:
     source = None
     output = None
     gimbal_output = None
+    marker_source = None
     stream_started = False
     follower = LineFollower(CONFIG)
     coordinator = None
@@ -196,6 +225,15 @@ def main() -> None:
             display=False, resolution=resolution
         )
         stream_started = True
+        # 数字标识的观测来源：SDK 的 marker 订阅（任务模块不许自己碰 SDK）。
+        # 视频流起来之后再订阅；订阅失败只是模块不触发，不影响巡线。
+        marker_source = MarkerObservationSource(
+            ep_robot.vision,
+            CONFIG.marker_color,
+            CONFIG.marker_coordinate_mode,
+        )
+        if not marker_source.start():
+            print("marker observations: NOT subscribed — 数字标识不会触发。")
         source = LatestFrameSource(
             ep_robot.camera,
             CONFIG.camera_strategy,
@@ -226,6 +264,8 @@ def main() -> None:
             else:
                 have_frame = True
                 last_sequence = packet.sequence
+                # 先把新鲜观测喂给任务，再让它 step，否则它看到的是上一帧的数据。
+                feed_marker_observations(coordinator, marker_source, packet, now)
                 decision = coordinator.step(packet, now)
                 # Final 的得分截图链：任务交出请求 -> 证据层画框写字存盘 ->
                 # 回传真实结果。放在 step() 之后，任务在等回执期间会保持接管。
@@ -273,6 +313,9 @@ def main() -> None:
                 pass
         if source is not None:
             source.close()
+        if marker_source is not None:
+            # 退订 marker 识别：不能把 SDK 的订阅留给下一次运行。
+            marker_source.stop()
         if stream_started:
             try:
                 ep_robot.camera.stop_video_stream()

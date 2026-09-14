@@ -92,6 +92,13 @@ class RuntimeConfig:
     gimbal_pitch_speed: int = 30
     gimbal_yaw_speed: int = 60
     gimbal_settle_seconds: float = 0.45
+    # 数字标识的 SDK marker 订阅（见 marker_source.py）。
+    # marker_color: SDK 的 marker 颜色过滤器只能设一个。留空 = 不设过滤器。
+    #   实车如果一直收不到 marker，依次试 "red" / "green" / "blue"。
+    # marker_coordinate_mode: "auto" 自动判断回调坐标是归一化还是像素；
+    #   实车第一次跑请核对 marker_source.stats() 的判断结果。
+    marker_color: str = ""
+    marker_coordinate_mode: str = "auto"
     display: bool = True
     vision: VisionConfig = field(default_factory=VisionConfig)
     control: ControlConfig = field(default_factory=ControlConfig)
