@@ -163,7 +163,7 @@ LineFollower.resume(timestamp: Optional[float] = None) -> bool
 
 接管顺序：`follower.pause()`，随后 `output.claim("external")`。交回顺序：任务零运动、`output.claim("line")`、`follower.reset_fault()`、处理一张新帧确认路线、`follower.resume()`。`resume()` 只有在停止状态且最近 `0.15 s` 内存在有效路线时返回 `True`，并重置控制历史。
 
-普通短时漏检由 `LineFollower` 在 `0.28 s` 内降速容错；超时锁定停车。`RouteTask` 是独立的长断线恢复任务，必须在此后才接管，不能延长短时容错时间冒充实现。第一版仅完成离线验证，详见 `ROUTE_RECOVERY.md`。
+普通短时漏检由 `LineFollower` 在 `0.28 s` 内降速容错；超时锁定停车。`RouteTask` 是独立的长断线恢复任务，必须在此后才接管，不能延长短时容错时间冒充实现。第二版仍只完成离线验证，专用视觉辅助在 `route_detector.py`，详见 `ROUTE_RECOVERY.md`。
 
 ## 3. 最小模块示例
 
@@ -222,6 +222,7 @@ python -m unittest discover -s tests -v
 | `traffic_light.py` | `TrafficLightTask` | 接管型 |
 | `obstacle.py` | `ObstacleTask` | 接管型 |
 | `route.py` | `RouteTask` | 接管型 |
+| `route_detector.py` | `RouteVision` | 长断线纯视觉辅助（不登记为任务） |
 | `green_junction.py` | `GreenJunctionTask` | 接管型 |
 | `free_junction.py` | `FreeJunctionTask` | 接管型 |
 | `evidence.py` | `EvidenceRecorder` | 观察型（基础设施，由整合负责人维护，不占名额） |

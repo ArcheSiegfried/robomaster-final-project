@@ -48,3 +48,19 @@ powershell -ExecutionPolicy Bypass -File scripts\check_offline.ps1
 另外用 300 张 640×360 合成空白帧测量 `RouteTask.step()`：平均 `1.264 ms`，最大 `8.376 ms`。该数据只说明本机离线逐帧调用没有阻塞，不代表机器人实际帧率、网络时延或恢复成功率。
 
 本轮同样没有运行 `main.py`、连接机器人、启动视频或发送实车命令。长断线所用云台角度、扫描方向、速度、时限、真实线段筛选及不同模块的接管优先级均待负责人组织实车验证。
+
+## 2026-09-14 长断线第二版离线回归
+
+根据首次实车反馈，第二版增加下方旧线检测、近全屏单端线段检测、走到物理线尾、有限空白跨越、±95° 扇形搜索、候选方向控制、旧线近端排除和分阶段交接。公共数据类型与 `TaskUpdate.step(frame, now)` 契约没有变化；协调器只增加可选 `reset()` 生命周期清理，避免人工停止、视频失效或任务结束后保留旧任务状态。
+
+实际执行：
+
+```powershell
+python -m unittest tests.test_route tests.test_coordinator -v
+python scripts\check_module.py route
+powershell -ExecutionPolicy Bypass -File scripts\check_offline.ps1 -Python .\.venv\Scripts\python.exe
+```
+
+结果：路线与协调器相关回归 `51/51` 通过；`route.py`/`route_detector.py` 静态契约检查和路线专测 `18/18` 通过；同步最新 `integration` 后，统一脚本语法检查 `40` 个 Python 文件、完整单元测试 `299/299`、离线接管示例和全部登记模块检查均通过，末尾输出 `OFFLINE_CHECK_OK`。
+
+本轮没有运行 `main.py`，没有连接机器人、相机或视频流，也没有向实车发送任何运动/云台命令。合成图只能证明状态机、限幅、几何筛选和故障路径符合当前约定，不能证明真实断口恢复成功率。抬头 ROI、HSV/形态学、0.12 m/s 空白跨越、30°/s 搜索、±95° 搜索范围、底盘 yaw 符号、旧线排除效果和云台异步完成时间仍须实车验证。

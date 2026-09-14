@@ -52,6 +52,17 @@ class ScriptedTask:
         return self._updates[index]
 
 
+class ResettableScriptedTask(ScriptedTask):
+    """Stateful task double used to verify optional lifecycle cleanup."""
+
+    def __init__(self, updates, name="resettable"):
+        super().__init__(updates, name=name)
+        self.reset_calls = 0
+
+    def reset(self):
+        self.reset_calls += 1
+
+
 class NeverTask:
     def __init__(self, name="never"):
         self.name = name
@@ -252,6 +263,15 @@ class CoordinatorTests(unittest.TestCase):
         self.assertEqual(harness.owner, "line")
         self.assertTrue(decision.force_stop)
 
+    def test_normal_completion_does_not_erase_task_cooldown_state(self):
+        task = ResettableScriptedTask(
+            [running(MotionCommand(forward=0.1)), TaskUpdate(TaskStatus.COMPLETED)]
+        )
+        harness = TaskHarness(task=task)
+        harness.start_line(now=1.0)
+        harness.feed_line(1.10)
+        self.assertEqual(task.reset_calls, 0)
+
     def test_not_triggered_while_active_is_treated_as_failure(self):
         task = ScriptedTask(
             [running(MotionCommand(forward=0.1)), TaskUpdate(TaskStatus.NOT_TRIGGERED)]
@@ -284,13 +304,14 @@ class CoordinatorTests(unittest.TestCase):
         self.assertTrue(any("exception" in error for error in decision.errors))
 
     def test_task_running_too_long_is_released(self):
-        task = ScriptedTask([running(MotionCommand(forward=0.1))])
+        task = ResettableScriptedTask([running(MotionCommand(forward=0.1))])
         harness = TaskHarness(task=task, config=config_with(max_task_seconds=0.05))
         harness.start_line(now=1.0)
         decision = harness.feed_line(1.10)
         self.assertEqual(harness.owner, "line")
         self.assertTrue(decision.force_stop)
         self.assertTrue(any("max_task_seconds" in error for error in decision.errors))
+        self.assertEqual(task.reset_calls, 1)
 
     # -- release to resume ---------------------------------------------
     def test_release_waits_for_a_fresh_valid_frame_before_resuming(self):
@@ -444,6 +465,20 @@ class CoordinatorTests(unittest.TestCase):
 
         self.assertTrue(harness.coordinator.human_resume(1.25))
         self.assertTrue(harness.follower.motion_enabled)
+
+    def test_human_stop_resets_a_stateful_task(self):
+        task = ResettableScriptedTask([running(MotionCommand(forward=0.1))])
+        harness = TaskHarness(task=task)
+        harness.start_line(now=1.0)
+        harness.coordinator.human_stop(1.15)
+        self.assertEqual(task.reset_calls, 1)
+
+    def test_video_gap_resets_a_stateful_task(self):
+        task = ResettableScriptedTask([running(MotionCommand(forward=0.1))])
+        harness = TaskHarness(task=task)
+        harness.start_line(now=1.0)
+        harness.coordinator.video_gap(CONFIG.video_gap_stop_seconds, 1.30)
+        self.assertEqual(task.reset_calls, 1)
 
     def test_human_reset_ends_takeover(self):
         task = ScriptedTask([running(MotionCommand(forward=0.1))])

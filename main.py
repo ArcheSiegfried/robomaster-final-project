@@ -292,6 +292,26 @@ def draw_debug(frame, decision):
         for point, color in points:
             if point is not None:
                 cv2.circle(shown, point, 5, color, -1)
+    task_detection = (
+        decision.task_update.detection
+        if decision.task_update is not None
+        else None
+    )
+    if task_detection is not None and task_detection.valid:
+        if task_detection.box is not None:
+            left, top, right, bottom = task_detection.box
+            cv2.rectangle(shown, (left, top), (right, bottom), (255, 0, 255), 2)
+        if task_detection.center is not None:
+            cv2.circle(shown, task_detection.center, 6, (255, 0, 255), -1)
+        cv2.putText(
+            shown,
+            task_detection.kind,
+            (10, 50),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.50,
+            (255, 0, 255),
+            2,
+        )
     label = (
         f"{decision.state} owner={decision.owner} "
         f"v={decision.command.forward:.2f} "
@@ -459,12 +479,13 @@ def main() -> None:
             output.hard_stop()
         raise
     finally:
-        if coordinator is not None:
-            # Flush and close the evidence recorder before tearing anything else
-            # down. Never raises.
-            coordinator.close()
+        # Safety stop precedes optional recorder/UI cleanup.  A slow or broken
+        # observer must never delay the final zero-speed command.
         if output is not None:
             output.hard_stop()
+        if coordinator is not None:
+            # Flush and close the evidence recorder after the chassis stop.
+            coordinator.close()
         if gimbal_output is not None:
             try:
                 gimbal_output.restore_line_view()

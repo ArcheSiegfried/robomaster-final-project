@@ -190,6 +190,22 @@ class TaskCoordinator:
         self._view_restore_failed = False
         return True
 
+    @staticmethod
+    def _reset_task(task, errors) -> None:
+        """Best-effort lifecycle reset for an ended stateful task.
+
+        The hook is optional, so existing modules keep the frozen v0.2 step
+        contract.  Human stop, video loss and coordinator timeouts must not
+        leave a task in its old RUNNING state ready to retake control later.
+        """
+        reset = getattr(task, "reset", None)
+        if not callable(reset):
+            return
+        try:
+            reset()
+        except Exception as error:
+            errors.append(f"{task.name} reset failed: {error}")
+
     def _restore_line_view(self, now: float, errors, force: bool = False) -> bool:
         if not force and not self._view_changed and not self._view_restore_failed:
             self._view_ready_at = None
@@ -256,7 +272,9 @@ class TaskCoordinator:
         self._active_started = now
         self.state = TASK_ACTIVE
         if not self._apply_task_gimbal(update, errors):
-            return self._release(now, errors, "task gimbal request failed")
+            return self._release(
+                now, errors, "task gimbal request failed", reset_task=True
+            )
         command = self._apply_task_motion(update, errors)
         return CoordinatorDecision(
             state=TASK_ACTIVE,
@@ -276,14 +294,18 @@ class TaskCoordinator:
                 f"{task.name} exceeded max_task_seconds "
                 f"({self.settings.tasks.max_task_seconds:.1f}s)"
             )
-            return self._release(now, errors, "task timeout")
+            return self._release(now, errors, "task timeout", reset_task=True)
 
         update = self._call(task.step, task.name, frame, now, errors)
         if update is None:
-            return self._release(now, errors, "task raised an exception")
+            return self._release(
+                now, errors, "task raised an exception", reset_task=True
+            )
         if update.status is TaskStatus.RUNNING:
             if not self._apply_task_gimbal(update, errors):
-                return self._release(now, errors, "task gimbal request failed")
+                return self._release(
+                    now, errors, "task gimbal request failed", reset_task=True
+                )
             command = self._apply_task_motion(update, errors)
             return CoordinatorDecision(
                 state=TASK_ACTIVE,
@@ -300,16 +322,33 @@ class TaskCoordinator:
                 f"{task.name} returned NOT_TRIGGERED while owning motion; "
                 f"a task must keep returning RUNNING until it completes or fails"
             )
-            return self._release(now, errors, "task gave up while owning motion")
+            return self._release(
+                now,
+                errors,
+                "task gave up while owning motion",
+                reset_task=True,
+            )
         return self._release(
             now, errors, f"task {update.status.value}", update=update
         )
 
-    def _release(self, now, errors, message, update=None) -> CoordinatorDecision:
+    def _release(
+        self,
+        now,
+        errors,
+        message,
+        update=None,
+        reset_task: bool = False,
+    ) -> CoordinatorDecision:
         name = self.active_task_name
+        task = self.active_task
         self.output.hard_stop()
         self.output.claim(OWNER_LINE)
         self.follower.reset_fault(now)
+        # A normal terminal update may deliberately retain de-duplication or
+        # cooldown state.  Forced endings cannot safely retain RUNNING state.
+        if reset_task and task is not None:
+            self._reset_task(task, errors)
         self.active_task = None
         self.active_task_name = None
         self._active_started = None
@@ -429,9 +468,12 @@ class TaskCoordinator:
         if self.active_task is None:
             return None
         name = self.active_task_name
+        task = self.active_task
+        reset_errors = [] if errors is None else errors
         self.output.hard_stop()
         self.output.claim(OWNER_LINE)
         self.follower.reset_fault(now)
+        self._reset_task(task, reset_errors)
         self.active_task = None
         self.active_task_name = None
         self._active_started = None
