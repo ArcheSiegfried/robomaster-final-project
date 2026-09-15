@@ -614,6 +614,7 @@ class GreenJunctionTask:
     死规矩（红线 8）：一旦返回 ``RUNNING``，就必须持续返回 ``RUNNING``，
     直到 ``COMPLETED`` 或 ``FAILED``，中间不会改口成 ``NOT_TRIGGERED``。
     """
+    name = "green_junction"
 
     def __init__(
         self,

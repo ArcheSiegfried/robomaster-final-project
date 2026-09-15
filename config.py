@@ -52,6 +52,28 @@ class ControlConfig:
     recovery_ramp_seconds: float = 0.20
 
 @dataclass(frozen=True)
+class TaskConfig:
+    """Safety envelope for external task takeover, not per-module tuning.
+
+    These bounds are enforced by coordinator.TaskCoordinator, so a module bug
+    cannot command more than these limits and cannot hold control forever.
+    A module may keep its own smaller limits inside its own file.
+    """
+
+    # A single continuous takeover longer than this is aborted and released.
+    max_task_seconds: float = 20.0
+    # After a task releases, wait this long for a fresh valid line before
+    # giving up and requiring a human SPACE press.
+    release_resume_timeout: float = 2.0
+    # One step()/observe() call slower than this is recorded as an error.
+    max_step_seconds: float = 0.02
+    # Hard caps applied to every task MotionCommand before it is sent.
+    task_max_forward: float = 0.30
+    task_max_lateral: float = 0.25
+    task_max_yaw: float = 90.0
+
+
+@dataclass(frozen=True)
 class RuntimeConfig:
     camera_resolution: str = "360p"
     camera_strategy: str = "newest"
@@ -62,8 +84,28 @@ class RuntimeConfig:
     resume_detection_max_age: float = 0.15
     gimbal_pitch: int = -25
     gimbal_yaw: int = 0
+    gimbal_search_pitch: int = -5
+    gimbal_pitch_min: int = -25
+    gimbal_pitch_max: int = 10
+    gimbal_yaw_min: int = -30
+    gimbal_yaw_max: int = 30
+    gimbal_pitch_speed: int = 30
+    gimbal_yaw_speed: int = 60
+    gimbal_settle_seconds: float = 0.45
+    # 数字标识的 SDK marker 订阅（见 marker_source.py）。
+    # marker_color: SDK 的 marker 颜色过滤器只能设一个。留空 = 不设过滤器。
+    #   实车如果一直收不到 marker，依次试 "red" / "green" / "blue"。
+    # marker_coordinate_mode: "auto" 自动判断回调坐标是归一化还是像素；
+    #   实车第一次跑请核对 marker_source.stats() 的判断结果。
+    marker_color: str = ""
+    marker_coordinate_mode: str = "auto"
+    # 终端状态反馈（丢线、任务接管、异常、心跳）。False = 完全不打印。
+    console_status: bool = True
+    #: 心跳行间隔（秒）。只影响"还活着"那行的频率，不影响状态变化行。
+    console_heartbeat_seconds: float = 2.0
     display: bool = True
     vision: VisionConfig = field(default_factory=VisionConfig)
     control: ControlConfig = field(default_factory=ControlConfig)
+    tasks: TaskConfig = field(default_factory=TaskConfig)
 
 CONFIG = RuntimeConfig()

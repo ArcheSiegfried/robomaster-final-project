@@ -32,3 +32,37 @@ line:TRACKING
 ## 未执行及待验证
 
 没有运行 `main.py`，没有连接机器人、启动视频或发送运动指令。当前没有随项目交付的真实录像或场地样图，因此仍需架空车轮验证运动符号、命令超时和急停，再在现场验证 HSV、ROI、线宽筛选、反光漏检、弯道参数和真实断网停车。
+
+## 2026-09-13 长断线第一版离线回归
+
+本轮将公共接口升级为 v0.2，在 `TaskUpdate` 末尾增加可选 `GimbalCommand`，并增加唯一动态云台出口。实际执行：
+
+```powershell
+python -m unittest tests.test_route tests.test_gimbal_output tests.test_coordinator tests.test_task_contract -v
+python scripts\check_module.py route
+powershell -ExecutionPolicy Bypass -File scripts\check_offline.ps1
+```
+
+结果：相关回归 `53/53` 通过；`route.py` 静态契约检查和 `8/8` 专测通过。同步当时最新 `integration` 后再次运行统一脚本：语法检查 `36` 个 Python 文件、完整单元测试 `239/239`、离线接管示例、全部注册模块契约检查均通过，末尾输出 `OFFLINE_CHECK_OK`。
+
+另外用 300 张 640×360 合成空白帧测量 `RouteTask.step()`：平均 `1.264 ms`，最大 `8.376 ms`。该数据只说明本机离线逐帧调用没有阻塞，不代表机器人实际帧率、网络时延或恢复成功率。
+
+本轮同样没有运行 `main.py`、连接机器人、启动视频或发送实车命令。长断线所用云台角度、扫描方向、速度、时限、真实线段筛选及不同模块的接管优先级均待负责人组织实车验证。
+
+## 2026-09-14 长断线第二版离线回归
+
+根据首次实车反馈，第二版增加下方旧线检测、近全屏单端线段检测、走到物理线尾、有限空白跨越、±95° 扇形搜索、候选方向控制、旧线近端排除和分阶段交接。公共数据类型与 `TaskUpdate.step(frame, now)` 契约没有变化；协调器只增加可选 `reset()` 生命周期清理，避免人工停止、视频失效或任务结束后保留旧任务状态。
+
+实际执行：
+
+```powershell
+python -m unittest tests.test_route tests.test_coordinator -v
+python scripts\check_module.py route
+powershell -ExecutionPolicy Bypass -File scripts\check_offline.ps1 -Python .\.venv\Scripts\python.exe
+```
+
+结果：路线与协调器相关回归 `52/52` 通过；`route.py`/`route_detector.py` 静态契约检查和路线专测 `19/19` 通过；同步最新 `integration` 后，统一脚本语法检查 `40` 个 Python 文件、完整单元测试 `300/300`、离线接管示例和全部登记模块检查均通过，末尾输出 `OFFLINE_CHECK_OK`。
+
+首次实车运行还暴露了线尾阶段的时间预算错误：原 `END_APPROACH_MAX_SECONDS=2.5` 配合 `0.08 m/s` 只能覆盖约 `0.20 m`，会在到达物理线尾附近时直接失败，因而不可能进入抬头、空白跨越和扇扫。现保留硬上限但调整为 `5.0 s`（约 `0.40 m`），并增加超过旧 2.5 秒后完整进入跨越与扇扫的回归用例。该距离仍须结合实际相机视野标定。
+
+本轮没有运行 `main.py`，没有连接机器人、相机或视频流，也没有向实车发送任何运动/云台命令。合成图只能证明状态机、限幅、几何筛选和故障路径符合当前约定，不能证明真实断口恢复成功率。抬头 ROI、HSV/形态学、0.12 m/s 空白跨越、30°/s 搜索、±95° 搜索范围、底盘 yaw 符号、旧线排除效果和云台异步完成时间仍须实车验证。
