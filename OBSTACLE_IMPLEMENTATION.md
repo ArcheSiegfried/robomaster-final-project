@@ -50,9 +50,36 @@
 
 新增三条回归测试钉死它们：`test_restarts_cleanly_after_an_external_release`、
 `test_never_completes_before_the_dodge_has_actually_run`（完成时间必须 ≥ 4.5 秒），
-以及"整段绕行必须真的发出过前进命令"的断言。测试总数 30。
+以及"整段绕行必须真的发出过前进命令"的断言。
+
+### 四、按官方信息（障碍是静止的小车）修正距离
+
+| 项 | v3 | v4 | 依据 |
+| --- | --- | --- | --- |
+| `PASS` 前进越过 | 0.20 × 1.60 ≈ 32 cm | **0.20 × 2.20 ≈ 44 cm** | 两车各约 31 cm 长，要完全越过需 ≥41 cm |
+
+并新增三条参数自检测试：距离是否够错开/越过一辆同型车、`MAX_TOTAL_TIME` 是否够走完四段、
+自定速度是否都在骨架限幅内。测试总数 33。
 
 ---
+
+## 官方信息与距离换算
+
+【官方信息】**障碍是一辆静止的小车**（另一台 RoboMaster 同型车），不会移动。
+
+按"同型车"估算：长约 30~32 cm、宽约 24 cm、高约 27 cm。三个动作距离就是照它算的：
+
+| 段 | 距离 | 怎么来的 |
+| --- | --- | --- |
+| `OUT` 侧移让开 | 0.24 × 1.70 ≈ **41 cm** | (24 + 24) / 2 + 余量 10 —— 把两辆车的**宽度**完全错开 |
+| `PASS` 前进越过 | 0.20 × 2.20 ≈ **44 cm** | (30 + 32) / 2 + 余量 10 —— 把两辆车的**长度**完全越过 |
+| `BACK` 往回收 | 0.20 × 1.20 ≈ **24 cm** | 收回让开量的一部分，余下交给 `SEEK` 边挪边找线 |
+
+> v3 的 `PASS` 只有 0.20 × 1.60 ≈ 32 cm，**比需要的 41 cm 短**——
+> 那样车会"横移让开了、往前只开一半、然后又收回来"，等于没绕过去。v4 已加长到 44 cm。
+
+障碍是**静止**的，所以它不会自己让开、也不会追上来；但反过来说，
+**"绕完还看到同一个障碍"就说明没绕过去**，这时连绕上限会停下来交给人看。
 
 ## 状态与边界
 
@@ -60,7 +87,7 @@
 IDLE
   └─ 连续 CONFIRM_FRAMES 帧检出障碍
        → OUT（立刻侧移让开，0.24 m/s × 1.70s ≈ 41cm）
-          → PASS（前进越过，0.20 m/s × 1.60s ≈ 32cm）
+          → PASS（前进越过，0.20 m/s × 2.20s ≈ 44cm）
              → BACK（侧移回中线，0.20 m/s × 1.20s ≈ 24cm）
                 → SEEK（一边往回挪一边看蓝线，最长 1.50s）
                      ├─ 连续 2 帧看到蓝线 → COMPLETED
@@ -69,6 +96,7 @@ IDLE
 任何阶段总计达到 9s          → FAILED（停车）
 同一段路连绕满 2 次障碍还在   → 接管一帧后直接 FAILED，并**上锁**不再接管
                                 （障碍消失 CLEAR_SECONDS=3s 才解锁）
+被从外面踢掉（断档 > 1s）      → 作废当前这一轮，重新判断（见 v4 一节）
 ```
 
 - **默认没有停车段**：`HOLD_BEFORE_GO = 0`，确认完成的那一帧就已经在下发侧移。
@@ -145,7 +173,7 @@ STRUCTURE_CLOSE`、`OBSTACLE_ROI`、以及四个形状判据。
 ## 验证结果
 
 ```powershell
-python scripts/check_module.py obstacle                            -> MODULE_CHECK_OK（30 tests OK）
+python scripts/check_module.py obstacle                            -> MODULE_CHECK_OK（33 tests OK）
 powershell -ExecutionPolicy Bypass -File scripts/check_offline.ps1 -> OFFLINE_CHECK_OK
 ```
 

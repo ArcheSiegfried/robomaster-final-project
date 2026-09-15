@@ -195,6 +195,45 @@ class ObstacleDetectorTests(unittest.TestCase):
         self.assertFalse(self.detector.detect(None).valid)
 
 
+class ObstacleParameterTests(unittest.TestCase):
+    """按官方信息核对参数：障碍是**一辆静止的小车**（另一台同型 RoboMaster）。
+
+    同型车长约 30~32 cm、宽约 24 cm。下面这些距离是从这个尺寸算出来的，
+    不是拍脑袋；改了速度或时长，这几条会立刻告诉你还够不够。
+    """
+
+    def test_dodge_distances_clear_a_car_sized_obstacle(self):
+        lateral = obstacle.SIDE_SPEED * obstacle.T_OUT_TIME
+        forward = obstacle.FWD_SPEED * obstacle.T_PASS_TIME
+        self.assertGreaterEqual(
+            lateral, 0.34, "横移只有 %.2fm，两辆车（各 24cm 宽）错不开" % lateral
+        )
+        self.assertGreaterEqual(
+            forward, 0.41, "前进只有 %.2fm，两辆车（各约 31cm 长）越不过去" % forward
+        )
+
+    def test_total_timeout_is_long_enough_for_all_four_stages(self):
+        """总超时如果比四段加起来还短，那这个动作永远走不完。"""
+        needed = (
+            obstacle.HOLD_BEFORE_GO
+            + obstacle.T_OUT_TIME
+            + obstacle.T_PASS_TIME
+            + obstacle.T_BACK_TIME
+            + obstacle.SEEK_TIME
+        )
+        self.assertGreater(
+            obstacle.MAX_TOTAL_TIME, needed,
+            "MAX_TOTAL_TIME=%.2fs 不够走完四段（需要 %.2fs）"
+            % (obstacle.MAX_TOTAL_TIME, needed),
+        )
+
+    def test_task_envelope_respected_by_our_own_speeds(self):
+        """我们自己给的速度必须还在骨架限幅之内（横移 0.25、前进 0.30）。"""
+        for speed in (obstacle.SIDE_SPEED, obstacle.BACK_SPEED, obstacle.SEEK_SPEED):
+            self.assertLessEqual(abs(speed), 0.25)
+        self.assertLessEqual(abs(obstacle.FWD_SPEED), 0.30)
+
+
 class ObstacleLineCheckTests(unittest.TestCase):
     """SEEK 段用的"线还在不在"判断。"""
 
