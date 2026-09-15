@@ -108,6 +108,16 @@ class RegistryTests(unittest.TestCase):
         self.assertEqual(len(tasks), len(task_registry.MOTION_TASK_CLASSES))
         self.assertEqual(len(observers), len(task_registry.OBSERVER_CLASSES))
 
+    def test_builder_can_isolate_route_for_real_car_testing(self):
+        tasks = task_registry.build_motion_tasks(("route",))
+        self.assertEqual([task.name for task in tasks], ["route"])
+
+    def test_builder_rejects_unknown_or_empty_selection(self):
+        with self.assertRaises(ValueError):
+            task_registry.build_motion_tasks(())
+        with self.assertRaises(ValueError):
+            task_registry.build_motion_tasks(("not-a-task",))
+
 
 class ModuleContractTests(unittest.TestCase):
     def test_motion_tasks_return_a_task_update(self):
@@ -180,6 +190,18 @@ class MainWiringTests(unittest.TestCase):
         )
         self.assertIs(coordinator.follower, follower)
         self.assertIs(coordinator.output, output)
+        coordinator.close()
+
+    def test_build_coordinator_can_wire_only_route(self):
+        follower = LineFollower(CONFIG)
+        output = MotionOutput(FakeChassis(), CONFIG)
+        coordinator = main.build_coordinator(
+            follower,
+            output,
+            capture_directory=None,
+            motion_task_names=("route",),
+        )
+        self.assertEqual([task.name for task in coordinator.motion_tasks], ["route"])
         coordinator.close()
 
     def test_built_coordinator_keeps_the_robot_stopped_on_a_blank_frame(self):
