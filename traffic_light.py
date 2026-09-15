@@ -29,7 +29,7 @@ SDK or the chassis. It only returns TaskUpdate requests; step() is
 non-blocking (no sleep, no long loops, work is confined to its own ROI).
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import List, Optional, Tuple
 
 import cv2
@@ -48,6 +48,28 @@ RED = "red"
 GREEN = "green"
 
 STOP_COMMAND = MotionCommand()
+
+
+@dataclass(frozen=True)
+class EvidenceRequest:
+    """One scoring-image request for the integration-owned evidence writer.
+
+    Duck-typed against evidence.py render_task_evidence(); the integration
+    layer (main.service_task_evidence) polls take_evidence_request() every
+    frame and acknowledges the real write result. The traffic-light task does
+    NOT block on this request: a red-light screenshot is a scoring side
+    effect, never a gate for stopping or releasing.
+    """
+
+    request_id: str
+    marker_id: str
+    frame_sequence: int
+    captured_at: float
+    detection: "VisualDetection"
+    annotation: str
+    text_anchor: Tuple[int, int]
+    image: np.ndarray
+    attempt: int = 1
 
 IDLE = "idle"
 HOLDING_RED = "holding_red"
@@ -97,6 +119,13 @@ class TrafficLightConfig:
 
     # If both colours are visible in one frame, treat it as red (conservative).
     red_priority: bool = True
+
+    # Scoring-image config: the final score counts saved images, e.g.
+    # "Team 03 detects a red light and stops the robot". One screenshot is
+    # requested when the red light is confirmed; it never gates the state
+    # machine (a failed write must not turn a red light into a green).
+    team_number: str = "03"
+    max_evidence_attempts: int = 2
 
     # Confirmation policy. Asymmetric by design: stop fast (2 frames, ~0.1 s),
     # release slowly (5 frames, ~0.25 s) - never releasing too early is the
@@ -287,6 +316,10 @@ class TrafficLightTask:
         self._green_streak = 0
         self._stopped_at = 0.0      # total-stop clock, never reset by flicker
         self._last_green_at = 0.0   # last frame that actually saw green
+        self._queued_evidence = None
+        self._active_evidence = None
+        self._evidence_done = False
+        self._evidence_outcome = None
 
     def _enter_hold(self, now: float) -> None:
         self._state = HOLDING_RED
@@ -302,6 +335,86 @@ class TrafficLightTask:
         self._stopped_at = 0.0
         self._last_green_at = 0.0
 
+    # ------------------------------------------------------------------
+    # Evidence protocol (main.service_task_evidence polls these every frame)
+    # ------------------------------------------------------------------
+
+    @property
+    def pending_evidence_request(self) -> Optional[EvidenceRequest]:
+        """Inspect the queued request without consuming it."""
+        return self._queued_evidence
+
+    def take_evidence_request(self) -> Optional[EvidenceRequest]:
+        """Transfer one request to the integration-owned evidence writer."""
+        request = self._queued_evidence
+        self._queued_evidence = None
+        return request
+
+    def acknowledge_evidence(self, request_id: str, saved: bool) -> bool:
+        """Record the real writer result; retry a bounded number of times.
+
+        The state machine never waits for this: whether the screenshot is
+        saved or not, the car keeps holding at red and releases on green.
+        """
+        if (
+            self._active_evidence is None
+            or self._active_evidence.request_id != request_id
+        ):
+            return False
+        if saved:
+            self._evidence_done = True
+            self._evidence_outcome = True
+            self._active_evidence = None
+            return True
+        if self._active_evidence.attempt >= self.settings.max_evidence_attempts:
+            self._evidence_outcome = False
+            self._active_evidence = None
+            return True
+        retry = replace(
+            self._active_evidence,
+            request_id="{}:retry{}".format(
+                self._active_evidence.request_id,
+                self._active_evidence.attempt + 1,
+            ),
+            attempt=self._active_evidence.attempt + 1,
+        )
+        self._active_evidence = retry
+        self._queued_evidence = retry
+        self._evidence_outcome = None
+        return True
+
+    def _queue_evidence(self, frame: FramePacket, detection: VisualDetection) -> None:
+        """Queue one red-light screenshot per stop cycle (best effort)."""
+        if self._evidence_done or self._evidence_outcome is False:
+            return
+        if self._queued_evidence is not None or self._active_evidence is not None:
+            return
+        request = self._make_evidence_request(frame, detection)
+        self._active_evidence = request
+        self._queued_evidence = request
+
+    def _make_evidence_request(
+        self, frame: FramePacket, detection: VisualDetection
+    ) -> EvidenceRequest:
+        height, width = frame.image.shape[:2]
+        annotation = (
+            "Team {} detects a red light and stops the robot".format(
+                self.settings.team_number
+            )
+        )
+        return EvidenceRequest(
+            request_id="traffic_light:red:frame:{}:attempt:1".format(
+                frame.sequence
+            ),
+            marker_id="traffic_light_red",
+            frame_sequence=frame.sequence,
+            captured_at=frame.captured_at,
+            detection=detection,
+            annotation=annotation,
+            text_anchor=(width // 2, height // 2),
+            image=frame.image.copy(),
+        )
+
     def step(self, frame: FramePacket, now: float) -> TaskUpdate:
         detection = self.detector.detect(frame.image)
         s = self.settings
@@ -312,6 +425,7 @@ class TrafficLightTask:
                 self._red_streak += 1
                 if self._red_streak >= s.red_confirm_frames:
                     self._enter_hold(now)
+                    self._queue_evidence(frame, detection)
                     return TaskUpdate(
                         TaskStatus.RUNNING,
                         motion=STOP_COMMAND,
