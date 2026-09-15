@@ -395,6 +395,12 @@ class EvidenceRecorder:
             )
             errors = tuple(str(item) for item in (getattr(decision, "errors", ()) or ()))
             message = str(getattr(decision, "message", "") or "")
+            # 协调器的消息只写"task failed"/"task completed"，模块自己给的原因在
+            # task_update.message 里。不合并的话，报告里只剩"失败了"而不知道
+            # 为什么（实车测 obstacle 那次就是这么丢掉原因的）。
+            update_message = str(getattr(update, "message", "") or "")
+            if update_message and update_message not in message:
+                message = ("%s / %s" % (message, update_message)) if message else update_message
         except Exception:
             return
 

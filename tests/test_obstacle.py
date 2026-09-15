@@ -195,6 +195,45 @@ class ObstacleDetectorTests(unittest.TestCase):
         self.assertFalse(self.detector.detect(None).valid)
 
 
+class ObstacleParameterTests(unittest.TestCase):
+    """按官方信息核对参数：障碍是**一辆静止的小车**（另一台同型 RoboMaster）。
+
+    同型车长约 30~32 cm、宽约 24 cm。下面这些距离是从这个尺寸算出来的，
+    不是拍脑袋；改了速度或时长，这几条会立刻告诉你还够不够。
+    """
+
+    def test_dodge_distances_clear_a_car_sized_obstacle(self):
+        lateral = obstacle.SIDE_SPEED * obstacle.T_OUT_TIME
+        forward = obstacle.FWD_SPEED * obstacle.T_PASS_TIME
+        self.assertGreaterEqual(
+            lateral, 0.34, "横移只有 %.2fm，两辆车（各 24cm 宽）错不开" % lateral
+        )
+        self.assertGreaterEqual(
+            forward, 0.41, "前进只有 %.2fm，两辆车（各约 31cm 长）越不过去" % forward
+        )
+
+    def test_total_timeout_is_long_enough_for_all_four_stages(self):
+        """总超时如果比四段加起来还短，那这个动作永远走不完。"""
+        needed = (
+            obstacle.HOLD_BEFORE_GO
+            + obstacle.T_OUT_TIME
+            + obstacle.T_PASS_TIME
+            + obstacle.T_BACK_TIME
+            + obstacle.SEEK_TIME
+        )
+        self.assertGreater(
+            obstacle.MAX_TOTAL_TIME, needed,
+            "MAX_TOTAL_TIME=%.2fs 不够走完四段（需要 %.2fs）"
+            % (obstacle.MAX_TOTAL_TIME, needed),
+        )
+
+    def test_task_envelope_respected_by_our_own_speeds(self):
+        """我们自己给的速度必须还在骨架限幅之内（横移 0.25、前进 0.30）。"""
+        for speed in (obstacle.SIDE_SPEED, obstacle.BACK_SPEED, obstacle.SEEK_SPEED):
+            self.assertLessEqual(abs(speed), 0.25)
+        self.assertLessEqual(abs(obstacle.FWD_SPEED), 0.30)
+
+
 class ObstacleLineCheckTests(unittest.TestCase):
     """SEEK 段用的"线还在不在"判断。"""
 
@@ -239,19 +278,24 @@ class ObstacleTakeoverTests(unittest.TestCase):
             abs(decision.command.lateral), obstacle.SIDE_SPEED, delta=1e-6
         )
 
-    def test_no_zero_speed_frame_during_takeover(self):
-        """整个接管过程里，横向命令不许连续两帧都是零（那又变成停车了）。"""
+    def test_never_commands_a_full_stop_while_dodging(self):
+        """接管期间不许出现"前进和横移同时为零"的整帧——那就是停车段（P0-2）。
+
+        注意：PASS 段本来就是只前进不横移，所以"横移为零"本身不算错；
+        错的是**三轴全零**（车原地不动）。
+        """
         _, now = self._feed_obstacle(1.05, obstacle.CONFIRM_FRAMES)
-        previous_lateral = None
-        for _ in range(40):
+        for _ in range(200):
             decision = feed_image(self.harness, obstacle_frame(), now)
             now += 0.05
-            lateral = decision.command.lateral
-            if previous_lateral == 0.0 and lateral == 0.0:
-                self.fail("连续两帧零横移：又出现停车段了")
-            previous_lateral = lateral
-            if decision.task_update and decision.task_update.status is not TaskStatus.RUNNING:
+            status = decision.task_update.status if decision.task_update else None
+            if status is not TaskStatus.RUNNING:
                 break
+            command = decision.command
+            self.assertFalse(
+                command.forward == 0.0 and command.lateral == 0.0,
+                "接管期间出现整帧零速度：又变成停车段了",
+            )
 
     # ---- 正样本端到端 ----
 
@@ -275,6 +319,7 @@ class ObstacleTakeoverTests(unittest.TestCase):
         """方向往左；横移总距离要够绕开另一台车；所有命令都在骨架安全范围内。"""
         _, now = self._feed_obstacle(1.05, obstacle.CONFIRM_FRAMES)
         laterals = []
+        forwards = []
         for _ in range(200):
             decision = feed_image(self.harness, obstacle_frame(), now)
             now += 0.05
@@ -284,9 +329,15 @@ class ObstacleTakeoverTests(unittest.TestCase):
             self.assertLessEqual(abs(command.yaw), 90.0)
             if command.lateral:
                 laterals.append(command.lateral)
+            if command.forward:
+                forwards.append(command.forward)
             if decision.task_update and decision.task_update.status is not TaskStatus.RUNNING:
                 break
         self.assertTrue(laterals, "整段绕行没有发出任何横移命令")
+        self.assertTrue(
+            forwards,
+            "整段绕行没有发出任何前进命令 —— PASS 段被跳过了（曾经真的犯过这个错）",
+        )
         self.assertLess(laterals[0], 0, "第一步应该往左让开（lateral 为负）")
         self.assertGreater(max(laterals), 0, "让开之后应该往回收")
         outward = [value for value in laterals if value < 0]
@@ -318,16 +369,75 @@ class ObstacleTakeoverTests(unittest.TestCase):
         self.assertIsNone(self.harness.task_name)
 
     def test_total_timeout_fails_and_stops(self):
-        """时间突然跳过头 -> 立刻 FAILED 停车，绝不一直绕下去。"""
-        self._feed_obstacle(1.05, obstacle.CONFIRM_FRAMES)
-        decision = feed_image(
-            self.harness, obstacle_frame(), 1.05 + obstacle.MAX_TOTAL_TIME + 1.0
+        """绕行拖太久 -> 立刻 FAILED 停车，绝不一直绕下去。
+
+        这里用白盒方式把"开始时刻"往前拨 10 秒来触发总超时：
+        直接跳时间会先命中"被外部踢掉"的断档检测（STALE_STEP_GAP），那是另一条路径。
+        """
+        task = ObstacleTask()
+        now = 1.0
+        seq = 0
+        while task.stage == "IDLE":
+            seq += 1
+            task.step(FramePacket(obstacle_frame(), seq, now), now)
+            now += 0.05
+        task.started_at -= obstacle.MAX_TOTAL_TIME + 1.0
+        update = task.step(FramePacket(obstacle_frame(), seq + 1, now), now)
+        self.assertEqual(update.status, TaskStatus.FAILED)
+        self.assertEqual(update.motion.forward, 0.0)
+        self.assertEqual(update.motion.lateral, 0.0)
+        self.assertEqual(update.motion.yaw, 0.0)
+
+    def test_restarts_cleanly_after_an_external_release(self):
+        """协调器从外面把控制权拿走时**不会通知模块**，再被问到时不许从半路接着走。
+
+        实车报告（2026-09-15）里"接管 0.1 秒后就 COMPLETED"就是这么造出来的：
+        stage 停在半路、每段时间都早已过期，于是一帧跳一段把流程"走"完，
+        看起来像绕过去了，其实一动没动。
+        """
+        task = ObstacleTask()
+        now = 1.0
+        seq = 0
+        while task.stage != "PASS":
+            seq += 1
+            task.step(FramePacket(obstacle_frame(), seq, now), now)
+            now += 0.05
+        self.assertEqual(task.stage, "PASS")
+
+        # 模拟：中途被踢掉（视频中断 / 人工按键），2.6 秒之后才重新被问到
+        now += 2.6
+        seq += 40
+        update = task.step(FramePacket(obstacle_frame(), seq, now), now)
+        self.assertIn(task.stage, ("IDLE", "OUT"), "被踢之后居然从半路接着走了")
+        if update.status is TaskStatus.RUNNING:
+            self.assertEqual(update.motion.forward, 0.0, "被踢之后居然直接往前开")
+
+    def test_never_completes_before_the_dodge_has_actually_run(self):
+        """完整动作最短 1.7 + 1.6 + 1.2 = 4.5 秒，绝不允许更早报 COMPLETED。
+
+        这条是上面那个实车假象的直接回归测试。
+        """
+        task = ObstacleTask()
+        now = 1.0
+        seq = 0
+        takeover_at = None
+        update = None
+        for _ in range(400):
+            seq += 1
+            update = task.step(FramePacket(obstacle_frame(), seq, now), now)
+            now += 0.05
+            if takeover_at is None and update.status is TaskStatus.RUNNING:
+                takeover_at = now
+            if update.status is TaskStatus.COMPLETED:
+                break
+        self.assertIsNotNone(takeover_at, "一直没有接管")
+        self.assertEqual(update.status, TaskStatus.COMPLETED)
+        shortest = obstacle.T_OUT_TIME + obstacle.T_PASS_TIME + obstacle.T_BACK_TIME
+        self.assertGreaterEqual(
+            now - takeover_at,
+            shortest - 0.2,
+            "完成得太快：动作根本没跑完（实车报告里那种假 COMPLETED）",
         )
-        self.assertEqual(decision.task_update.status, TaskStatus.FAILED)
-        self.assertEqual(self.harness.owner, "line")
-        self.assertEqual(decision.command.forward, 0.0)
-        self.assertEqual(decision.command.lateral, 0.0)
-        self.assertEqual(decision.command.yaw, 0.0)
 
     def test_stops_after_too_many_consecutive_dodges(self):
         """审核风险 2：障碍一直在，不许没完没了地绕。
