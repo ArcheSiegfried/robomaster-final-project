@@ -372,10 +372,24 @@ def main() -> None:
     coordinator = None
     last_sequence = 0
     have_frame = False
+    # 启动横幅：必须打在"碰硬件之前"，而且 flush=True。
+    # 否则连不上车时（SDK 的 initialize 没有超时，会静默阻塞）终端一片空白，
+    # 现场分不清是卡住了还是根本没跑起来。
+    print(
+        "[main] 正在连接机器人（AP / UDP，机器人固定地址 192.168.2.1）...",
+        flush=True,
+    )
+    print(
+        "[main] 若这里卡住没有下文：车没开机，或本机没连上 RMEP-XXXX 热点。\n"
+        "[main]   自检：ipconfig 里应出现 192.168.2.x，且能 ping 通 192.168.2.1。",
+        flush=True,
+    )
     try:
         ep_robot.initialize(conn_type="ap", proto_type="udp")
+        print("[main] 机器人已连接，正在做云台起始回中 ...", flush=True)
         output = MotionOutput(ep_robot.chassis, CONFIG)
         _align_camera(ep_robot, output, robot)
+        print("[main] 云台就位，正在打开视频流 ...", flush=True)
         gimbal_output = GimbalOutput(ep_robot.gimbal, CONFIG)
         coordinator = build_coordinator(
             follower, output, gimbal_output=gimbal_output
