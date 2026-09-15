@@ -443,10 +443,19 @@ class TaskCoordinator:
 
     # -- video gap -----------------------------------------------------
     def video_gap(self, frame_age: float, now: float) -> CoordinatorDecision:
-        """No new camera frame. Never let a task keep driving through it."""
+        """No new camera frame. Never let a task keep driving through it.
+
+        **只有视频真的丢了才结束任务。** main 在"这一轮没等到新帧"时就会调到这里，
+        而正常的一帧间隔也可能触发它（实测：等帧超时 12ms、相机 30fps 时，
+        75% 的循环都会走到这里）。如果无条件结束任务，任何模块都活不过一帧 ——
+        实车日志里"接管后 0.1 秒就被释放"就是这么来的。
+        阈值与底座自身的判据共用 `video_gap_stop_seconds`：视频真的断了，
+        任务照样被立刻结束并硬停车（安全性不变）。
+        """
         errors = []
         message = ""
-        if self.active_task is not None:
+        video_really_lost = frame_age >= self.settings.video_gap_stop_seconds
+        if self.active_task is not None and video_really_lost:
             message = f"{self.active_task_name} ended by video gap"
             self._end_takeover(now, errors)
         decision = self.follower.process_video_gap(frame_age, now)

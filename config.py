@@ -78,7 +78,11 @@ class RuntimeConfig:
     camera_resolution: str = "360p"
     camera_strategy: str = "newest"
     camera_read_timeout: float = 0.06
-    consumer_wait_timeout: float = 0.012
+    # 等新帧最多等多久。必须 >= 相机一帧的时长（30fps → 33ms），否则正常的帧间隔
+    # 会被当成"没有新帧"，主循环就会去调 coordinator.video_gap()。
+    # 实车教训：原来写 0.012s（12ms），实测 75% 的循环拿不到新帧 → 每次任务接管
+    # 都在 0.1 秒内被视频间隔误判踢掉（见 coordinator.video_gap）。
+    consumer_wait_timeout: float = 0.05
     video_gap_stop_seconds: float = 0.22
     command_timeout: float = 0.15
     resume_detection_max_age: float = 0.15
