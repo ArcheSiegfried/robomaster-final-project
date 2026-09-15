@@ -83,8 +83,10 @@ powershell -ExecutionPolicy Bypass -File scripts\check_offline.ps1 -Python .\.ve
 代码调整后，同一批现场定时截图的离线回放依次产生：抬头 `pitch=-5°`、空白跨越
 `forward=0.18 m/s`、候选确认扇扫 `yaw=30°/s`、主扇扫 `yaw=45°/s`。空白跨越至少
 执行 `0.8 s` 后才允许候选打断，降低抬头后仍可见的旧路线被立即重新接受的风险。
-`MotionOutput` 现在不再忽略 SDK 明确返回的 `False`，`GimbalOutput` 会保留动作并在
-后续帧报告 rejected/failed/exception；终端心跳会显示实际命令、云台目标和当前阶段。
+`MotionOutput` 曾短暂把 SDK 明确返回的 `False` 当成致命异常；后续实车日志证明该
+连接下每条速度请求都可能缺少同步应答但底盘仍执行，致命异常会造成按 SPACE 后退出。
+现仅保留该结果供诊断，不因单次未应答退出。`GimbalOutput` 会保留动作并在后续帧
+报告 rejected/failed/exception；终端心跳会显示实际命令、云台目标和当前阶段。
 
 离线命令：
 
@@ -96,3 +98,30 @@ powershell -ExecutionPolicy Bypass -File scripts\check_offline.ps1 -Python .\.ve
 模块检查通过，输出 `MODULE_CHECK_OK`、`OFFLINE_CHECK_OK`。这些结果仍不能证明底盘
 实际执行了新速度、云台实际到达 `-5°` 或真实新路线能够成功重获，必须由下一轮专项
 实车测试确认。
+
+## 2026-09-15 两轮断线搜索实车反馈后的控制修正
+
+读取 `route_debug_20260915_155738.csv`、`route_debug_20260915_155840.csv` 及对应运行
+截图后确认：任务已能完成线尾接管、抬头、空白跨越和候选搜索，但第一轮在
+`ALIGNING` 卡住约 7.8 秒；候选中心约 x=265、角度约 +26.5° 时，原中心项和方向项
+互相抵消，yaw 仅约 +0.5°/s。第二轮候选位置/角度大幅跳变，最终在线侧以19秒总
+预算失败。`pitch=-5°` 的截图也包含大量墙面和天花板，地面线路被压在画面底部。
+
+本轮保持公共接口 v0.2 不变，修改为：搜索视角 `-12°`；候选切换增加位置和无向角
+硬连续性门槛；near/far 增加 0.78/0.70 滞回；接近横向的候选不打断扇扫；远端靠近
+改用线路下端入口而非轮廓中心；近端先只按方向转正，再以 `0.08 m/s` 有限弧线靠线；
+最后降回 `-25°`，必须由基础 `LineDetector` 连续确认3帧才完成。单帧候选缺失会
+停车等待0.20秒，不再立即切回搜索。
+
+实际离线命令：
+
+```powershell
+.\.venv\Scripts\python.exe -m unittest tests.test_route tests.test_coordinator tests.test_offline
+.\.venv\Scripts\python.exe scripts\check_module.py route
+powershell -ExecutionPolicy Bypass -File scripts\check_offline.ps1 -Python .\.venv\Scripts\python.exe
+```
+
+结果：针对性回归 `75/75`，路线模块 `26/26`；统一脚本语法检查 `42` 个 Python 文件、
+完整单元测试 `330/330`、离线接管示例和全部模块检查均通过，末尾输出
+`MODULE_CHECK_OK`、`OFFLINE_CHECK_OK`。本轮代码助手没有连接机器人或运行实车；
+`pitch=-12°`、分阶段转正/靠线以及降低视角后的自动恢复仍需下一轮实车确认。

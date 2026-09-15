@@ -34,6 +34,7 @@ BRIDGING = "bridging"
 SEARCHING = "searching"
 APPROACHING = "approaching"
 ALIGNING = "aligning"
+DOCKING = "docking"
 REACQUIRING = "reacquiring"
 
 # Initial values only.  None has been validated on the real course.
@@ -58,8 +59,8 @@ BRIDGE_MAX_SECONDS = 3.0
 BRIDGE_MIN_SECONDS = 0.80
 BRIDGE_FORWARD_SPEED = 0.18
 BRIDGE_SLOW_SPEED = 0.14
-BRIDGE_YAW_GAIN = 34.0
-BRIDGE_HEADING_GAIN = 0.24
+APPROACH_MIN_SPEED = 0.08
+APPROACH_TARGET_GAIN = 34.0
 BRIDGE_MAX_YAW = 26.0
 FRAGMENT_LOSS_SECONDS = 0.20
 
@@ -74,10 +75,20 @@ CANDIDATE_CONFIRM_FRAMES = 3
 REACQUIRE_STABLE_FRAMES = 3
 REACQUIRE_MAX_CENTER_JUMP = 0.24
 REACQUIRE_MAX_ANGLE_JUMP = 42.0
+NEAR_ENTER_RATIO = 0.78
+NEAR_EXIT_RATIO = 0.70
+MAX_APPROACH_ANGLE_DEG = 72.0
 OLD_LINE_CLEAR_DISTANCE = 0.07
 WIDE_TURN_NEAR_LIMIT_DEG = 78.0
-ALIGN_CENTER_ERROR = 0.13
 ALIGN_ANGLE_DEG = 18.0
+ALIGN_YAW_GAIN = 0.55
+ALIGN_MIN_YAW = 8.0
+DOCK_FORWARD_SPEED = 0.08
+DOCK_TARGET_ERROR = 0.13
+DOCK_ANGLE_DEG = 25.0
+DOCK_YAW_GAIN = 34.0
+DOCK_MAX_YAW = 22.0
+HANDOFF_VIEW_TIMEOUT_SECONDS = 2.0
 MAX_INTEGRATION_STEP_SECONDS = 0.20
 
 
@@ -128,6 +139,7 @@ class RouteTask:
         self._candidate: Optional[RouteCandidate] = None
         self._candidate_frames = 0
         self._candidate_seen_far = False
+        self._candidate_near = False
         self._candidate_center: Optional[Tuple[int, int]] = None
         self._candidate_angle: Optional[float] = None
         self._candidate_last_at: Optional[float] = None
@@ -158,6 +170,11 @@ class RouteTask:
     def estimated_heading_offset(self) -> float:
         return self._heading_offset
 
+    @property
+    def candidate_near(self) -> bool:
+        """Hysteresis-filtered near/far classification for diagnostics."""
+        return self._candidate_near
+
     def reset(self) -> None:
         """Cancel all recovery history after a human/video/fault stop."""
         self.state = MONITORING
@@ -171,6 +188,7 @@ class RouteTask:
         self._candidate = None
         self._candidate_frames = 0
         self._candidate_seen_far = False
+        self._candidate_near = False
         self._candidate_center = None
         self._candidate_angle = None
         self._candidate_last_at = None
@@ -275,6 +293,12 @@ class RouteTask:
             <= REACQUIRE_MAX_CENTER_JUMP
         )
 
+    @staticmethod
+    def _angle_difference(first: float, second: float) -> float:
+        """Smallest difference between two undirected line angles."""
+        difference = abs(float(first) - float(second)) % 180.0
+        return min(difference, 180.0 - difference)
+
     def _select_candidate(
         self, candidates: List[RouteCandidate], frame_width: int
     ) -> Optional[RouteCandidate]:
@@ -294,14 +318,24 @@ class RouteTask:
             angle_jump = (
                 0.0
                 if self._candidate_angle is None
-                else abs(candidate.angle_deg - self._candidate_angle)
+                else self._angle_difference(
+                    candidate.angle_deg, self._candidate_angle
+                )
             )
+            # Do not jump to an unrelated blue fragment merely because its
+            # independent score is high.  A genuinely new candidate may be
+            # selected after FRAGMENT_LOSS_SECONDS clears this history.
+            if (
+                distance > REACQUIRE_MAX_CENTER_JUMP
+                or angle_jump > REACQUIRE_MAX_ANGLE_JUMP
+            ):
+                continue
             continuity = max(0.0, 1.0 - distance / 0.35)
             angle_score = max(0.0, 1.0 - angle_jump / 70.0)
             ranked.append(
                 (candidate.score + 0.30 * continuity + 0.15 * angle_score, candidate)
             )
-        return max(ranked, key=lambda item: item[0])[1] if ranked else candidates[0]
+        return max(ranked, key=lambda item: item[0])[1] if ranked else None
 
     def _observe_candidate(self, frame: FramePacket, now: float) -> None:
         candidates = self._route_vision.candidates(frame.image)
@@ -314,6 +348,7 @@ class RouteTask:
             ):
                 self._candidate_frames = 0
                 self._candidate_seen_far = False
+                self._candidate_near = False
                 self._candidate_center = None
                 self._candidate_angle = None
                 self._candidate_last_sequence = None
@@ -326,14 +361,18 @@ class RouteTask:
             center, self._candidate_center, frame.image.shape[1]
         ) and (
             self._candidate_angle is None
-            or abs(selected.angle_deg - self._candidate_angle)
+            or self._angle_difference(selected.angle_deg, self._candidate_angle)
             <= REACQUIRE_MAX_ANGLE_JUMP
         )
+        if self._candidate_near:
+            self._candidate_near = selected.bottom_ratio > NEAR_EXIT_RATIO
+        else:
+            self._candidate_near = selected.bottom_ratio >= NEAR_ENTER_RATIO
         if frame.sequence != self._candidate_last_sequence:
             self._candidate_frames = self._candidate_frames + 1 if continuous else 1
             self._candidate_seen_far = (
-                self._candidate_seen_far or not selected.near
-            ) if continuous else not selected.near
+                self._candidate_seen_far or not self._candidate_near
+            ) if continuous else not self._candidate_near
             self._candidate_last_sequence = frame.sequence
         self._candidate_center = center
         self._candidate_angle = selected.angle_deg
@@ -365,17 +404,19 @@ class RouteTask:
                 f"confirming candidate {self._candidate_frames}/"
                 f"{CANDIDATE_CONFIRM_FRAMES}"
             )
+        if abs(self._candidate.angle_deg) > MAX_APPROACH_ANGLE_DEG:
+            return False, "candidate is too transverse; continuing fan search"
         departure = self._candidate_departure_position(self._candidate, frame)
         if departure <= 0.02:
             return False, "candidate rejected behind old-route departure gate"
         if (
-            self._candidate.near
+            self._candidate_near
             and abs(self._heading_offset) > WIDE_TURN_NEAR_LIMIT_DEG
             and not self._candidate_seen_far
         ):
             return False, "near candidate rejected during wide turn"
         if (
-            self._candidate.near
+            self._candidate_near
             and self._pose_forward < OLD_LINE_CLEAR_DISTANCE
             and not self._candidate_seen_far
         ):
@@ -408,6 +449,7 @@ class RouteTask:
         self._search_direction = self._last_tracking_direction
         self._candidate_frames = 0
         self._candidate_seen_far = False
+        self._candidate_near = False
         self._candidate_center = None
         self._candidate_angle = None
         self._candidate_last_sequence = None
@@ -432,25 +474,53 @@ class RouteTask:
         self._stable_frames = 0
         self._stable_last_sequence = None
 
+    def _start_docking(self, now: float) -> None:
+        self.state = DOCKING
+        self._phase_started_at = now
+        self._stable_frames = 0
+        self._stable_last_sequence = None
+
     def _start_reacquiring(self, now: float) -> None:
         self.state = REACQUIRING
         self._phase_started_at = now
         self._stable_frames = 0
         self._stable_last_sequence = None
+        self._line_detector.reset()
 
     @staticmethod
-    def _candidate_control(
+    def _candidate_target_error(
         candidate: RouteCandidate, frame: FramePacket
-    ) -> Tuple[float, float]:
+    ) -> float:
         width = frame.image.shape[1]
-        center_x = candidate.detection.center[0]
-        center_error = (center_x - width / 2.0) / max(width / 2.0, 1.0)
-        yaw = (
-            BRIDGE_YAW_GAIN * center_error
-            + BRIDGE_HEADING_GAIN * candidate.angle_deg
+        # The contour centroid moves sideways as a long oblique segment enters
+        # the image.  Its lower endpoint is the actual place the chassis must
+        # reach, so steer to that instead.
+        return float(
+            (candidate.lower_point[0] - width / 2.0)
+            / max(width / 2.0, 1.0)
         )
-        yaw = max(-BRIDGE_MAX_YAW, min(yaw, BRIDGE_MAX_YAW))
-        return float(center_error), float(yaw)
+
+    @staticmethod
+    def _alignment_yaw(angle_deg: float) -> float:
+        if abs(angle_deg) <= ALIGN_ANGLE_DEG:
+            return 0.0
+        yaw = max(
+            -SEARCH_CONFIRM_YAW_SPEED,
+            min(angle_deg * ALIGN_YAW_GAIN, SEARCH_CONFIRM_YAW_SPEED),
+        )
+        if abs(yaw) < ALIGN_MIN_YAW:
+            yaw = ALIGN_MIN_YAW if yaw > 0.0 else -ALIGN_MIN_YAW
+        return float(yaw)
+
+    def _line_view_running(self, now: float, message: str) -> TaskUpdate:
+        self._record_motion(STOP_COMMAND, now)
+        return TaskUpdate(
+            TaskStatus.RUNNING,
+            motion=STOP_COMMAND,
+            detection=self.last_detection,
+            message=message,
+            gimbal=GimbalCommand(pitch=self._line_pitch, yaw=self._search_yaw),
+        )
 
     def _step_end_approach(self, line, now: float) -> TaskUpdate:
         if line.valid:
@@ -499,7 +569,7 @@ class RouteTask:
     def _step_search(self, frame: FramePacket, now: float) -> TaskUpdate:
         ready, reason = self._candidate_ready(frame)
         if ready:
-            if self._candidate.near:
+            if self._candidate_near:
                 self._start_align(now)
             else:
                 self._start_approach(now)
@@ -546,7 +616,15 @@ class RouteTask:
             return self._running(
                 now, STOP_COMMAND, "route fragment briefly missing; stopped"
             )
-        if self._candidate.near:
+        if abs(self._candidate.angle_deg) > MAX_APPROACH_ANGLE_DEG:
+            self._begin_search(now)
+            return self._running(
+                now,
+                STOP_COMMAND,
+                "route became transverse; returning to fan search",
+                self._candidate.detection,
+            )
+        if self._candidate_near:
             self._start_align(now)
             return self._running(
                 now,
@@ -554,10 +632,16 @@ class RouteTask:
                 "route endpoint is near; aligning",
                 self._candidate.detection,
             )
-        center_error, yaw = self._candidate_control(self._candidate, frame)
-        forward = BRIDGE_SLOW_SPEED
-        if abs(center_error) > 0.45 or abs(self._candidate.angle_deg) > 70.0:
-            forward = 0.0
+        target_error = self._candidate_target_error(self._candidate, frame)
+        yaw = max(
+            -BRIDGE_MAX_YAW,
+            min(target_error * APPROACH_TARGET_GAIN, BRIDGE_MAX_YAW),
+        )
+        forward = (
+            APPROACH_MIN_SPEED
+            if abs(target_error) > 0.45
+            else BRIDGE_SLOW_SPEED
+        )
         return self._running(
             now,
             MotionCommand(forward=forward, yaw=yaw),
@@ -566,54 +650,105 @@ class RouteTask:
         )
 
     def _step_align(self, frame: FramePacket, now: float) -> TaskUpdate:
-        if self._candidate is None or not self._candidate.near:
+        if self._candidate is None:
+            if (
+                self._candidate_last_at is not None
+                and now - self._candidate_last_at < FRAGMENT_LOSS_SECONDS
+            ):
+                return self._running(
+                    now, STOP_COMMAND, "route heading briefly missing; stopped"
+                )
             self._begin_search(now)
             return self._running(
-                now, STOP_COMMAND, "near route lost; returning to search"
+                now, STOP_COMMAND, "route heading lost; returning to search"
             )
-        center_error, yaw = self._candidate_control(self._candidate, frame)
-        aligned = (
-            abs(center_error) <= ALIGN_CENTER_ERROR
-            and abs(self._candidate.angle_deg) <= ALIGN_ANGLE_DEG
-        )
+        aligned = abs(self._candidate.angle_deg) <= ALIGN_ANGLE_DEG
         if frame.sequence != self._stable_last_sequence:
             self._stable_frames = self._stable_frames + 1 if aligned else 0
             self._stable_last_sequence = frame.sequence
         if self._stable_frames >= REACQUIRE_STABLE_FRAMES:
-            self._start_reacquiring(now)
+            self._start_docking(now)
             return self._running(
                 now,
                 STOP_COMMAND,
-                "route endpoint aligned; confirming handoff",
+                "route heading aligned; starting final approach",
                 self._candidate.detection,
             )
-        yaw = max(-SEARCH_CONFIRM_YAW_SPEED, min(yaw, SEARCH_CONFIRM_YAW_SPEED))
+        yaw = self._alignment_yaw(self._candidate.angle_deg)
         return self._running(
             now,
-            MotionCommand(yaw=0.0 if aligned else yaw),
-            f"aligning route {self._stable_frames}/{REACQUIRE_STABLE_FRAMES}",
+            MotionCommand(yaw=yaw),
+            f"aligning route heading {self._stable_frames}/"
+            f"{REACQUIRE_STABLE_FRAMES}",
             self._candidate.detection,
         )
 
-    def _step_reacquiring(self, frame: FramePacket, now: float) -> TaskUpdate:
-        if self._candidate is None or not self._candidate.near:
+    def _step_docking(self, frame: FramePacket, now: float) -> TaskUpdate:
+        if self._candidate is None:
+            if (
+                self._candidate_last_at is not None
+                and now - self._candidate_last_at < FRAGMENT_LOSS_SECONDS
+            ):
+                return self._running(
+                    now, STOP_COMMAND, "final-approach route briefly missing; stopped"
+                )
             self._begin_search(now)
             return self._running(
-                now, STOP_COMMAND, "handoff confirmation lost; resuming search"
+                now, STOP_COMMAND, "final-approach route lost; returning to search"
+            )
+        if abs(self._candidate.angle_deg) > DOCK_ANGLE_DEG:
+            self._start_align(now)
+            return self._running(
+                now,
+                STOP_COMMAND,
+                "route heading drifted; realigning before final approach",
+                self._candidate.detection,
+            )
+        target_error = self._candidate_target_error(self._candidate, frame)
+        ready = self._candidate_near and abs(target_error) <= DOCK_TARGET_ERROR
+        if frame.sequence != self._stable_last_sequence:
+            self._stable_frames = self._stable_frames + 1 if ready else 0
+            self._stable_last_sequence = frame.sequence
+        if self._stable_frames >= REACQUIRE_STABLE_FRAMES:
+            self._start_reacquiring(now)
+            return self._line_view_running(
+                now, "route entry reached; lowering view for line verification"
+            )
+        yaw = max(
+            -DOCK_MAX_YAW,
+            min(target_error * DOCK_YAW_GAIN, DOCK_MAX_YAW),
+        )
+        return self._running(
+            now,
+            MotionCommand(forward=DOCK_FORWARD_SPEED, yaw=yaw),
+            f"docking onto route {self._stable_frames}/"
+            f"{REACQUIRE_STABLE_FRAMES}",
+            self._candidate.detection,
+        )
+
+    def _step_reacquiring(self, line, frame: FramePacket, now: float) -> TaskUpdate:
+        elapsed = now - float(self._phase_started_at)
+        if elapsed < self._view_settle_seconds:
+            return self._line_view_running(
+                now, "lowering to line view; chassis stopped"
             )
         if frame.sequence != self._stable_last_sequence:
-            self._stable_frames += 1
+            self._stable_frames = self._stable_frames + 1 if line.valid else 0
             self._stable_last_sequence = frame.sequence
         if self._stable_frames >= REACQUIRE_STABLE_FRAMES:
             return self._finish(
                 TaskStatus.COMPLETED,
-                "new route stable; lower view and verify before resume",
+                "base line detector confirmed new route",
             )
-        return self._running(
+        if elapsed >= HANDOFF_VIEW_TIMEOUT_SECONDS:
+            return self._finish(
+                TaskStatus.FAILED,
+                "new route was not valid after lowering to line view",
+            )
+        return self._line_view_running(
             now,
-            STOP_COMMAND,
-            f"confirming handoff {self._stable_frames}/{REACQUIRE_STABLE_FRAMES}",
-            self._candidate.detection,
+            f"verifying base line {self._stable_frames}/"
+            f"{REACQUIRE_STABLE_FRAMES}",
         )
 
     def step(self, frame: FramePacket, now: float) -> TaskUpdate:
@@ -685,6 +820,7 @@ class RouteTask:
             self._phase_started_at = now
             self._candidate_frames = 0
             self._candidate_seen_far = False
+            self._candidate_near = False
             self._candidate_center = None
             self._candidate_angle = None
             self._candidate_last_sequence = None
@@ -698,7 +834,7 @@ class RouteTask:
             # Never stop the first crossing merely because that old fragment
             # survives the generic candidate filter for three frames.
             if ready and bridge_elapsed >= BRIDGE_MIN_SECONDS:
-                if self._candidate.near:
+                if self._candidate_near:
                     self._start_align(now)
                 else:
                     self._start_approach(now)
@@ -731,7 +867,10 @@ class RouteTask:
         if self.state == ALIGNING:
             return self._step_align(frame, now)
 
+        if self.state == DOCKING:
+            return self._step_docking(frame, now)
+
         if self.state == REACQUIRING:
-            return self._step_reacquiring(frame, now)
+            return self._step_reacquiring(line, frame, now)
 
         return self._finish(TaskStatus.FAILED, "invalid route recovery state")

@@ -88,7 +88,10 @@ class RuntimeConfig:
     resume_detection_max_age: float = 0.15
     gimbal_pitch: int = -25
     gimbal_yaw: int = 0
-    gimbal_search_pitch: int = -5
+    # -5 deg showed too much wall/ceiling and compressed the route against the
+    # bottom edge in the first real recovery runs.  Keep a wider view than the
+    # -25 deg line-following pose without losing most of the useful floor.
+    gimbal_search_pitch: int = -12
     gimbal_pitch_min: int = -25
     gimbal_pitch_max: int = 10
     gimbal_yaw_min: int = -30

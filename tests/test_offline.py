@@ -206,10 +206,10 @@ class OfflineTests(unittest.TestCase):
             {"w1": 0, "w2": 0, "w3": 0, "w4": 0},
         )
 
-    def test_explicit_chassis_rejection_is_not_silently_ignored(self):
+    def test_explicit_chassis_rejection_is_recorded_without_exiting(self):
         output = MotionOutput(RejectingChassis(), CONFIG)
-        with self.assertRaisesRegex(RuntimeError, "rejected"):
-            output.send("line", MotionCommand(0.1, 0, 0))
+        output.send("line", MotionCommand(0.1, 0, 0))
+        self.assertFalse(output.last_send_accepted)
 
     def test_importing_main_does_not_import_robomaster(self):
         sys.modules.pop("main", None)

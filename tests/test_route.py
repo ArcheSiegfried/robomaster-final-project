@@ -12,7 +12,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from coordinator import LINE_FOLLOWING, RELEASING, TASK_ACTIVE  # noqa: E402
-from models import TaskStatus  # noqa: E402
+from models import FramePacket, TaskStatus  # noqa: E402
 from route import (  # noqa: E402
     ALIGNING,
     BRIDGE_FORWARD_SPEED,
@@ -21,6 +21,7 @@ from route import (  # noqa: E402
     END_APPROACH,
     END_APPROACH_SPEED,
     MONITORING,
+    SEARCHING,
     SEARCH_HARD_LIMIT_DEG,
     SEARCH_YAW_SPEED,
     TOTAL_RECOVERY_SECONDS,
@@ -62,6 +63,14 @@ def blue_square_frame():
     image = np.full((360, 640, 3), 210, np.uint8)
     cv2.rectangle(image, (250, 100), (390, 240), (255, 0, 0), -1)
     return image
+
+
+def transverse_route_frame():
+    return segment_frame((100, 190), (540, 190), thickness=18)
+
+
+def near_threshold_frame(bottom_y):
+    return segment_frame((320, bottom_y), (320, 120), thickness=18)
 
 
 def old_and_new_frame():
@@ -118,6 +127,10 @@ class RouteVisionTests(unittest.TestCase):
     def test_square_blue_object_is_not_a_route_fragment(self):
         self.assertEqual(self.vision.candidates(blue_square_frame()), [])
 
+    def test_transverse_route_is_detected_as_nearly_ninety_degrees(self):
+        candidate = self.vision.candidates(transverse_route_frame())[0]
+        self.assertGreater(abs(candidate.angle_deg), 85.0)
+
     def test_new_far_fragment_outranks_visible_old_near_line(self):
         candidates = self.vision.candidates(old_and_new_frame())
         self.assertGreaterEqual(len(candidates), 2)
@@ -130,7 +143,9 @@ class RouteRecoveryTests(unittest.TestCase):
         _, harness, takeover = start_and_trigger()
         self.assertEqual(takeover.command.forward, 0.0)
         self.assertEqual(takeover.command.yaw, 0.0)
-        self.assertEqual(harness.gimbal.last_move()["pitch"], -5.0)
+        self.assertEqual(
+            harness.gimbal.last_move()["pitch"], CONFIG.gimbal_search_pitch
+        )
         self.assertEqual(harness.owner, "external")
 
     def test_far_loss_with_bottom_line_crawls_to_physical_endpoint(self):
@@ -149,7 +164,9 @@ class RouteRecoveryTests(unittest.TestCase):
         confirmed = harness.feed_blank(1.36)
         self.assertEqual(first_blank.command.forward, 0.0)
         self.assertEqual(confirmed.command.forward, 0.0)
-        self.assertEqual(harness.gimbal.last_move()["pitch"], -5.0)
+        self.assertEqual(
+            harness.gimbal.last_move()["pitch"], CONFIG.gimbal_search_pitch
+        )
 
     def test_endpoint_after_old_two_point_five_second_budget_still_recovers(self):
         """Real feedback: far sampling can vanish >0.20 m before line end."""
@@ -170,7 +187,9 @@ class RouteRecoveryTests(unittest.TestCase):
         raising = harness.feed_blank(4.01)
         self.assertEqual(raising.state, TASK_ACTIVE)
         self.assertEqual(raising.command.forward, 0.0)
-        self.assertEqual(harness.gimbal.last_move()["pitch"], -5.0)
+        self.assertEqual(
+            harness.gimbal.last_move()["pitch"], CONFIG.gimbal_search_pitch
+        )
 
         bridge = harness.feed_blank(4.81)
         self.assertEqual(bridge.command.forward, BRIDGE_FORWARD_SPEED)
@@ -240,7 +259,7 @@ class RouteRecoveryTests(unittest.TestCase):
         )
         self.assertGreater(BRIDGE_MIN_SECONDS, 0.0)
 
-    def test_oblique_route_uses_center_and_heading_to_turn_towards_it(self):
+    def test_oblique_route_steers_towards_its_entry_point(self):
         _, harness, _ = start_and_trigger()
         settle_into_bridge(harness)
         for now in (3.01, 3.06, 3.11):
@@ -249,6 +268,60 @@ class RouteRecoveryTests(unittest.TestCase):
         self.assertEqual(approach.command.forward, BRIDGE_SLOW_SPEED)
         self.assertGreater(approach.command.yaw, 0.0)
         self.assertLessEqual(abs(approach.command.yaw), 26.0)
+
+    def test_alignment_heading_cannot_cancel_against_lateral_offset(self):
+        self.assertGreaterEqual(RouteTask._alignment_yaw(26.5), 8.0)
+        self.assertLessEqual(RouteTask._alignment_yaw(-59.0), -8.0)
+        self.assertAlmostEqual(RouteTask._angle_difference(89.0, -89.0), 2.0)
+
+    def test_near_classification_has_hysteresis(self):
+        task = RouteTask()
+        first = near_threshold_frame(265)
+        entered = near_threshold_frame(275)
+
+        task._observe_candidate(FramePacket(first, 1, 1.0), 1.0)
+        self.assertFalse(task.candidate_near)
+        task._observe_candidate(FramePacket(entered, 2, 1.05), 1.05)
+        self.assertTrue(task.candidate_near)
+        task._observe_candidate(FramePacket(first, 3, 1.10), 1.10)
+        self.assertTrue(task.candidate_near)
+
+    def test_transverse_candidate_does_not_interrupt_fan_search(self):
+        task, harness, _ = start_and_trigger()
+        settle_into_bridge(harness)
+        harness.feed_blank(5.20)
+        self.assertEqual(task.state, SEARCHING)
+
+        decisions = [
+            harness.feed_image(now, transverse_route_frame())
+            for now in (5.25, 5.30, 5.35, 5.40)
+        ]
+        self.assertEqual(task.state, SEARCHING)
+        self.assertTrue(any(abs(item.command.yaw) > 0.0 for item in decisions))
+        self.assertTrue(
+            any("too transverse" in item.message for item in decisions)
+        )
+
+    def test_alignment_survives_one_missing_candidate_frame(self):
+        task, harness, _ = start_and_trigger()
+        settle_into_bridge(harness)
+        for now in (3.01, 3.06, 3.11):
+            harness.feed_image(now, far_fragment_frame(x=320))
+        harness.feed_image(3.16, near_route_frame())
+        self.assertEqual(task.state, ALIGNING)
+
+        missing = harness.feed_blank(3.20)
+        self.assertEqual(task.state, ALIGNING)
+        self.assertEqual(missing.command.forward, 0.0)
+        self.assertEqual(missing.command.yaw, 0.0)
+        self.assertIn("briefly missing", missing.message)
+
+    def test_approach_targets_route_entry_instead_of_contour_centroid(self):
+        image = segment_frame((180, 355), (600, 80), thickness=20)
+        candidate = RouteVision(CONFIG.vision).candidates(image)[0]
+        self.assertGreater(candidate.detection.center[0], image.shape[1] // 2)
+        packet = FramePacket(image, 1, 1.0)
+        self.assertLess(RouteTask._candidate_target_error(candidate, packet), 0.0)
 
     def test_blue_square_never_becomes_a_route_candidate(self):
         task, harness, _ = start_and_trigger()
@@ -269,16 +342,39 @@ class RouteRecoveryTests(unittest.TestCase):
         for now in (3.21, 3.26, 3.31, 3.36, 3.41):
             decision = harness.feed_image(now, near_route_frame())
             self.assertEqual(decision.state, TASK_ACTIVE)
-        done = harness.feed_image(3.46, near_route_frame())
+        lowering = harness.feed_image(3.46, near_route_frame())
+        self.assertEqual(lowering.state, TASK_ACTIVE)
+        self.assertEqual(harness.gimbal.last_move()["pitch"], CONFIG.gimbal_pitch)
+
+        # A raised-view route candidate is not enough to complete.  The task
+        # waits for the camera to lower, then requires three fresh frames that
+        # satisfy the normal line detector.
+        for now in (3.70, 3.92, 4.10, 4.15):
+            waiting = harness.feed_image(now, near_route_frame())
+            self.assertEqual(waiting.state, TASK_ACTIVE)
+        done = harness.feed_image(4.20, near_route_frame())
         self.assertEqual(done.state, RELEASING)
         self.assertEqual(done.task_update.status, TaskStatus.COMPLETED)
         self.assertEqual(harness.gimbal.last_move()["pitch"], -25.0)
 
-        waiting = harness.feed_line(3.70, x=320)
-        self.assertEqual(waiting.state, RELEASING)
-        resumed = harness.feed_line(3.92, x=320)
+        resumed = harness.feed_line(4.40, x=320)
         self.assertEqual(resumed.state, LINE_FOLLOWING)
         self.assertTrue(harness.follower.motion_enabled)
+
+    def test_lowered_view_without_a_valid_base_line_fails_stopped(self):
+        task, harness, _ = start_and_trigger()
+        settle_into_bridge(harness)
+        for now in (3.01, 3.06, 3.11):
+            harness.feed_image(now, far_fragment_frame(x=320))
+        harness.feed_image(3.16, near_route_frame())
+        for now in (3.21, 3.26, 3.31, 3.36, 3.41, 3.46):
+            harness.feed_image(now, near_route_frame())
+
+        failed = harness.feed_blank(5.47)
+        self.assertEqual(failed.state, RELEASING)
+        self.assertEqual(failed.task_update.status, TaskStatus.FAILED)
+        self.assertEqual(failed.command.forward, 0.0)
+        self.assertEqual(failed.command.yaw, 0.0)
 
     def test_total_timeout_fails_stops_and_restores_line_view(self):
         _, harness, _ = start_and_trigger()

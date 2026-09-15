@@ -480,6 +480,28 @@ class CoordinatorTests(unittest.TestCase):
         harness.coordinator.video_gap(CONFIG.video_gap_stop_seconds, 1.30)
         self.assertEqual(task.reset_calls, 1)
 
+    def test_short_video_gap_preserves_active_task(self):
+        task = ResettableScriptedTask(
+            [
+                running(MotionCommand(forward=0.1)),
+                running(MotionCommand(forward=0.1)),
+            ]
+        )
+        harness = TaskHarness(task=task)
+        harness.start_line(now=1.0)
+
+        decision = harness.coordinator.video_gap(0.02, 1.12)
+
+        self.assertEqual(harness.task_name, task.name)
+        self.assertEqual(harness.owner, "external")
+        self.assertEqual(task.reset_calls, 0)
+        self.assertEqual(decision.state, TASK_ACTIVE)
+        self.assertEqual(decision.task_name, task.name)
+        self.assertFalse(decision.force_stop)
+
+        harness.feed_line(1.14)
+        self.assertEqual(harness.task_name, task.name)
+
     def test_human_reset_ends_takeover(self):
         task = ScriptedTask([running(MotionCommand(forward=0.1))])
         harness = TaskHarness(task=task)
