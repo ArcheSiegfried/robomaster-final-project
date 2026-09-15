@@ -181,7 +181,36 @@ MIN_DENSITY = 0.05           # 框内"有东西"的像素占比 >= 5%：排除�
 # （原来 MAX_OBSTACLE_AREA=0.90 会出现"越该动作越被拒掉"的矛盾）
 MAX_OBSTACLE_AREA = 0.60
 MAX_OBSTACLE_WIDTH = 0.60
-MIN_CONFIDENCE = 0.35        # 候选打分低于这个值就不认（归一化后的 0~1）
+
+# ---------------------------------------------------------------------
+# 【v5】实车误触发（2026-09-15 16:15 那次运行）之后加的三道闸
+# ---------------------------------------------------------------------
+# 实测：26 张现场截图里有 11 张被判成"有障碍"（42%），车就在正常巡线中反复
+# 左移-回正。报告给了三条关键线索，下面三道闸一一对应。
+#
+# 闸一：**贴边淘汰**。11 个误判框里有 9 个压在 ROI 的下沿/左沿/右沿上。
+#   几何理由：真障碍是"挡在路中间"的东西，应该完整待在 ROI 里面；
+#   被 ROI 边界切开的，多半是背景、场地边界或者车体自身的边缘。
+#   注意：**上沿不算**——远处的东西本来就会从 ROI 上沿露出来。
+REJECT_EDGE_TOUCHING = True
+EDGE_TOUCH_MARGIN = 0.02     # 距边界 2% 以内就算"贴着"
+
+# 闸二：**抬高置信度门槛**。实测误判的 confidence 是 0.38~0.85，最低 0.38，
+#   而原来门槛 0.35 —— 形同虚设。取 0.50 的依据：
+#   那批误判里"没贴边"的只有两帧，分别是 0.39 和 0.61；
+#   门槛放在 0.50 就能吃掉 0.39 那一帧，又不像 0.60 那样会误伤
+#   "真实但稍远、稍小"的障碍（那种的打分本来就在 0.6 附近）。
+MIN_CONFIDENCE = 0.50
+
+# 闸三：**框里必须真的有"东西"**：既不像地面、也不像蓝线。
+#   关掉颜色判据之后只剩"硬边 + 连成块"，对**高对比背景**没有区分力；
+#   但"一块和地面同色的浅色结构"是可以识别的——它的内部几乎全是地面色。
+#   浅色地面 = 低饱和 + 高亮度；蓝线 = 巡线那套 HSV 区间。
+#   门槛取得很低（5%），因为它的作用只是"框里不能**全是**地面色"；
+#   取高了会误伤浅色障碍（浅色车只有轮子和底盘阴影是深的）。
+MIN_OBJECT_RATIO = 0.05      # 框内"非地面非蓝线"的像素占比要 >= 5%
+FLOOR_S_MAX = 60             # 饱和度 <= 60 且
+FLOOR_V_MIN = 140            # 亮度 >= 140 -> 算"浅色地面"
 
 # 去噪用的形态学核（函数内部会自动取奇数）
 OPEN_KERNEL = 3
@@ -301,19 +330,24 @@ class ObstacleDetector:
     def __init__(self) -> None:
         self.last_candidates = 0
         self.last_skin_rejected = 0
+        self.last_edge_rejected = 0
+        self.last_flat_rejected = 0
         self.last_mask = None
 
     # ---------------- 两条证据 ----------------
 
-    def _structure_mask(self, roi, hsv):
-        """硬边缘 -> 连成块。不依赖障碍颜色。"""
-        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    def _line_mask(self, hsv):
+        """蓝线掩膜，和框架巡线同一套颜色。抹线、判"框里是不是线"都用它。"""
         lower, upper = CONFIG.vision.hsv_lower, CONFIG.vision.hsv_upper
-        line = cv2.inRange(
+        return cv2.inRange(
             hsv,
             np.array(lower, dtype=np.uint8),
             np.array(upper, dtype=np.uint8),
         )
+
+    def _structure_mask(self, roi, line):
+        """硬边缘 -> 连成块。不依赖障碍颜色。"""
+        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
         if cv2.countNonZero(line):
             # 把蓝线像素抹成"周围地面的灰度"：线本身不再产生边缘，
             # 也不会把横穿它的障碍轮廓切断
@@ -355,12 +389,32 @@ class ObstacleDetector:
             return False
         return (int(cv2.countNonZero(skin)) / float(total)) >= SKIN_REJECT_RATIO
 
+    @staticmethod
+    def _object_ratio(patch, line_patch):
+        """框里"既不像浅色地面、也不像蓝线"的像素占多少。
+
+        闸三用它：一块和地面同色的浅色结构（背景、场地边界、阴影边）内部几乎
+        全是地面色，这个比例会很低，于是被拒；真障碍（车、箱子）内部是别的东西。
+        """
+        floor_like = cv2.inRange(
+            patch,
+            np.array((0, 0, FLOOR_V_MIN), dtype=np.uint8),
+            np.array((180, FLOOR_S_MAX, 255), dtype=np.uint8),
+        )
+        background = cv2.bitwise_or(floor_like, line_patch)
+        total = int(patch.shape[0] * patch.shape[1])
+        if total <= 0:
+            return 0.0
+        return 1.0 - (int(cv2.countNonZero(background)) / float(total))
+
     # ---------------- 对外 ----------------
 
     def detect(self, image) -> VisualDetection:
         """返回整幅图像坐标的 VisualDetection；没有障碍返回 no_result。"""
         self.last_candidates = 0
         self.last_skin_rejected = 0
+        self.last_edge_rejected = 0
+        self.last_flat_rejected = 0
         self.last_mask = None
         if image is None:
             return VisualDetection.no_result(KIND)
@@ -377,10 +431,11 @@ class ObstacleDetector:
             return VisualDetection.no_result(KIND)
 
         hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+        line = self._line_mask(hsv)
 
         mask = np.zeros((roi_height, roi_width), dtype=np.uint8)
         if USE_STRUCTURE:
-            mask |= self._structure_mask(roi, hsv)
+            mask |= self._structure_mask(roi, line)
         if USE_COLOR_RANGES:
             mask |= self._color_mask(hsv)
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, _odd_kernel(OPEN_KERNEL))
@@ -407,12 +462,31 @@ class ObstacleDetector:
                 # 立着挡路的东西才有这个高度；贴地的细条、扁平色斑到这里被刷掉
                 continue
 
+            # 闸一：贴边淘汰（下沿 / 左沿 / 右沿；上沿不算，远处的东西会从上面露出来）
+            if REJECT_EDGE_TOUCHING:
+                margin_x = roi_width * EDGE_TOUCH_MARGIN
+                margin_y = roi_height * EDGE_TOUCH_MARGIN
+                if (
+                    box_left <= margin_x
+                    or box_left + box_width >= roi_width - margin_x
+                    or box_top + box_height >= roi_height - margin_y
+                ):
+                    self.last_edge_rejected += 1
+                    continue
+
             inside = mask[box_top:box_top + box_height, box_left:box_left + box_width]
             density = cv2.countNonZero(inside) / box_area
             if density < MIN_DENSITY:
                 # 框里几乎是空的 = 稀疏散点，不是一坨挡路的东西
                 continue
             patch = hsv[box_top:box_top + box_height, box_left:box_left + box_width]
+
+            # 闸三：框里得真的有东西（不能全是浅色地面或蓝线）
+            line_patch = line[box_top:box_top + box_height, box_left:box_left + box_width]
+            if self._object_ratio(patch, line_patch) < MIN_OBJECT_RATIO:
+                self.last_flat_rejected += 1
+                continue
+
             if self._is_skin_like(patch, inside):
                 # 皮肤色的东西不当障碍（见 P0-1）
                 self.last_skin_rejected += 1

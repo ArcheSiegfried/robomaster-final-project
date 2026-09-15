@@ -181,6 +181,37 @@ class ObstacleDetectorTests(unittest.TestCase):
         self.assertFalse(self.detector.detect(line_frame()).valid)
         self.assertFalse(self.detector.detect(np.full((360, 640, 3), 210, np.uint8)).valid)
 
+    def test_ignores_candidates_touching_the_roi_edge(self):
+        """闸一（贴边淘汰）：实测 11 个误判里 9 个压在 ROI 下/左/右沿上。
+
+        真障碍是"挡在路中间"的东西，应该完整待在 ROI 里面；被 ROI 边界切开的
+        多半是背景、场地边界或车体自身。**上沿不算**——远处的东西本来就从上面露出来。
+        """
+        # ROI 是 x 160..480, y 108..270（640x360 画面）
+        cases = {
+            "压住下沿": (280, 200, 360, 268),
+            "压住左沿": (162, 180, 250, 250),
+            "压住右沿": (400, 180, 478, 250),
+        }
+        for name, (x1, y1, x2, y2) in cases.items():
+            image = line_frame()
+            cv2.rectangle(image, (x1, y1), (x2, y2), (120, 120, 120), -1)
+            self.assertFalse(
+                self.detector.detect(image).valid,
+                "%s 的候选没有被淘汰" % name,
+            )
+
+    def test_ignores_a_light_flat_structure(self):
+        """闸三：一块"和地面一样浅"的结构不算障碍。
+
+        关掉颜色判据之后只剩"硬边 + 连成块"，对高对比背景没有区分力；
+        但背景/场地边界的内部几乎全是浅色低饱和像素，这个比例会很低。
+        """
+        image = line_frame()
+        # 只有一圈深一点的边，里面还是地面色（210）—— 像场地边界、背景结构
+        cv2.rectangle(image, (240, 170), (360, 240), (170, 170, 170), 4)
+        self.assertFalse(self.detector.detect(image).valid, "浅色结构被当成障碍了")
+
     def test_picks_the_bigger_nearer_candidate(self):
         """同时有两块时，选更大更靠下的那块。"""
         image = line_frame()
@@ -444,12 +475,13 @@ class ObstacleTakeoverTests(unittest.TestCase):
 
         最多连绕 MAX_CONSECUTIVE_DODGES 次，再多就直接 FAILED 停车要人来看，
         并且**从此不再接管**（否则会变成每几秒停一下的走走停停）。
-        这里故意把障碍放在线的右侧，让巡线全程有效，好把"反复触发"跑出来。
+        障碍就放在路中间（官方信息：障碍是一辆停在线上的小车），这样每次
+        绕完都能重新看到线、继续触发。
         """
         harness = TaskHarness(task=ObstacleTask())
         harness.start_line(now=1.0)
         now = 1.05
-        image = obstacle_frame(center=(430, 200))
+        image = obstacle_frame(center=(320, 200))
         dodges = 0
         failed = False
         takeovers = 0
@@ -490,7 +522,7 @@ class ObstacleTakeoverTests(unittest.TestCase):
     def test_unlocks_once_the_obstacle_clears(self):
         """障碍消失够久之后，应该重新愿意干活（不是永久瘫掉）。"""
         task = ObstacleTask()
-        image = obstacle_frame(center=(430, 200))
+        image = obstacle_frame(center=(320, 200))
         now = 1.0
         seq = 0
         for _ in range(3000):                      # 最多模拟 150 秒
