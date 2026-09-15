@@ -48,6 +48,36 @@ def _find_evidence_sink(coordinator):
     return None
 
 
+def record_runtime_diagnostics(coordinator, marker_source) -> None:
+    """把接线层的自检结果写进本次运行记录（report.md 的独立小节）。
+
+    为什么要有这一步：时间线只能告诉你"某个模块没接管"，看不出原因。数字标识
+    尤其依赖 SDK 的 marker 订阅，而订阅可能**静默失败**——颜色过滤器只能设一个、
+    坐标模式猜错、回调频率不够。跑一次就把这些一起写进记录，下次不用靠猜。
+
+    **必须在 `coordinator.close()` 之前调用**（close 会写 report.md）。
+    和 main 里其它辅助函数一样：绝不抛异常，绝不影响开车。
+    """
+    sink = _find_evidence_sink(coordinator)
+    record = getattr(sink, "record_diagnostics", None)
+    if not callable(record):
+        return
+    try:
+        if marker_source is None:
+            record(
+                "数字标识观测（SDK marker 订阅）",
+                {"状态": "本次运行没有建立 marker 订阅，数字标识不会接管"},
+            )
+            return
+        values = dict(marker_source.stats())
+        warning = marker_source.rate_warning()
+        if warning:
+            values["提醒"] = warning
+        record("数字标识观测（SDK marker 订阅）", values)
+    except Exception:
+        pass
+
+
 def service_task_evidence(coordinator) -> int:
     """把任务模块交出来的得分截图请求交给证据层，并回传真实结果。
 
@@ -498,6 +528,8 @@ def main() -> None:
         if output is not None:
             output.hard_stop()
         if coordinator is not None:
+            # 先把自检结果写进记录，再 close（close 会生成 report.md）。
+            record_runtime_diagnostics(coordinator, marker_source)
             # Flush and close the evidence recorder after the chassis stop.
             coordinator.close()
         if gimbal_output is not None:
