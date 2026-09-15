@@ -78,11 +78,14 @@ class RuntimeConfig:
     camera_resolution: str = "360p"
     camera_strategy: str = "newest"
     camera_read_timeout: float = 0.06
-    consumer_wait_timeout: float = 0.012
-    # Real AP-mode logs contained isolated 0.41 s and 0.50 s delivery gaps
-    # followed by healthy frames.  The chassis command itself still expires
-    # after 0.15 s, so allowing 0.60 s before latching VIDEO_LOST does not let
-    # an old motion command run through the gap.
+    # 等新帧最多等多久。必须 >= 相机一帧的时长（30fps → 33ms），否则正常的帧间隔
+    # 会被当成"没有新帧"，主循环就会去调 coordinator.video_gap()。
+    # 实车教训：原来写 0.012s（12ms），实测 75% 的循环拿不到新帧 → 每次任务接管
+    # 都在 0.1 秒内被视频间隔误判踢掉（见 coordinator.video_gap）。
+    consumer_wait_timeout: float = 0.05
+    # AP 模式日志还出现过 0.41s 和 0.50s 后自行恢复的孤立传输间隙。
+    # 旧运动命令仍会在 0.15s 后失效，因此 0.60s 的视频锁停阈值不会让底盘
+    # 带着旧命令穿过长间隙。
     video_gap_stop_seconds: float = 0.60
     command_timeout: float = 0.15
     resume_detection_max_age: float = 0.15

@@ -443,18 +443,16 @@ class TaskCoordinator:
 
     # -- video gap -----------------------------------------------------
     def video_gap(self, frame_age: float, now: float) -> CoordinatorDecision:
-        """Handle a missing consumer frame separately from video failure.
+        """No new camera frame. Never let a task keep driving through it.
 
-        The consumer timeout is deliberately shorter than one camera period,
-        so an isolated ``wait_after`` timeout is normal.  Preserve an active
-        task through that short gap; its last chassis request still expires via
-        ``command_timeout``.  Only a sustained gap at the configured video
-        threshold may cancel takeover and latch ``VIDEO_LOST``.
+        main 在这一轮没等到新帧时就会调用这里；一次等待超时不等于视频失效。
+        短间隙保留任务所有权，但旧底盘指令仍由 ``command_timeout`` 到期停止。
+        只有达到 ``video_gap_stop_seconds`` 才结束任务并由巡线底座锁停。
         """
         errors = []
         message = ""
-        sustained = frame_age >= self.settings.video_gap_stop_seconds
-        if self.active_task is not None and sustained:
+        video_really_lost = frame_age >= self.settings.video_gap_stop_seconds
+        if self.active_task is not None and video_really_lost:
             message = f"{self.active_task_name} ended by video gap"
             self._end_takeover(now, errors)
         decision = self.follower.process_video_gap(frame_age, now)

@@ -53,11 +53,32 @@
     -> 修法：ROI 改成**靠上、靠窄**的 (0.25, 0.30, 0.75, 0.75)，用更远的提前量
        换更晚的确认；并把"太近"交给 ROI 下沿处理，面积上限只当兜底。
 
+======================= 官方信息与由此推出的假设 =======================
+
+【官方信息】障碍是**一辆静止的小车**（另一台 RoboMaster 同型车），不会移动。
+【官方信息】没有人给过赛道宽度、道具精确尺寸；下面按"同型车"估算。
+
+  假设 1：障碍车与我们车同型，长约 30~32 cm、宽约 24 cm、高约 27 cm。
+          它是立着的立体物 -> 轮廓有硬边缘 -> **结构判据能抓到，不需要知道颜色**。
+  假设 2：它停在蓝线上 -> 会把蓝线挡住 -> 绕过去之后线会重新出现（SEEK 段靠这个收尾）。
+  假设 3：赛道够宽，往一侧让开约 41 cm 能完全错开两辆车。
+  假设 4：绕完允许本模块主动找线（SEEK）；SEEK 失败就停车报 FAILED。
+
+  由尺寸推出的三个距离（写死在参数区，改参数时要一起重算）：
+      OUT  ≈ 41 cm = (24 + 24) / 2 + 余量 10   完全错开车宽
+      PASS ≈ 44 cm = (30 + 32) / 2 + 余量 10   完全越过车长
+      BACK ≈ 24 cm，余下的交给 SEEK 边挪边找线
+
+  障碍是静止的，所以：它不会自己让开，也不会追上来；但"绕完还看到同一个障碍"
+  就说明**没绕过去**，这时连绕上限（MAX_CONSECUTIVE_DODGES）会停下来交给人看。
+
 仍未验证（不得当作已通过）：
-  * 动作幅度（侧移约 41 cm、三段共 4.5 秒）没有实车依据，道具宽度/场地宽度都没量过；
+  * 上面三个距离是照"同型车"**算**出来的，**没有实车量过**（道具宽度、场地宽度都没量）；
+  * 障碍车如果是**浅色**、和浅色地面差别很小，结构判据的边缘阈值要现场调
+    （用 `python obstacle.py 真车照片.png` 看掩膜）；
   * `MotionCommand.lateral` 的正负号必须在**架空**状态确认（MODULE_GUIDE 明确要求）；
-  * 真实障碍道具还没拿到，它在真实光照下的样子未知；
-  * 报告里的 426 张现场画面不在仓库里，本文件**没有**对它们跑过回归。
+  * 报告的 426 张现场画面不在仓库里，本文件**没有**对它们跑过回归；
+  * v4 的三处修改（断档检测、分段推进、PASS 加长）**一次真车都没试过**。
 
 离线调参（不用连车、不用连相机）：
     python obstacle.py 样图.png [输出掩膜.png]
@@ -97,10 +118,26 @@ SEEK_SPEED = 0.16            # 找线时往回挪的速度
 # HOLD_BEFORE_GO = 0 是 P0-2 的修法：确认完立刻侧移，不再先停车看清。
 # 实测过：那 0.20 秒的零速会让车多前冲约 6 cm，正是"看起来像停住了"的来源。
 HOLD_BEFORE_GO = 0.00
-T_OUT_TIME = 1.70            # 第 1 段：往侧面让开（横移约 41 cm）
-T_PASS_TIME = 1.60           # 第 2 段：贴着障碍往前越过去（约 32 cm）
-T_BACK_TIME = 1.20           # 第 3 段：往回收（约 24 cm）
+T_OUT_TIME = 1.70            # 第 1 段：往侧面让开（0.24 × 1.70 ≈ 41 cm）
+T_PASS_TIME = 2.20           # 第 2 段：往前越过（0.20 × 2.20 ≈ 44 cm，见下面的换算）
+T_BACK_TIME = 1.20           # 第 3 段：往回收（0.20 × 1.20 ≈ 24 cm）
 SEEK_TIME = 1.50             # 第 4 段：主动找线，最多找这么久
+
+# 【官方信息】障碍是**一辆静止的小车**（另一台 RoboMaster 同型车）。
+# 下面三个距离都是照这个尺寸算出来的，不是拍脑袋：
+#
+#   两车长度都按约 30~32 cm 算：
+#     要完全越过它，前进至少 = (30 + 32) / 2 + 余量 10 ≈ 41 cm
+#       -> PASS 段 0.20 × 2.20 ≈ 44 cm  ✓（原来 1.60s 只有 32 cm，会"只开一半"）
+#   两车宽度都按约 24 cm 算：
+#     要完全错开，横移至少 = (24 + 24) / 2 + 余量 10 ≈ 34 cm
+#       -> OUT 段 0.24 × 1.70 ≈ 41 cm  ✓
+#   横移让开多少，回程就要收多少：
+#       -> BACK 段 0.20 × 1.20 ≈ 24 cm，剩下的交给 SEEK 段边挪边找线（最多再 24 cm）
+#
+# 障碍是**静止的**，所以它不会自己让开，也不会追上来；
+# 但也意味着"绕完还看到同一个障碍"就说明**没绕过去**，
+# 这时候连绕上限（MAX_CONSECUTIVE_DODGES）会把它停下来交给人看。
 
 # --- 硬性保护 ---
 MAX_TOTAL_TIME = 9.00        # 整段（含找线）最长 9 秒，超了立刻停车报 FAILED
@@ -109,6 +146,23 @@ LINE_CONFIRM_FRAMES = 2      # 找线时连续 2 帧看到蓝线，才算找回�
 REARM_SECONDS = 5.00         # 一次绕行结束后，这段时间内不再重新接管
 MAX_CONSECUTIVE_DODGES = 2   # 同一段路最多连绕 2 次，第 3 次直接停车要人来看
 CLEAR_SECONDS = 3.00         # 画面里连续这么久没有障碍，就认为换了段路，连绕计数归零
+
+# 【v4 · 最重要的一条】两次 step() 之间隔这么久，就认为"我们被从外面踢掉了"。
+#
+# 实车测试报告（2026-09-15）的时间线里出现过这样的记录：
+#     00:04.9  TASK_ACTIVE  obstacle  RUNNING    task took over
+#     00:04.9  RELEASING    obstacle  COMPLETED  task completed
+# 整个绕行动作最短也要 4.5 秒（1.7 + 1.6 + 1.2 + 找线），**0.1 秒完成在物理上不可能**。
+#
+# 根因：协调器在视频中断 / 人工按键 / 硬超时时会把控制权拿走，但**不会通知模块**。
+# 模块的 stage 还停在 OUT/PASS 上；等车被人工恢复、模块再次被问到时，
+# 每一段的"已用时间"早就超过各自时限，于是**一帧跳一段**（OUT→PASS→BACK→SEEK），
+# 看到线就报 COMPLETED —— 造出"绕过去了"的假象，实际上一动没动。
+#
+# 修法：自己发现这次断档；隔得太久就作废重来，绝不从半路接着走。
+# 1.0 秒的依据：被踢掉之后巡线是 STOPPED，需要人工按 SPACE 才恢复，
+# 实测那一次断档是 2.6 秒；而正常绕行时每帧都会调用一次 step()（约 0.03 秒一次）。
+STALE_STEP_GAP = 1.00
 
 # --- 检测 ROI（画面比例 x1, y1, x2, y2）---
 # 【P0-1 / P1-3 的核心修改】原来是 (0.20, 0.45, 0.80, 0.95)：
@@ -434,6 +488,8 @@ class ObstacleTask:
         self.last_seen_at = None
         # 到达连绕上限后置位：不再接管，免得变成"每几秒停一下"的走走停停。
         self.locked = False
+        # 上一次 step() 的时刻：用来发现"我们被从外面踢掉了"（见 STALE_STEP_GAP）
+        self._last_step_at = None
 
     # ---------------- 对外 ----------------
 
@@ -443,12 +499,37 @@ class ObstacleTask:
 
     def step(self, frame: FramePacket, now: float) -> TaskUpdate:
         """主循环每帧调用一次，必须立刻返回。"""
+        if self.stage != "IDLE" and self._was_cut_short(now):
+            # 协调器在外面把控制权拿走了（视频中断 / 人工按键 / 硬超时），
+            # 而且不会通知模块。发现断档就作废重来，绝不从半路接着走。
+            self._abandon()
+        self._last_step_at = now
+
         if self.stage == "IDLE":
             detection = self.detect(frame.image)
             self.last_detection = detection
             return self._step_idle(detection, now)
         # 绕行途中不再重复检测（结果只用于上报）；只有 SEEK 段还要看画面找线。
         return self._step_active(frame.image, now)
+
+    def _was_cut_short(self, now: float) -> bool:
+        """两次 step() 之间隔得太久，说明中间我们并不在开车。"""
+        return (
+            self._last_step_at is not None
+            and (now - self._last_step_at) > STALE_STEP_GAP
+        )
+
+    def _abandon(self) -> None:
+        """作废当前这一轮绕行：回到 IDLE，重新判断。
+
+        注意**不设冷却**（`finished_at` 不动）：这一轮本来就没绕成，
+        障碍多半还在，应该马上重新确认、重新绕，而不是干等 5 秒。
+        """
+        self.stage = "IDLE"
+        self.hit_frames = 0
+        self.line_frames = 0
+        self.started_at = None
+        self.segment_started_at = None
 
     # ---------------- 还没接管：判断要不要管 ----------------
 
@@ -546,33 +627,36 @@ class ObstacleTask:
 
         elapsed = now - self.segment_started_at
 
+        # 注意：每进入下一段都必须把 elapsed 归零，否则会**一路穿透**。
+        # 之前这里犯过这个错：侧移段结束时 elapsed=1.7，已经 >= 前进段的 1.6、
+        # 也 >= 回收段的 1.2，于是一个调用里 OUT→PASS→BACK→SEEK 全走完，
+        # **前进和回收两段被整段跳过**，车只横移一下就去找线了。
         if self.stage == "HOLD":
-            if elapsed >= HOLD_BEFORE_GO:
-                self._enter("OUT", now)
-            else:
+            if elapsed < HOLD_BEFORE_GO:
                 return self._running(MotionCommand(), "holding before the dodge")
+            self._enter("OUT", now)
+            elapsed = 0.0
 
         if self.stage == "OUT":
-            if elapsed >= T_OUT_TIME:
-                self._enter("PASS", now)
-            else:
+            if elapsed < T_OUT_TIME:
                 return self._running(
                     MotionCommand(lateral=self._side() * SIDE_SPEED), "stepping aside"
                 )
+            self._enter("PASS", now)
+            elapsed = 0.0
 
         if self.stage == "PASS":
-            if elapsed >= T_PASS_TIME:
-                self._enter("BACK", now)
-            else:
+            if elapsed < T_PASS_TIME:
                 return self._running(MotionCommand(forward=FWD_SPEED), "passing the obstacle")
+            self._enter("BACK", now)
+            elapsed = 0.0
 
         if self.stage == "BACK":
-            if elapsed >= T_BACK_TIME:
-                self._enter("SEEK", now)
-            else:
+            if elapsed < T_BACK_TIME:
                 return self._running(
                     MotionCommand(lateral=-self._side() * BACK_SPEED), "returning to the line"
                 )
+            self._enter("SEEK", now)
 
         if self.stage == "SEEK":
             return self._step_seek(image, now)

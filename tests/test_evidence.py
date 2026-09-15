@@ -487,6 +487,37 @@ class RunReportTests(unittest.TestCase):
         ):
             self.assertIn(expected, text, f"运行记录里缺少 {expected!r}")
 
+    def test_run_record_keeps_the_module_own_failure_reason(self):
+        """协调器只说"task failed"，模块自己给的原因也必须进记录。
+
+        实车教训：obstacle 有一次 FAILED，记录里只剩 "task failed"，
+        为什么失败查不出来了。
+        """
+        from coordinator import CoordinatorDecision
+        from models import TaskStatus, TaskUpdate
+
+        recorder = EvidenceRecorder(directory=self.directory)
+        self.addCleanup(recorder.close)
+        recorder.observe(FramePacket(line_frame(320), 1, 1.0), 1.0)
+        recorder.record_decision(
+            CoordinatorDecision(
+                state="RELEASING",
+                owner="line",
+                task_name="obstacle",
+                task_update=TaskUpdate(
+                    TaskStatus.FAILED, message="no safe way around; giving up"),
+                message="task failed",
+                errors=(),
+            ),
+            1.1,
+        )
+        recorder.close()
+
+        text = (recorder.run_directory / "report.md").read_text(encoding="utf-8")
+        self.assertIn("task failed", text)
+        self.assertIn("no safe way around; giving up", text,
+                      "模块自身的失败原因必须出现在运行记录里")
+
     def test_record_decision_keeps_transitions_only(self):
         """逐帧调用不能刷屏：只有状态变化或出现错误才记一行。"""
         recorder = EvidenceRecorder(directory=self.directory)
@@ -509,6 +540,27 @@ class RunReportTests(unittest.TestCase):
         text = (recorder.run_directory / "report.md").read_text(encoding="utf-8")
         self.assertIn("没有产生得分截图", text)
         self.assertIn("没有任何模块接管", text)
+
+    def test_report_can_carry_runtime_diagnostics(self):
+        """运行结束的记录里要能带上"接线层自检结果"。
+
+        为什么要有这个测试：`run_20260915_161540` 里数字标识一次都没接管，
+        而记录里查不到"SDK 的 marker 订阅到底成没成功、回调多少 Hz、坐标是
+        像素还是归一化"，于是只能靠猜。把自检结果写进 report.md，下一次跑完
+        就有答案。
+        """
+        recorder = EvidenceRecorder(directory=self.directory)
+        self.addCleanup(recorder.close)
+        recorder.observe(FramePacket(line_frame(320), 1, 1.0), 1.0)
+        recorder.record_diagnostics(
+            "数字标识观测（SDK marker 订阅）",
+            {"subscribed": True, "callback_hz": 9.5},
+        )
+        recorder.close()
+
+        text = (recorder.run_directory / "report.md").read_text(encoding="utf-8")
+        self.assertIn("## 数字标识观测（SDK marker 订阅）", text)
+        self.assertIn("| callback_hz | 9.5 |", text)
 
 
 if __name__ == "__main__":
