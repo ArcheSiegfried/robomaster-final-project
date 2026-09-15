@@ -7,22 +7,29 @@ Design assumptions (module-local, adjustable, see TrafficLightConfig):
 - The light is located in the upper part of the frame (ROI defaults to the
   top 60% of the image; the blue line lives in the lower half, so it does
   not overlap the detection region).
-- Red and green lamps appear as saturated HSV blobs of plausible size.
-  Blobs that are too small, too large or in the wrong place are discarded.
+- Red and green lamps appear as compact, roughly round HSV blobs. The green
+  HSV range is deliberately wide (yellow-green to cyan, low S/V floor) because
+  a real LED lamp over-exposes: its core turns white and only a coloured halo
+  survives, so a narrow range misses it entirely. Shape filters (aspect ratio
+  and fill ratio) keep the wide range from matching long red/green objects.
 - Red and green never light at the same time; if both are detected (glare,
   other objects), "red" wins by default: stopping is always safer than an
   unconfirmed release.
-- A single green frame is never enough to release. Release (COMPLETED)
-  requires `green_confirm_frames` consecutive green frames.
-- "No red seen" is never treated as "green". While holding at red, if the
-  light disappears we keep holding and fail after `max_hold_seconds`.
+- Green confirmation tolerates dropped frames: a missing green inside
+  `green_gap_grace` does NOT reset the streak, so 1-2 frame flicker or a video
+  hiccup cannot hold the car forever in front of a lit green lamp.
+- "No red seen" is never treated as "green". While stopped, the car keeps
+  holding and fails after `max_hold_seconds` of TOTAL stop time; the stop
+  clock is not reset by green flicker, so a stuck loop always ends in FAILED.
+- A green lamp seen while never having stopped does not take over: the car is
+  already driving, and the light only authorises release of a stop.
 
 Contract (MODULE_GUIDE v0.1): this module never connects to the camera, the
 SDK or the chassis. It only returns TaskUpdate requests; step() is
 non-blocking (no sleep, no long loops, work is confined to its own ROI).
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
 import cv2
@@ -62,28 +69,47 @@ class TrafficLightConfig:
         ((0, 100, 60), (10, 255, 255)),
         ((170, 100, 60), (179, 255, 255)),
     )
-    green_hsv_lower: Tuple[int, int, int] = (35, 80, 50)
-    green_hsv_upper: Tuple[int, int, int] = (85, 255, 255)
+    # Wide green range on purpose: real LED cores over-expose to white and only
+    # a coloured halo survives; white balance shifts hue between yellow-green
+    # and cyan. Shape filters below stop the wide range from matching long
+    # red/green objects.
+    green_hsv_lower: Tuple[int, int, int] = (28, 40, 40)
+    green_hsv_upper: Tuple[int, int, int] = (100, 255, 255)
 
     open_kernel: int = 3
     close_kernel: int = 7
 
-    min_area: float = 60.0
+    min_area: float = 40.0
     max_area_ratio: float = 0.12
-    min_vertical_coverage: float = 0.06
+    min_vertical_coverage: float = 0.04
 
+    # Shape constraints: a lamp is roughly round. aspect = min(w,h)/max(w,h),
+    # fill = contour area / bounding-rect area.
+    min_aspect_ratio: float = 0.6
+    min_fill_ratio: float = 0.5
+
+    # Scoring weights; confidence = score / (sum of weights) -> full mark = 1.0.
     vertical_weight: float = 1.2
     center_weight: float = 0.8
     area_weight: float = 0.4
+    # Vertical coverage that already counts as "full" for scoring.
+    coverage_full_ratio: float = 0.20
 
     # If both colours are visible in one frame, treat it as red (conservative).
     red_priority: bool = True
 
-    # Confirmation policy.
+    # Confirmation policy. Asymmetric by design: stop fast (2 frames, ~0.1 s),
+    # release slowly (5 frames, ~0.25 s) - never releasing too early is the
+    # fail-safe direction, while stopping late is not.
     red_confirm_frames: int = 2
     green_confirm_frames: int = 5
+    # Seconds a missing green is tolerated inside green confirmation. Dropped
+    # frames / LED flicker inside this window do NOT reset the streak.
+    green_gap_grace: float = 0.30
 
-    # While holding at red, give up after this many seconds without a green.
+    # Total time the car may stay stopped at the light (any phase, counting
+    # from the first hold). NOT reset by green flicker, so a stuck loop always
+    # ends in FAILED instead of stopping forever.
     max_hold_seconds: float = 15.0
 
 
@@ -119,24 +145,16 @@ class TrafficLightDetector:
         )
         kernel_open = self._kernel(s.open_kernel)
         kernel_close = self._kernel(s.close_kernel)
-        red_mask = cv2.morphologyEx(
-            red_mask, cv2.MORPH_OPEN, kernel_open
-        )
-        red_mask = cv2.morphologyEx(
-            red_mask, cv2.MORPH_CLOSE, kernel_close
-        )
-        green_mask = cv2.morphologyEx(
-            green_mask, cv2.MORPH_OPEN, kernel_open
-        )
-        green_mask = cv2.morphologyEx(
-            green_mask, cv2.MORPH_CLOSE, kernel_close
-        )
+        red_mask = cv2.morphologyEx(red_mask, cv2.MORPH_OPEN, kernel_open)
+        red_mask = cv2.morphologyEx(red_mask, cv2.MORPH_CLOSE, kernel_close)
+        green_mask = cv2.morphologyEx(green_mask, cv2.MORPH_OPEN, kernel_open)
+        green_mask = cv2.morphologyEx(green_mask, cv2.MORPH_CLOSE, kernel_close)
         return red_mask, green_mask
 
     def _score(
         self, mask: np.ndarray, width: int, height: int
     ) -> List[Tuple[float, Tuple[int, int], Tuple[int, int, int, int]]]:
-        """Score blobs by size, vertical coverage and horizontal centering."""
+        """Score blobs by shape (roundness), size, coverage and centering."""
         s = self.settings
         frame_area = max(width * height, 1)
         candidates = []
@@ -151,11 +169,19 @@ class TrafficLightDetector:
             coverage = h / max(height, 1)
             if coverage < s.min_vertical_coverage:
                 continue
+            # Shape gate: lamps are roughly round; long red/green objects
+            # (poles, signs, clothes) must never be treated as lamps.
+            aspect = min(w, h) / max(max(w, h), 1)
+            if aspect < s.min_aspect_ratio:
+                continue
+            fill = area / max(w * h, 1)
+            if fill < s.min_fill_ratio:
+                continue
             center_x = x + w / 2.0
             center_y = y + h / 2.0
             center_distance = abs(center_x - width / 2.0) / max(width / 2.0, 1)
             score = (
-                s.vertical_weight * min(coverage, 1.0)
+                s.vertical_weight * min(coverage / s.coverage_full_ratio, 1.0)
                 + s.center_weight * (1.0 - min(center_distance, 1.0))
                 + s.area_weight * min((area / frame_area) / 0.10, 1.0)
             )
@@ -214,12 +240,19 @@ class TrafficLightDetector:
         score, center, box = candidate
         full_center = (center[0] + left, center[1] + top)
         full_box = (box[0] + left, box[1] + top, box[2] + left, box[3] + top)
+        # Confidence is normalised by the sum of weights so a perfect lamp
+        # scores 1.0 (previous score/4.0 could never exceed 0.6).
+        weights = (
+            TrafficLightConfig.vertical_weight
+            + TrafficLightConfig.center_weight
+            + TrafficLightConfig.area_weight
+        )
         return VisualDetection(
             valid=True,
             kind="traffic_light",
             center=full_center,
             color=color,
-            confidence=min(1.0, max(0.0, score / 4.0)),
+            confidence=min(1.0, max(0.0, score / weights)),
             box=full_box,
         )
 
@@ -228,11 +261,13 @@ class TrafficLightTask:
     """Stateful light task; returns TaskUpdate once per frame, non-blocking.
 
     Status flow (rule: once RUNNING, stay RUNNING until COMPLETED/FAILED):
-      idle -> holding_red (red confirmed)      -> RUNNING, zero motion
-      holding_red -> confirm_green (green seen) -> RUNNING, zero motion
-      confirm_green (from hold, confirmed)      -> COMPLETED (release)
-      idle -> confirm_green (green seen)        -> NOT_TRIGGERED until
-                                                   confirmed -> COMPLETED
+      idle -> holding_red (red confirmed)        -> RUNNING, zero motion
+      holding_red -> confirm_green (green seen)  -> RUNNING, zero motion
+      confirm_green (green confirmed)            -> COMPLETED (release)
+      holding_red / confirm_green -> FAILED      -> after max_hold_seconds of
+                                                    TOTAL stop time
+      idle + green                               -> NOT_TRIGGERED (never
+                                                    takes over while driving)
     """
 
     name = KIND
@@ -250,15 +285,22 @@ class TrafficLightTask:
         self._state = IDLE
         self._red_streak = 0
         self._green_streak = 0
-        self._state_start = 0.0
-        self._from_stop = False
+        self._stopped_at = 0.0      # total-stop clock, never reset by flicker
+        self._last_green_at = 0.0   # last frame that actually saw green
 
     def _enter_hold(self, now: float) -> None:
         self._state = HOLDING_RED
-        self._state_start = now
         self._red_streak = 0
         self._green_streak = 0
-        self._from_stop = True
+        if not self._stopped_at:
+            self._stopped_at = now
+
+    def _back_to_idle(self) -> None:
+        self._state = IDLE
+        self._red_streak = 0
+        self._green_streak = 0
+        self._stopped_at = 0.0
+        self._last_green_at = 0.0
 
     def step(self, frame: FramePacket, now: float) -> TaskUpdate:
         detection = self.detector.detect(frame.image)
@@ -266,7 +308,7 @@ class TrafficLightTask:
         color = detection.color if detection.valid else None
 
         if self._state == IDLE:
-            if color == "red":
+            if color == RED:
                 self._red_streak += 1
                 if self._red_streak >= s.red_confirm_frames:
                     self._enter_hold(now)
@@ -281,122 +323,91 @@ class TrafficLightTask:
                     detection=detection,
                     message="red seen; confirming",
                 )
-            if color == "green":
-                self._state = CONFIRM_GREEN
-                self._state_start = now
-                self._from_stop = False
-                self._green_streak = 1
-                if self._green_streak >= s.green_confirm_frames:
-                    self._state = IDLE
-                    return TaskUpdate(
-                        TaskStatus.COMPLETED,
-                        detection=detection,
-                        message="green confirmed; release",
-                    )
-                return TaskUpdate(
-                    TaskStatus.NOT_TRIGGERED,
-                    detection=detection,
-                    message="green seen; confirming",
-                )
+            # Green from idle never takes over: the car is already driving and
+            # the light only authorises release of a stop (4.2, plan A).
             self._red_streak = 0
             self._green_streak = 0
+            return TaskUpdate(TaskStatus.NOT_TRIGGERED, detection=detection)
+
+        # Stopped: total-stop clock runs from the first hold and is NOT reset
+        # by green flicker, so a stuck loop always ends in FAILED (4.3).
+        if now - self._stopped_at > s.max_hold_seconds:
+            self._back_to_idle()
             return TaskUpdate(
-                TaskStatus.NOT_TRIGGERED, detection=detection
+                TaskStatus.FAILED,
+                detection=detection,
+                message="stop timeout; failed",
             )
 
         if self._state == HOLDING_RED:
-            if color == "green":
-                self._state = CONFIRM_GREEN
-                self._state_start = now
-                self._from_stop = True
-                self._green_streak = 1
-                return TaskUpdate(
-                    TaskStatus.RUNNING,
-                    motion=STOP_COMMAND,
-                    detection=detection,
-                    message="green seen while holding; confirming",
-                )
-            if color == "red":
+            if color == RED:
                 return TaskUpdate(
                     TaskStatus.RUNNING,
                     motion=STOP_COMMAND,
                     detection=detection,
                     message="holding at red",
                 )
-            # Light disappeared while holding: never treat "no red" as green.
-            if now - self._state_start > s.max_hold_seconds:
-                self._state = IDLE
+            if color == GREEN:
+                self._state = CONFIRM_GREEN
+                self._green_streak = 1
+                self._last_green_at = now
                 return TaskUpdate(
-                    TaskStatus.FAILED,
+                    TaskStatus.RUNNING,
+                    motion=STOP_COMMAND,
                     detection=detection,
-                    message="red hold timeout; failed",
+                    message="green seen; confirming",
                 )
             return TaskUpdate(
                 TaskStatus.RUNNING,
                 motion=STOP_COMMAND,
                 detection=detection,
-                message="holding at red (light lost)",
+                message="holding (light lost)",
             )
 
-        # CONFIRM_GREEN
-        if color == "green":
+        # CONFIRM_GREEN (only reachable from a stop)
+        if color == GREEN:
             self._green_streak += 1
+            self._last_green_at = now
             if self._green_streak >= s.green_confirm_frames:
-                self._state = IDLE
-                self._red_streak = 0
-                self._green_streak = 0
+                self._back_to_idle()
                 return TaskUpdate(
                     TaskStatus.COMPLETED,
                     detection=detection,
                     message="green confirmed; release",
                 )
-            if self._from_stop:
-                return TaskUpdate(
-                    TaskStatus.RUNNING,
-                    motion=STOP_COMMAND,
-                    detection=detection,
-                    message="confirming green while holding",
-                )
-            return TaskUpdate(
-                TaskStatus.NOT_TRIGGERED,
-                detection=detection,
-                message="confirming green",
-            )
-        if color == "red":
-            self._red_streak += 1
-            if self._red_streak >= s.red_confirm_frames:
-                self._enter_hold(now)
-                return TaskUpdate(
-                    TaskStatus.RUNNING,
-                    motion=STOP_COMMAND,
-                    detection=detection,
-                    message="back to red; holding",
-                )
-            if self._from_stop:
-                return TaskUpdate(
-                    TaskStatus.RUNNING,
-                    motion=STOP_COMMAND,
-                    detection=detection,
-                    message="confirming green (red blip)",
-                )
-            return TaskUpdate(
-                TaskStatus.NOT_TRIGGERED,
-                detection=detection,
-                message="confirming green (red blip)",
-            )
-        # Light disappeared mid-confirmation.
-        if self._from_stop:
-            self._enter_hold(now)
             return TaskUpdate(
                 TaskStatus.RUNNING,
                 motion=STOP_COMMAND,
                 detection=detection,
-                message="green confirmation lost; holding",
+                message="confirming green",
             )
-        self._state = IDLE
+        if color == RED:
+            # Red reappeared: back to holding; the total-stop clock keeps
+            # running, so a red/green flicker loop still times out (4.3).
+            self._state = HOLDING_RED
+            self._red_streak = 0
+            self._green_streak = 0
+            return TaskUpdate(
+                TaskStatus.RUNNING,
+                motion=STOP_COMMAND,
+                detection=detection,
+                message="back to red; holding",
+            )
+        # No lamp: tolerate short gaps (dropped frames / flicker) inside the
+        # grace window; beyond it, go back to holding and wait for red or the
+        # total-stop timeout (4.1).
+        if now - self._last_green_at <= s.green_gap_grace:
+            return TaskUpdate(
+                TaskStatus.RUNNING,
+                motion=STOP_COMMAND,
+                detection=detection,
+                message="confirming green (gap)",
+            )
+        self._state = HOLDING_RED
         self._green_streak = 0
         return TaskUpdate(
-            TaskStatus.NOT_TRIGGERED,
+            TaskStatus.RUNNING,
+            motion=STOP_COMMAND,
             detection=detection,
-            message="green confirmation lost",
+            message="green lost; holding",
         )

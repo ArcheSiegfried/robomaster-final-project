@@ -123,6 +123,35 @@ class DetectorTests(unittest.TestCase):
         self.assertGreaterEqual(left, 64)
         self.assertLess(right, 576)
 
+    def test_detects_cyan_green(self):
+        """Hue shifted toward cyan; the old range (H capped at 85) missed it."""
+        image = blank_frame()
+        cv2.circle(image, (320, 120), 22, (0, 140, 130), -1)
+        result = self.detector.detect(image)
+        self.assertTrue(result.valid)
+        self.assertEqual(result.color, "green")
+
+    def test_detects_low_saturation_green(self):
+        """Over-exposed LED core: green with low saturation (old S>=80 missed)."""
+        image = blank_frame()
+        cv2.circle(image, (320, 120), 22, (60, 90, 70), -1)
+        result = self.detector.detect(image)
+        self.assertTrue(result.valid)
+        self.assertEqual(result.color, "green")
+
+    def test_slender_red_bar_is_rejected(self):
+        """A long thin red object must not be treated as a lamp (4.4 shape gate)."""
+        image = blank_frame()
+        cv2.rectangle(image, (300, 80), (310, 210), (0, 0, 220), -1)
+        result = self.detector.detect(image)
+        self.assertFalse(result.valid)
+
+    def test_confidence_high_for_solid_lamp(self):
+        """A solid lamp scores close to full confidence (4.5: normalised weights)."""
+        result = self.detector.detect(light_frame("red"))
+        self.assertTrue(result.valid)
+        self.assertGreater(result.confidence, 0.8)
+
 
 # --------------------------------------------------------------------------
 # Task state machine tests
@@ -221,12 +250,15 @@ class TaskTests(unittest.TestCase):
         self.assertIsNotNone(failed)
         self.assertEqual(failed.status, TaskStatus.FAILED)
 
-    def test_green_from_idle_completes_without_takeover(self):
+    def test_green_from_idle_never_takes_over(self):
+        """Plan A (report 4.2): a green seen while already driving must NOT
+        take over; it only authorises release of a stop. The task stays
+        NOT_TRIGGERED for every frame."""
         seq = ["green", "green", "green", "green", "green"]
         task, updates = self.run_sequence(seq)
-        for update in updates[:-1]:
+        for update in updates:
             self.assertEqual(update.status, TaskStatus.NOT_TRIGGERED)
-        self.assertEqual(updates[-1].status, TaskStatus.COMPLETED)
+            self.assertIsNone(update.motion)
 
     def test_green_blip_from_idle_does_not_trigger(self):
         seq = ["green", "none", "none"]
@@ -276,6 +308,35 @@ class TaskTests(unittest.TestCase):
         update = task.step(packet(light_frame("red"), 1, 1.05), 1.05)
         self.assertTrue(update.detection.valid)
         self.assertEqual(update.detection.color, "red")
+
+    def test_green_confirmation_tolerates_dropped_frames(self):
+        """A missing green inside green_gap_grace must NOT reset the streak;
+        one dropped frame cannot hold the car forever (4.1)."""
+        seq = ["red", "red", "green", "green", "none", "green", "green", "green"]
+        task, updates = self.run_sequence(seq)
+        # 'none' at t=10.20 is 0.05 s after the last green -> tolerated.
+        self.assertEqual(updates[-1].status, TaskStatus.COMPLETED)
+
+    def test_green_flicker_cycle_still_fails_after_timeout(self):
+        """A red/green flicker loop must NOT reset the stop clock forever;
+        FAILED must appear within max_hold_seconds (4.3)."""
+        task = TrafficLightTask()
+        t = 30.0
+        task.step(packet(light_frame("red"), 0, t), t)
+        task.step(packet(light_frame("red"), 1, t + 0.05), t + 0.05)
+        failed = None
+        for i in range(400):
+            t += 0.05
+            if i % 8 == 0:
+                image = light_frame("green")
+            else:
+                image = blank_frame()
+            update = task.step(packet(image, 2 + i, t), t)
+            if update.status == TaskStatus.FAILED:
+                failed = update
+                break
+        self.assertIsNotNone(failed)
+        self.assertEqual(failed.status, TaskStatus.FAILED)
 
 
 # --------------------------------------------------------------------------
