@@ -8,6 +8,52 @@
 
 ---
 
+## v4：从实车运行记录里查出来的两个 bug（2026-09-15 报告）
+
+实车测试报告给了 4 次运行的逐次状态时间线。**报告里关于"成功"的结论需要更正**，
+并顺着它查出一个真实缺陷。
+
+### 一、报告里那 6 次 `COMPLETED` 极可能是假象，不是真的绕过
+
+报告的时间线里有这样的记录：
+
+```text
+00:04.9  TASK_ACTIVE   obstacle  RUNNING    task took over
+00:04.9  RELEASING     obstacle  COMPLETED  task completed
+```
+
+**整个绕行动作最短也要 4.5 秒**（侧移 1.7 + 前进 1.6 + 回收 1.2，再加找线），
+**0.1 秒就 COMPLETED 在物理上不可能**。那次 `FAILED` 同样是接管与失败落在同一瞬间。
+
+原因：**协调器在视频中断 / 人工按键 / 硬超时时会把控制权拿走，但不会通知模块。**
+模块的 `stage` 还停在 `OUT`/`PASS`，而每一段的"已用时间"早已超过各自时限，
+于是**一帧跳一段**（`OUT→PASS→BACK→SEEK`），看到线就报 `COMPLETED`。
+
+**所以"流程在实车上走通过 6 次"这个结论大概率不成立——绕行动作很可能一次都没真正跑完。**
+
+### 二、第二个 bug（更严重）：`PASS` 和 `BACK` 两段被整段跳过
+
+`_step_active()` 里 `elapsed` 只算了一次、进入下一段时**没有归零**。
+侧移段结束的那一刻 `elapsed = 1.7`，它同时 `>= T_PASS_TIME(1.6)` 和 `>= T_BACK_TIME(1.2)`，
+于是一次调用里 `OUT→PASS→BACK→SEEK` 全部穿透——**"前进越过"和"回收"两段根本没执行**。
+
+也就是说：即使是一次"正常完成"的绕行，车也只是**横移一下就直接去找线**，
+从来没有往前绕过障碍。这个 bug 是靠上一条顺藤摸瓜找出来的。
+
+### 三、两处修法
+
+1. 新增断档检测 `STALE_STEP_GAP = 1.0`：两次 `step()` 之间隔超过 1 秒，
+   就认为中途被从外面踢过（实测那次断档 2.6 秒；被踢后巡线是 `STOPPED`，
+   要人工按 `SPACE` 才恢复），**作废当前这一轮、重新判断**，绝不从半路接着走。
+   同时**不设冷却**——这一轮本来就没绕成，障碍多半还在，应该马上重来。
+2. 每进入下一段都把 `elapsed` 归零，**一次调用只推进一段**。
+
+新增三条回归测试钉死它们：`test_restarts_cleanly_after_an_external_release`、
+`test_never_completes_before_the_dodge_has_actually_run`（完成时间必须 ≥ 4.5 秒），
+以及"整段绕行必须真的发出过前进命令"的断言。测试总数 30。
+
+---
+
 ## 状态与边界
 
 ```text
@@ -99,7 +145,7 @@ STRUCTURE_CLOSE`、`OBSTACLE_ROI`、以及四个形状判据。
 ## 验证结果
 
 ```powershell
-python scripts/check_module.py obstacle                            -> MODULE_CHECK_OK（28 tests OK）
+python scripts/check_module.py obstacle                            -> MODULE_CHECK_OK（30 tests OK）
 powershell -ExecutionPolicy Bypass -File scripts/check_offline.ps1 -> OFFLINE_CHECK_OK
 ```
 
@@ -113,7 +159,8 @@ powershell -ExecutionPolicy Bypass -File scripts/check_offline.ps1 -> OFFLINE_CH
 
 ## 未验证事项（不得当作已通过）
 
-1. **v3 一次真车都没试过。** ROI 位置、起手时序、动作幅度全是纸面推导。
+1. **v3/v4 一次真车都没试过。** ROI 位置、起手时序、动作幅度、断档阈值全是纸面推导。
+   （2026-09-15 那次实车跑的是 v3，而按上面第一节的分析，**那次没有一次真正跑完过绕行动作**。）
 2. **真实障碍道具还没拿到**，它在真实光照下的样子完全未知。
 3. **426 张现场画面本身没有**（只有逐帧统计 CSV），所以**没有对真实画面重新跑过检测**；
    CSV 里没有色块坐标和 HSV，"新 ROI 是否完全裁掉自遮挡""皮肤剔除是否命中那 2 帧手"

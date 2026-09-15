@@ -110,6 +110,23 @@ REARM_SECONDS = 5.00         # 一次绕行结束后，这段时间内不再重�
 MAX_CONSECUTIVE_DODGES = 2   # 同一段路最多连绕 2 次，第 3 次直接停车要人来看
 CLEAR_SECONDS = 3.00         # 画面里连续这么久没有障碍，就认为换了段路，连绕计数归零
 
+# 【v4 · 最重要的一条】两次 step() 之间隔这么久，就认为"我们被从外面踢掉了"。
+#
+# 实车测试报告（2026-09-15）的时间线里出现过这样的记录：
+#     00:04.9  TASK_ACTIVE  obstacle  RUNNING    task took over
+#     00:04.9  RELEASING    obstacle  COMPLETED  task completed
+# 整个绕行动作最短也要 4.5 秒（1.7 + 1.6 + 1.2 + 找线），**0.1 秒完成在物理上不可能**。
+#
+# 根因：协调器在视频中断 / 人工按键 / 硬超时时会把控制权拿走，但**不会通知模块**。
+# 模块的 stage 还停在 OUT/PASS 上；等车被人工恢复、模块再次被问到时，
+# 每一段的"已用时间"早就超过各自时限，于是**一帧跳一段**（OUT→PASS→BACK→SEEK），
+# 看到线就报 COMPLETED —— 造出"绕过去了"的假象，实际上一动没动。
+#
+# 修法：自己发现这次断档；隔得太久就作废重来，绝不从半路接着走。
+# 1.0 秒的依据：被踢掉之后巡线是 STOPPED，需要人工按 SPACE 才恢复，
+# 实测那一次断档是 2.6 秒；而正常绕行时每帧都会调用一次 step()（约 0.03 秒一次）。
+STALE_STEP_GAP = 1.00
+
 # --- 检测 ROI（画面比例 x1, y1, x2, y2）---
 # 【P0-1 / P1-3 的核心修改】原来是 (0.20, 0.45, 0.80, 0.95)：
 #   * 下沿 0.95 会把镜头正下方、机器人自己的橙色件收进来（实测每帧 900~1700 px）；
@@ -434,6 +451,8 @@ class ObstacleTask:
         self.last_seen_at = None
         # 到达连绕上限后置位：不再接管，免得变成"每几秒停一下"的走走停停。
         self.locked = False
+        # 上一次 step() 的时刻：用来发现"我们被从外面踢掉了"（见 STALE_STEP_GAP）
+        self._last_step_at = None
 
     # ---------------- 对外 ----------------
 
@@ -443,12 +462,37 @@ class ObstacleTask:
 
     def step(self, frame: FramePacket, now: float) -> TaskUpdate:
         """主循环每帧调用一次，必须立刻返回。"""
+        if self.stage != "IDLE" and self._was_cut_short(now):
+            # 协调器在外面把控制权拿走了（视频中断 / 人工按键 / 硬超时），
+            # 而且不会通知模块。发现断档就作废重来，绝不从半路接着走。
+            self._abandon()
+        self._last_step_at = now
+
         if self.stage == "IDLE":
             detection = self.detect(frame.image)
             self.last_detection = detection
             return self._step_idle(detection, now)
         # 绕行途中不再重复检测（结果只用于上报）；只有 SEEK 段还要看画面找线。
         return self._step_active(frame.image, now)
+
+    def _was_cut_short(self, now: float) -> bool:
+        """两次 step() 之间隔得太久，说明中间我们并不在开车。"""
+        return (
+            self._last_step_at is not None
+            and (now - self._last_step_at) > STALE_STEP_GAP
+        )
+
+    def _abandon(self) -> None:
+        """作废当前这一轮绕行：回到 IDLE，重新判断。
+
+        注意**不设冷却**（`finished_at` 不动）：这一轮本来就没绕成，
+        障碍多半还在，应该马上重新确认、重新绕，而不是干等 5 秒。
+        """
+        self.stage = "IDLE"
+        self.hit_frames = 0
+        self.line_frames = 0
+        self.started_at = None
+        self.segment_started_at = None
 
     # ---------------- 还没接管：判断要不要管 ----------------
 
@@ -546,33 +590,36 @@ class ObstacleTask:
 
         elapsed = now - self.segment_started_at
 
+        # 注意：每进入下一段都必须把 elapsed 归零，否则会**一路穿透**。
+        # 之前这里犯过这个错：侧移段结束时 elapsed=1.7，已经 >= 前进段的 1.6、
+        # 也 >= 回收段的 1.2，于是一个调用里 OUT→PASS→BACK→SEEK 全走完，
+        # **前进和回收两段被整段跳过**，车只横移一下就去找线了。
         if self.stage == "HOLD":
-            if elapsed >= HOLD_BEFORE_GO:
-                self._enter("OUT", now)
-            else:
+            if elapsed < HOLD_BEFORE_GO:
                 return self._running(MotionCommand(), "holding before the dodge")
+            self._enter("OUT", now)
+            elapsed = 0.0
 
         if self.stage == "OUT":
-            if elapsed >= T_OUT_TIME:
-                self._enter("PASS", now)
-            else:
+            if elapsed < T_OUT_TIME:
                 return self._running(
                     MotionCommand(lateral=self._side() * SIDE_SPEED), "stepping aside"
                 )
+            self._enter("PASS", now)
+            elapsed = 0.0
 
         if self.stage == "PASS":
-            if elapsed >= T_PASS_TIME:
-                self._enter("BACK", now)
-            else:
+            if elapsed < T_PASS_TIME:
                 return self._running(MotionCommand(forward=FWD_SPEED), "passing the obstacle")
+            self._enter("BACK", now)
+            elapsed = 0.0
 
         if self.stage == "BACK":
-            if elapsed >= T_BACK_TIME:
-                self._enter("SEEK", now)
-            else:
+            if elapsed < T_BACK_TIME:
                 return self._running(
                     MotionCommand(lateral=-self._side() * BACK_SPEED), "returning to the line"
                 )
+            self._enter("SEEK", now)
 
         if self.stage == "SEEK":
             return self._step_seek(image, now)
