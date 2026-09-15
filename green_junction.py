@@ -25,22 +25,32 @@
 ============  ==========================================================
 A1            岔路是"蓝色巡线带一分为二"，两条分支都是蓝色（``require_blue_branches``）。
               如果正式赛道用别的颜色/材质，改 HSV 区间即可。
-A2            岔路出现在画面上方：分叉行位于 ROI 的 35% 以下位置
-              （``min_split_row_ratio``、``max_split_row_ratio``、``max_split_fraction``）。
+A2            岔路出现在画面上方：分叉带（同一行上被空隙拉开的蓝色带）落在 ROI 的
+              ``max_split_fraction`` 以上（``min_split_row_ratio``、``min_split_row_offset``）。
 A3            "分叉行"= 同一行上出现两段蓝色带，**空隙真正拉开**
-              （``gap_over_tape_ratio``：空隙 ≥ 带宽的 40%）且中心距够远
-              （``min_branch_separation``），并且这个形态最少连续
-              ``min_split_rows`` 行。刚分叉时两条带还贴着，那只是被拉宽的粗线，
-              普通弯道和实线噪点也不会满足这些条件。
-A4            两条分支一直延伸到 ROI 底部（``min_branch_rows``、``min_branch_pixels_below``），
-              也就是车头正前方是两选一的开口；分叉点已经贴到画面底部时说明车已经
+              （``gap_over_tape_ratio``：空隙 ≥ 带宽的 40%）且内侧间距够远
+              （``min_branch_separation_px`` 绝对像素 **或** ``min_branch_separation`` 比例），
+              并且这个形态最少连续 ``min_split_rows`` 行。刚分叉时两条带还贴着，
+              那只是被拉宽的粗线，普通弯道和实线噪点也不会满足这些条件。
+A3b           岔路是分叉带上下某一侧连着一条"还没分叉"的带子的"Y"：分叉带上方或
+              下方必须有一段不是分叉行的带子（``stem_window_ratio`` 的窗口里过半的
+              行有带子但不算分叉），**或者**两条分支的间距沿画面纵向明显变化
+              （``min_branch_opening_ratio``：远、近两端间距的比值 ≥ 1.25）。
+              两条平行色块（间距恒定、两端都不接带子）不算岔路。
+              张开和收拢**两个方向都算**：2026-09-15 实车那次正是"分叉点在画面下方、
+              两条分支向上张开"的朝向，老代码只认反方向，所以判成
+              ``branches too short``（见下面的修订说明）。
+A4            分叉带的上沿离 ROI 底部还要有 ``min_branch_pixels_below`` 像素以上，
+              说明车头正前方还有东西可看；分叉点已经贴到画面底部时说明车已经
               开过岔路，这时不触发。
 A5            图像中心 = 车头正前方。相机水平视野 ``horizontal_fov_deg`` 默认 70 度，
               用来把像素偏移换算成转向角；这个值只影响转多少，不影响选哪边。
 A6            灯的判据由 **3 号（traffic_light.py）** 提供。本模块通过注入的
               ``light_probe(frame, now) -> LightReading`` 读取，自己不认红绿灯
               （``LIGHT_OWNER`` 常量说明这个边界）。没有注入探针时，唯一可用的判据是
-              ``fallback_color``，默认 ``"none"`` 表示"没有判据"→ 失败停车。
+              ``fallback_color``，默认 ``"none"`` 表示"没有判据"：**这种配置下本模块
+              连接管都不接管**（``require_rule_source``），把岔路让给后面注册的
+              ``free_junction``；否则它只可能白停 ``decision_timeout`` 秒再 FAILED。
 A7            两条分支都是绿灯、或者灯只报了一个颜色没有报位置时，
               ``fallback_rule`` 决定走哪边；默认 ``"straightest"``（走最接近车头正前方的那边）。
 A8            转向是一段有限动作：yaw = 选中分支的偏角 × ``yaw_gain``，被
@@ -50,7 +60,28 @@ A9            走过一个岔路后 ``rearm_cooldown`` 秒内不再重复触发�
 A10           转向时前进速度与转向量成比例（``forward = forward_speed × |yaw| / max_turn_yaw``）：
               没选出分支时 yaw 为 0，前进也必须是 0，也就是"等判据时原地停着"。
               ``forward_speed`` 默认 0.10 m/s，低于骨架的 0.30 m/s 上限。
+A11           "线回到画面中央"这个判据**不依赖框架传参**：协调器固定只调
+              ``task.step(frame, now)``，所以框架永远不会给 ``line``。优先用传进来的
+              ``line``，没有（或不可信）时用本模块自己在**画面近处窄带**里算出来的
+              巡线带中心偏差（``near_band_*`` / ``near_min_rows`` / ``near_row_min_run``）。
+              近处看到两条带（岔路分支）或看不到带子，都算"线没回来"。
+A12           只有"分叉带已经贴到最后一截画面"（``drove_past_fork_row_ratio``）
+              才可能判"车已经开过岔路口"：正常进近时车头前方的带子是单条且居中，
+              和"开过了"长得一样，不加上这一条就会把正常进近误判成失败。
 ============  ==========================================================
+
+修订说明（2026-09-15 实车测试报告）：本次改了三处，全部只在本文件里，
+**没有改公共接口**（``step(frame, now, line=None)`` 签名不变，``line`` 依然是可选的）。
+
+1. 岔路判据以前只认"两条分支越往车头方向越张开"，这次改成**两个方向都认**，
+   并把"两条分支"的判定从"这一行恰好只有两段"放宽到"最左和最右两段"
+   （实车画面里噪点常把一条带子切成三四段，老代码直接判"没有分叉行"）；
+   同时把"分叉点以下必须有分支延伸到 ROI 底部"这条要求，换成老代码里那条
+   除零风险的"张开比例"判据的新写法（见 ``_band_trend_ratio``）。
+2. ``line`` 拿不到时，"线回中央"改用画面近处的蓝色带自己算（A11），
+   否则 ``TURN → SETTLE → COMPLETED`` 这两道门在实车上恒为 False，只能超时失败。
+3. ``_opens_upward`` 里 ``span`` 可能算成 0 → ``sum/span`` 除零（实车日志出现过
+   34 条 ``float division by zero``）。新实现里 ``span <= 0`` 直接判否。
 """
 
 from dataclasses import dataclass
@@ -152,13 +183,22 @@ class JunctionConfig:
     #: 两段之间的空隙 / 那两段的平均带宽。刚分叉的地方两条带还贴着，
     #: 要等空隙真正拉开才算"分叉行"，否则只是被拉宽的粗线。
     gap_over_tape_ratio: float = 0.40
-    min_branch_separation: float = 0.10   # 两段中心距 / ROI 宽度，低于此值不算岔路
-    #: 最靠近车头处的两条分支间距，至少要是远处间距的这么多倍（真的在张开）。
+    #: 两段内侧间距的绝对下限（像素）。这个值沿用 7 号 free_junction.py 在
+    #: 2026-09-15 实车上真的确认到岔路时用的 45 像素，比只按比例判更抗透视。
+    min_branch_separation_px: int = 45
+    min_branch_separation: float = 0.10   # 内侧间距 / ROI 宽度；与上面那条是"或"关系
+    #: 两条分支的间距沿画面纵向必须明显变化（张开或收拢都算，见 A3b）：
+    #: 远近两端间距的比值（大 / 小）不小于它；两条平行色块不算岔路。
     min_branch_opening_ratio: float = 1.25
-    min_split_rows: int = 2          # 两段形态最少连续多少行
-    min_branch_rows: int = 2         # 每条分支最少占据多少采样行
-    max_split_fraction: float = 0.80 # 分叉行在 ROI 内的最大纵向位置（再往下就等于车已开过）
-    min_branch_pixels_below: int = 30  # 分叉行以下至少还要看得到这么多像素的两条分支
+    #: 至少要有这么多行分叉带才敢用"间距变化"当判据；行太少时趋势不可信，
+    #: 改用"分叉带旁边有没有一段单条带子"来判。
+    min_band_rows_for_trend: int = 6
+    #: 分叉带上方/下方找"还没分叉的带子"的窗口高度（占 ROI 高度的比例）。
+    stem_window_ratio: float = 0.05
+    min_split_rows: int = 3          # 两段形态最少连续多少行（7 号实车用的也是 3）
+    min_branch_rows: int = 2         # 每条分支最少占据多少行（只影响置信度打分）
+    max_split_fraction: float = 0.80 # 分叉带起点在 ROI 内的最大纵向位置（再往下就等于车已开过）
+    min_branch_pixels_below: int = 30  # 分叉带上沿到 ROI 底部至少要有这么多像素
     min_split_row_ratio: float = 0.02
     min_split_row_offset: int = 1    # 距 ROI 顶部的安全边距（行）
     max_branch_center_offset: float = 0.85  # 分支中心相对 ROI 中心的允许偏移
@@ -166,15 +206,27 @@ class JunctionConfig:
     line_valid_confidence: float = 0.20     # 低于此置信度的线检测不算数
     min_junction_confidence: float = 0.25   # 综合置信度门槛
 
+    # --- 近处巡线带（见 A11：coordinator 永远不传 line，只能自己从画面算） ---
+    #: 只看画面最下面这条窄带（整幅图比例）——那里离车头最近，正常应该是一条带子。
+    near_band_top: float = 0.88
+    near_band_bottom: float = 0.99
+    near_min_rows: int = 3        # 窄带里至少要有几行是"恰好一条带"
+    near_row_min_run: int = 6     # 窄带里一行多宽才算"一条带"
+    near_min_pixels: int = 40     # 窄带里至少要有这么多蓝像素，否则算没看到线
+    near_error_deadband: float = 0.20   # 近处带中心的允许偏差（量纲同 line_center_deadband）
+
     # --- 确认与再触发（见 A8、A9） ---
     confirm_frames: int = 3          # 连续几帧都看到才算真岔路
     confirm_gap_grace: float = 0.25  # 中间漏看到的容忍时间（秒）
     confirm_timeout: float = 2.5     # 确认阶段最长耗时
     rearm_cooldown: float = 2.0      # 走过岔路后的再触发冷却时间（秒）
     decision_timeout: float = 6.0    # 到岔路口后等判据的最长时间
-    #: 判定"车已经开过岔路口"需要连续多少帧同时满足：线回来了 + 岔路还在。
-    #: 单帧的巧合不算，要连续犯这个矛盾才失败。
+    #: 判定"车已经开过岔路口"需要连续多少帧同时满足：线回来了 + 岔路还在
+    #: + 分叉带已经贴到画面最后一截（见 A12）。单帧的巧合不算。
     drove_past_frames: int = 3
+    #: 分叉带下沿（两条分支汇成一条带子的地方）要低到 ROI 的这个比例以下，
+    #: 才算"车头已经顶到岔路口"。正常进近时这个值小，不会误判成失败。
+    drove_past_fork_row_ratio: float = 0.85
     junction_gap_grace: float = 0.60 # 转向中岔路短暂看不见的容忍时间
     total_timeout: float = 12.0      # 单次任务硬上限（骨架另有一层 20 秒上限）
 
@@ -192,6 +244,11 @@ class JunctionConfig:
     fallback_color: str = "none"
     #: 灯判据不能区分左右时怎么选："straightest"（默认）或 "left" / "right" / "none"。
     fallback_rule: str = "straightest"
+    #: 没有任何判据来源时（没注入 light_probe，``fallback_color`` 又是 "none"）
+    #: 要不要接管。默认 **不接管**：这种配置下本模块不可能成功，接管只会白停
+    #: ``decision_timeout`` 秒，还会把岔路从后面注册的模块（free_junction）手里抢走。
+    #: 设成 False = 老行为："接管 → 原地停 → 超时 FAILED"。
+    require_rule_source: bool = True
     require_blue_branches: bool = True  # A1：关掉就只按亮度/形态找分叉
 
 
@@ -223,6 +280,13 @@ class JunctionDetection:
     branches: Tuple[BranchGeometry, ...] = ()
     confidence: float = 0.0
     mask: Optional[np.ndarray] = None    # 整幅图像尺寸的蓝色掩膜
+    fork_bottom_row: Optional[int] = None  # 分叉带下沿（分支开始汇成一条带的 y）
+    band_rows: int = 0                     # 分叉带有多少行
+    #: 分叉带下沿在 ROI 里的纵向位置（0=ROI 顶，1=ROI 底）。见 A12。
+    band_bottom_ratio: float = 0.0
+    #: 远、近两端间距的比值（≥1）；行数不够算不出时是 None。见 A3b。
+    trend_ratio: Optional[float] = None
+    has_stem: bool = False                 # 分叉带旁边是否有一段单条带子
 
     @classmethod
     def no_result(cls, message: str = "", mask: Optional[np.ndarray] = None):
@@ -260,6 +324,38 @@ def _kernel(size: int) -> np.ndarray:
     return cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (size, size))
 
 
+def row_runs(
+    row: np.ndarray,
+    merge_gap: int = 2,
+    min_run: int = 4,
+) -> List[Tuple[int, int]]:
+    """一行掩膜里的横向连通段（合并小空隙、丢掉太短的段）。
+
+    返回的是这一行里每一段带的 ``(x0, x1)``（闭区间，相对这一行的坐标系）。
+    岔路检测和"近处巡线带"共用它，保证两处的"一段带"定义完全一样。
+    """
+    indices = np.flatnonzero(row)
+    if indices.size == 0:
+        return []
+    breaks = np.flatnonzero(np.diff(indices) > 1)
+    starts = np.concatenate(([0], breaks + 1))
+    ends = np.concatenate((breaks, [indices.size - 1]))
+    runs: List[Tuple[int, int]] = []
+    for start, end in zip(starts, ends):
+        x0 = int(indices[start])
+        x1 = int(indices[end])
+        # 合并
+        if runs and x0 - runs[-1][1] <= merge_gap:
+            runs[-1] = (runs[-1][0], x1)
+        else:
+            runs.append((x0, x1))
+    return [
+        (x0, x1)
+        for x0, x1 in runs
+        if (x1 - x0 + 1) >= max(1, int(min_run))
+    ]
+
+
 def blue_branch_mask(frame: np.ndarray, settings: JunctionConfig) -> np.ndarray:
     """返回整幅图像尺寸的蓝色巡线带掩膜；不做任何硬件访问。"""
     if frame is None or frame.ndim != 3 or frame.shape[2] != 3:
@@ -292,6 +388,75 @@ def line_is_centered(
     return abs(line.error) <= deadband
 
 
+def near_field_line(
+    image: np.ndarray,
+    settings: Optional[JunctionConfig] = None,
+) -> Tuple[Optional[float], str]:
+    """只看画面最下方一条窄带，估计巡线带中心相对画面中心的偏差（-1..1）。
+
+    为什么需要它（见 A11）：协调器固定只调 ``task.step(frame, now)``，
+    永远不会传 ``line``，所以"线回到中央了没有"这道门在本模块里必须自己算。
+
+    判据刻意保守：
+
+    * 窄带里必须**主要只有一条带子**（``near_min_rows`` 行以上）；
+    * 看到两条以上（岔路的两条分支伸到车头前）→ 返回 ``None``，也就是"线没回来"；
+    * 蓝色像素太少（``near_min_pixels``）→ 同样算没看到线。
+
+    :return: ``(error, reason)``；``error`` 为 ``None`` 表示这一帧不能判定。
+    """
+    if image is None or getattr(image, "ndim", 0) != 3 or image.shape[2] != 3:
+        return None, "no image"
+    settings = settings if settings is not None else JunctionConfig()
+    height, width = image.shape[:2]
+    left = max(0, min(int(width * settings.roi_left), width - 1))
+    right = max(left + 1, min(int(width * settings.roi_right), width))
+    y0 = max(0, min(height - 1, int(height * settings.near_band_top)))
+    y1 = max(y0 + 1, min(height, int(height * settings.near_band_bottom)))
+    strip = image[y0:y1, left:right]
+    if strip.size == 0:
+        return None, "empty near band"
+
+    hsv = cv2.cvtColor(strip, cv2.COLOR_BGR2HSV)
+    mask = cv2.inRange(
+        hsv,
+        np.array(settings.hsv_lower, dtype=np.uint8),
+        np.array(settings.hsv_upper, dtype=np.uint8),
+    )
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, _kernel(settings.open_kernel))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, _kernel(settings.close_kernel))
+    if int(np.count_nonzero(mask)) < max(0, int(settings.near_min_pixels)):
+        return None, "no tape in the near band"
+
+    centers: List[float] = []
+    split_rows = 0
+    for row in mask:
+        runs = row_runs(row, settings.run_merge_gap, settings.near_row_min_run)
+        if len(runs) == 1:
+            centers.append((runs[0][0] + runs[0][1]) / 2.0 + left)
+        elif len(runs) > 1:
+            split_rows += 1
+    if len(centers) < max(1, int(settings.near_min_rows)):
+        if split_rows:
+            return None, "near band is split into branches"
+        return None, "no tape in the near band"
+
+    error = (float(np.median(centers)) - width / 2.0) / max(width / 2.0, 1.0)
+    return error, "near band error=%.2f" % error
+
+
+def near_line_is_centered(
+    image: np.ndarray,
+    settings: Optional[JunctionConfig] = None,
+) -> Tuple[bool, str]:
+    """``near_field_line`` 的布尔版本：近处那条带子是否就在画面中央附近（见 A11）。"""
+    settings = settings if settings is not None else JunctionConfig()
+    error, reason = near_field_line(image, settings)
+    if error is None:
+        return False, reason
+    return abs(error) <= settings.near_error_deadband, reason
+
+
 # --------------------------------------------------------------------------
 # 检测器
 # --------------------------------------------------------------------------
@@ -308,134 +473,167 @@ class JunctionDetector:
 
     def _row_runs(self, row: np.ndarray) -> List[Tuple[int, int]]:
         """一行掩膜里的横向连通段（已按 settings 合并小空隙、丢掉太短的段）。"""
-        indices = np.flatnonzero(row)
-        if indices.size == 0:
-            return []
-        breaks = np.flatnonzero(np.diff(indices) > 1)
-        starts = np.concatenate(([0], breaks + 1))
-        ends = np.concatenate((breaks, [indices.size - 1]))
-        runs: List[Tuple[int, int]] = []
-        for start, end in zip(starts, ends):
-            x0 = int(indices[start])
-            x1 = int(indices[end])
-            # 合并
-            if runs and x0 - runs[-1][1] <= self.settings.run_merge_gap:
-                runs[-1] = (runs[-1][0], x1)
-            else:
-                runs.append((x0, x1))
-        return [
-            (x0, x1)
-            for x0, x1 in runs
-            if (x1 - x0 + 1) >= self.settings.row_min_run
-        ]
+        return row_runs(row, self.settings.run_merge_gap, self.settings.row_min_run)
 
-    def _two_runs(self, row: np.ndarray, width: int) -> Optional[Tuple[Tuple[int, int], Tuple[int, int]]]:
-        """这一行是不是"被空隙真正拉开的两段"；空隙不够就当没看见。"""
+    def _two_runs(
+        self, row: np.ndarray, width: int
+    ) -> Optional[Tuple[Tuple[int, int], Tuple[int, int]]]:
+        """这一行是不是"被空隙真正拉开的两段"；不够就返回 ``None``。
+
+        只取**最左和最右**两段：实车画面里一条带子常被噪点切成三四段，
+        老代码要求"恰好两段"，于是在真岔路上直接判"没有分叉行"。
+        被噪声切开的单条带子仍然过不了下面的空隙判据（空隙相对带宽太小）。
+        """
         runs = self._row_runs(row)
-        if len(runs) != 2:
+        if len(runs) < 2:
             return None
-        first, second = runs
+        first, second = runs[0], runs[-1]
         gap = second[0] - first[1] - 1
         tape = ((first[1] - first[0] + 1) + (second[1] - second[0] + 1)) / 2.0
         if gap < tape * self.settings.gap_over_tape_ratio:
             # 刚分叉的地方两条带还贴着；这时仍是一条（被拉宽的）线。
             return None
-        separation = (second[0] - first[1]) / max(width, 1)
-        if separation < self.settings.min_branch_separation:
+        separation_px = second[0] - first[1]
+        if (
+            separation_px < self.settings.min_branch_separation_px
+            and separation_px / max(width, 1) < self.settings.min_branch_separation
+        ):
             return None
         return first, second
 
-    # -- 分叉行 -----------------------------------------------------------
+    # -- 分叉带 -----------------------------------------------------------
 
-    def _find_split(self, mask: np.ndarray, rect: Tuple[int, int, int, int]):
-        """从 ROI 顶部往下找第一处稳定分叉行；找不到返回 ``None``。"""
+    def _scan_rows(
+        self, mask: np.ndarray, rect: Tuple[int, int, int, int]
+    ) -> List[Tuple[int, Tuple[Tuple[int, int], Tuple[int, int]]]]:
+        """把 ROI 里"是分叉行"的行按顺序列出来（每行带各自的左右两段）。
+
+        扫描范围是整个 ROI：分叉带允许一直伸到 ROI 底部（见 A3b/A12，
+        实车那次的朝向就是这样，带子下沿贴到画面底部才算"车顶到口子上了"）。
+        起点仍然留安全边距，免得把画面最上面一两行噪声当成分叉。
+        """
         left, top, right, bottom = rect
         height = bottom - top
         settings = self.settings
         start = top + max(
             1, int(height * settings.min_split_row_ratio), settings.min_split_row_offset
         )
-        limit = top + int(height * settings.max_split_fraction)
-        limit = max(start, min(limit, bottom - 1))
-        confirmed = 0
-        for y in range(start, limit + 1):
-            if self._two_runs(mask[y, left:right], right - left) is None:
-                confirmed = 0
-                continue
-            confirmed += 1
-            if confirmed >= settings.min_split_rows:
-                first_row = y - confirmed + 1
-                if bottom - first_row < settings.min_branch_pixels_below:
-                    # 分叉点已经贴到画面底部，等于车已经开过去了，不处理。
-                    return None
-                return first_row
-        return None
+        rows = []
+        for y in range(start, bottom):
+            pair = self._two_runs(mask[y, left:right], right - left)
+            if pair is not None:
+                rows.append((y, pair))
+        return rows
+
+    @staticmethod
+    def _bands(
+        rows: Sequence[Tuple[int, Tuple[Tuple[int, int], Tuple[int, int]]]],
+        min_rows: int,
+    ) -> List[List[Tuple[int, Tuple[Tuple[int, int], Tuple[int, int]]]]]:
+        """把分叉行切成一段段**连续**的带子，只留下够长的。"""
+        bands: List[List[Tuple[int, Tuple[Tuple[int, int], Tuple[int, int]]]]] = []
+        current: List[Tuple[int, Tuple[Tuple[int, int], Tuple[int, int]]]] = []
+        previous_y: Optional[int] = None
+        for item in rows:
+            y = item[0]
+            if previous_y is not None and y != previous_y + 1:
+                if len(current) >= min_rows:
+                    bands.append(current)
+                current = []
+            current.append(item)
+            previous_y = y
+        if len(current) >= min_rows:
+            bands.append(current)
+        return bands
+
+    @staticmethod
+    def _band_strength(
+        band: Sequence[Tuple[int, Tuple[Tuple[int, int], Tuple[int, int]]]]
+    ) -> float:
+        """挑带子时的强度：平均内侧间距（像素），越宽越像岔路。"""
+        return sum(float(pair[1][0] - pair[0][1]) for _y, pair in band) / max(len(band), 1)
+
+    def _band_trend_ratio(self, band: Sequence) -> Optional[float]:
+        """远、近两端内侧间距的比值（大 / 小，≥1）；行太少返回 ``None``。
+
+        张开（近处更宽）和收拢（近处更窄）**都算**岔路：实车那次是"分叉点在
+        画面下方、两条分支向上张开"，也就是往下收拢。平行色块的比值接近 1。
+
+        老代码的 ``_opens_upward`` 在这里会除零：``span`` 可能是 0，
+        然后 ``sum(valid[-span:]) / span`` 直接炸（实车日志里那 34 条
+        ``float division by zero`` 就是它）。
+        """
+        settings = self.settings
+        separations = [float(pair[1][0] - pair[0][1]) for _y, pair in band]
+        if len(separations) < max(2, int(settings.min_band_rows_for_trend)):
+            return None
+        span = max(1, len(separations) // 3)
+        far = sum(separations[:span]) / span     # 画面上方（远）
+        near = sum(separations[-span:]) / span   # 画面下方（近）
+        if far <= 0.0 or near <= 0.0:
+            return None
+        return max(far, near) / min(far, near)
+
+    def _has_stem(
+        self,
+        mask: np.ndarray,
+        rect: Tuple[int, int, int, int],
+        band_top: int,
+        band_bottom: int,
+    ) -> bool:
+        """分叉带的上方或下方，是不是接着一段"还没分叉"的带子（Y 的那条腿）。
+
+        只看"这一行有没有带子、而且不是分叉行"：刚离开分叉点的地方两条带子
+        往往还贴着（空隙不够），那也算腿——所以不能要求"恰好一段"。
+        """
+        left, top, right, bottom = rect
+        width = right - left
+        window = max(3, int((bottom - top) * self.settings.stem_window_ratio))
+        windows = (
+            (max(top, band_top - window), band_top),
+            (band_bottom + 1, min(bottom, band_bottom + 1 + window)),
+        )
+        for start, stop in windows:
+            total = 0
+            stem = 0
+            for y in range(start, stop):
+                total += 1
+                if self._two_runs(mask[y, left:right], width) is not None:
+                    continue
+                if self._row_runs(mask[y, left:right]):
+                    stem += 1
+            if total and stem * 2 >= total:
+                return True
+        return False
 
     # -- 分支几何 ---------------------------------------------------------
 
-    def _opens_upward(
-        self,
-        mask: np.ndarray,
-        rect: Tuple[int, int, int, int],
-        split_row: int,
-        samples: Sequence[int],
-    ) -> bool:
-        """检查两条分支的间距是否越往近处越大（真正的岔路会张开）。"""
-        left, top, right, bottom = rect
-        width = right - left
-        separations: List[float] = []
-        for y in samples:
-            pair = self._two_runs(mask[y, left:right], width)
-            if pair is None:
-                separations.append(float("nan"))
-                continue
-            separations.append(float(pair[1][0] - pair[0][1]))
-        valid = [value for value in separations if value == value]  # 去掉 nan
-        span = min(len(valid) // 3, max(1, len(valid) // 4))
-        if len(valid) < 2 * span:
-            return False
-        near = sum(valid[-span:]) / span
-        far = sum(valid[:span]) / span
-        return near >= far * self.settings.min_branch_opening_ratio
-
     def _branch_geometry(
         self,
-        mask: np.ndarray,
+        band: Sequence[Tuple[int, Tuple[Tuple[int, int], Tuple[int, int]]]],
         rect: Tuple[int, int, int, int],
-        split_row: int,
-    ) -> Tuple[Optional[BranchGeometry], Optional[BranchGeometry]]:
-        """统计分叉行以下每一个采样行里两条分支的中心位置。"""
+    ) -> Tuple[Optional[BranchGeometry], Optional[BranchGeometry], str]:
+        """用分叉带里的每一行，统计两条分支的中心位置和偏角。
+
+        返回 ``(左, 右, 原因)``；失败时前两项都是 ``None``，原因直接进日志，
+        这样下一次实车/离线探针能一眼看出是哪一道判据挡的。
+        """
         left, top, right, bottom = rect
         width = right - left
         settings = self.settings
-        span = bottom - split_row
-        if span <= 0:
-            return None, None
-        step = max(1, span // 12)
-        samples = list(range(split_row + step, bottom, step))
-        if not samples:
-            samples = [split_row + 1] if split_row + 1 < bottom else []
-        if len(samples) < settings.min_branch_rows:
-            return None, None
-
-        bucket: Tuple[List[float], List[float], List[float], List[float]] = ([], [], [], [])
-        for y in samples:
-            pair = self._two_runs(mask[y, left:right], width)
-            if pair is None:
-                continue
+        xs_left: List[float] = []
+        ys_left: List[float] = []
+        xs_right: List[float] = []
+        ys_right: List[float] = []
+        for y, pair in band:
             (a0, a1), (b0, b1) = pair
-            bucket[0].append((a0 + a1) / 2.0 + left)
-            bucket[1].append(float(y))
-            bucket[2].append((b0 + b1) / 2.0 + left)
-            bucket[3].append(float(y))
-        rows = len(bucket[0])
-        if rows < settings.min_branch_rows:
-            return None, None
-
-        # 两条分支越往车头方向越张开。两个平行的色块（不是岔路）间距恒定，
-        # 会被这一条挡掉。
-        if not self._opens_upward(mask, rect, split_row, samples):
-            return None, None
+            xs_left.append((a0 + a1) / 2.0 + left)
+            ys_left.append(float(y))
+            xs_right.append((b0 + b1) / 2.0 + left)
+            ys_right.append(float(y))
+        rows = len(xs_left)
+        if rows < max(1, int(settings.min_branch_rows)):
+            return None, None, "band too short for branch geometry"
 
         half_width = max(width / 2.0, 1.0)
         per_pixel_deg = settings.horizontal_fov_deg / max(width, 1)
@@ -444,13 +642,13 @@ class JunctionDetector:
 
         result: List[BranchGeometry] = []
         for xs, ys, side in (
-            (bucket[0], bucket[1], Branch.LEFT),
-            (bucket[2], bucket[3], Branch.RIGHT),
+            (xs_left, ys_left, Branch.LEFT),
+            (xs_right, ys_right, Branch.RIGHT),
         ):
             center_x = float(np.mean(xs))
             center_y = float(np.mean(ys))
             if abs(center_x - roi_center) / half_width > settings.max_branch_center_offset:
-                return None, None
+                return None, None, "branch centre is outside the ROI"
             bearing = (center_x - frame_center) * per_pixel_deg
             result.append(
                 BranchGeometry(
@@ -460,7 +658,7 @@ class JunctionDetector:
                     rows=rows,
                 )
             )
-        return result[0], result[1]
+        return result[0], result[1], "ok"
 
     # -- 对外入口 ---------------------------------------------------------
 
@@ -486,24 +684,59 @@ class JunctionDetector:
             self.last_confidence = 0.0
             return JunctionDetection.no_result("no blue pigment in ROI", mask)
 
-        split_row = self._find_split(mask, rect)
-        if split_row is None:
+        rows = self._scan_rows(mask, rect)
+        bands = self._bands(rows, max(1, int(settings.min_split_rows)))
+        height = max(bottom - top, 1)
+        # 分叉带的**起点**不能太低（A2）：太低了等于车已经压在口子上，来不及判了。
+        start_limit = top + int(height * settings.max_split_fraction)
+        bands = [item for item in bands if item[0][0] <= start_limit]
+        band: Optional[List[Tuple[int, Tuple[Tuple[int, int], Tuple[int, int]]]]] = None
+        if bands:
+            # 先要最长的一段，一样长时取间距最大的那段（最像岔路）。
+            band = max(bands, key=lambda item: (len(item), self._band_strength(item)))
+        if band is None:
             self.last_confidence = 0.0
-            return JunctionDetection.no_result("no two-run row (curve or solid line)", mask)
+            message = (
+                "fork is already under the car"
+                if rows
+                else "no two-run row (curve or solid line)"
+            )
+            return JunctionDetection.no_result(message, mask)
 
-        pair = self._two_runs(mask[split_row, left:right], right - left)
-        if pair is None:
+        band_top = band[0][0]
+        band_bottom = band[-1][0]
+        if bottom - band_top < settings.min_branch_pixels_below:
+            # 分叉点已经贴到画面底部，等于车已经开过去了，不处理。
             self.last_confidence = 0.0
-            return JunctionDetection.no_result("split row lost", mask)
+            return JunctionDetection.no_result("fork is already under the car", mask)
+
+        pair = band[0][1]
         split_center = (pair[0][1] + pair[1][0]) / 2.0 + left
 
-        left_branch, right_branch = self._branch_geometry(mask, rect, split_row)
+        left_branch, right_branch, geometry_reason = self._branch_geometry(band, rect)
         if left_branch is None or right_branch is None:
             self.last_confidence = 0.0
-            return JunctionDetection.no_result("branches too short", mask)
+            return JunctionDetection.no_result(geometry_reason, mask)
+
+        # A3b：分叉带旁边必须接着一段"还没分叉"的带子（Y 的腿），或者两条分支的
+        # 间距沿纵向明显变化（张开/收拢都算）。两条平行色块（间距恒定、两头都不
+        # 接带子）会被这一条挡掉。
+        trend_ratio = self._band_trend_ratio(band)
+        has_stem = self._has_stem(mask, rect, band_top, band_bottom)
+        trend_ok = (
+            trend_ratio is not None
+            and trend_ratio >= settings.min_branch_opening_ratio
+        )
+        if not trend_ok and not has_stem:
+            self.last_confidence = 0.0
+            return JunctionDetection.no_result(
+                "parallel bands: no stem and no opening (trend=%s)"
+                % ("n/a" if trend_ratio is None else "%.2f" % trend_ratio),
+                mask,
+            )
 
         height = max(bottom - top, 1)
-        row_ratio = (split_row - top) / height
+        row_ratio = (band_top - top) / height
         row_score = max(0.0, 1.0 - row_ratio)
         separation = right_branch.center[0] - left_branch.center[0]
         sep_score = min(1.0, max(0.0, separation) / max(right - left, 1) / 0.30)
@@ -517,12 +750,17 @@ class JunctionDetector:
         return JunctionDetection(
             valid=True,
             message="junction confirmed",
-            split_row=int(split_row),
+            split_row=int(band_top),
             split_center_x=int(round(split_center)),
             box=box,
             branches=(left_branch, right_branch),
             confidence=confidence,
             mask=mask,
+            fork_bottom_row=int(band_bottom),
+            band_rows=len(band),
+            band_bottom_ratio=float((band_bottom - top) / height),
+            trend_ratio=trend_ratio,
+            has_stem=has_stem,
         )
 
 
@@ -795,6 +1033,40 @@ class GreenJunctionTask:
             return reading
         return None
 
+    def _has_rule_source(self) -> bool:
+        """有没有任何"走哪边"的判据来源（见 A6 / ``require_rule_source``）。"""
+        if not self.settings.require_rule_source:
+            return True
+        if self.light_probe is not None:
+            return True
+        fallback = (self.settings.fallback_color or "none").strip().lower()
+        return fallback in ("green", "red")
+
+    def _line_centered(self, frame: FramePacket, now: float) -> Tuple[bool, str]:
+        """线回到画面中央了没有（见 A11）。
+
+        协调器固定只调 ``step(frame, now)``，``line`` 永远是 ``None``，所以这里
+        必须自己从画面算：优先用框架真的传进来的 ``line``（离线测试和别的
+        整合方式会传），拿不到或者不可信时，退回画面近处那条窄带
+        （:func:`near_line_is_centered`）。
+
+        返回 ``(是否居中, 判据来源或原因)``，第二个值只进日志/消息。
+        """
+        settings = self.settings
+        line = self.last_line
+        if (
+            line is not None
+            and getattr(line, "valid", False)
+            and getattr(line, "confidence", 0.0) >= settings.line_valid_confidence
+        ):
+            centered = line_is_centered(
+                line, settings.line_center_deadband, settings.line_valid_confidence
+            )
+            return centered, "line detector"
+        if frame is None or frame.image is None:
+            return False, "no image for the near-field line check"
+        return near_line_is_centered(frame.image, settings)
+
     # -- 主入口 -----------------------------------------------------------
 
     def step(
@@ -807,7 +1079,9 @@ class GreenJunctionTask:
 
         :param frame: 框架给的共享帧（本模块只读 ``frame.image``）。
         :param now: 单调时间（秒）。
-        :param line: 可选，框架本帧的巡线结果；用来判断"转向完线回来了没有"。
+        :param line: 可选，框架本帧的巡线结果。**不传也能跑**：协调器固定只调
+            ``step(frame, now)``，这种情况下"线回到中央了没有"由本模块
+            从画面近处的蓝色带自己算（见 A11 / :meth:`_line_centered`）。
         """
         settings = self.settings
         self.last_line = line
@@ -837,7 +1111,7 @@ class GreenJunctionTask:
         if self.state is JunctionState.DECIDE:
             return self._step_decide(detection, frame, now)
         if self.state is JunctionState.TURN:
-            return self._step_turn(detection, now)
+            return self._step_turn(detection, frame, now)
         return self._step_settle(detection, frame, now)
 
     # -- 状态实现 ---------------------------------------------------------
@@ -850,6 +1124,14 @@ class GreenJunctionTask:
     def _step_idle(self, detection: JunctionDetection, now: float) -> TaskUpdate:
         if self._idle_since is None:
             self._idle_since = now
+        if not self._has_rule_source():
+            # 一个判据来源都没有（既没有探针，fallback_color 又是 "none"）：
+            # 本模块在这个岔路口**不可能**成功，接管只会白停 6 秒并把岔路
+            # 从后面的模块（例如 free_junction）手里抢走。所以干脆不触发，
+            # 让协调器去问下一个模块。想恢复"接管、停住、再失败"的老行为，
+            # 把 JunctionConfig(require_rule_source=False) 即可。
+            self._confirm_count = 0
+            return self._not_triggered("no light rule source; not applicable")
         if self._rearm_ready_at is not None and now < self._rearm_ready_at:
             # 刚走过一个岔路：冷却期内即使又看到岔路形状也不重复触发（A9）。
             self._confirm_count = 0
@@ -901,13 +1183,15 @@ class GreenJunctionTask:
         if self._run_started_at is not None and now - self._run_started_at > settings.total_timeout:
             return self._failed("task total timeout")
 
-        # "线在画面中央" + "岔路形态还在"连续出现 → 车其实已经开过了岔路口，
-        # 只是没发现。这时没有分支可选，必须失败停车，不能瞎选一边。
-        if detection.valid and line_is_centered(
-            self.last_line,
-            settings.line_center_deadband,
-            settings.line_valid_confidence,
-        ):
+        # "线在画面中央" + "岔路形态还在" + "分叉带已经贴到最后一截画面"连续出现
+        # → 车其实已经顶到岔路口了。这时没有分支可选，必须失败停车，不能瞎选一边。
+        # 最后那一条（A12）是必须的：正常进近时车头前的带子也是单条且居中，
+        # 少了它就会把正常进近误判成"开过了"。
+        centered, line_source = self._line_centered(frame, now)
+        fork_at_the_car = (
+            detection.band_bottom_ratio >= settings.drove_past_fork_row_ratio
+        )
+        if detection.valid and centered and fork_at_the_car:
             self._drove_past_frames += 1
             if self._drove_past_frames >= settings.drove_past_frames:
                 return self._failed("drove past the junction without a decision")
@@ -936,7 +1220,9 @@ class GreenJunctionTask:
             % (chosen.side.value, chosen.bearing_deg, reason),
         )
 
-    def _step_turn(self, detection: JunctionDetection, now: float) -> TaskUpdate:
+    def _step_turn(
+        self, detection: JunctionDetection, frame: FramePacket, now: float
+    ) -> TaskUpdate:
         settings = self.settings
         if self._run_started_at is not None and now - self._run_started_at > settings.total_timeout:
             return self._failed("task total timeout during turn")
@@ -950,17 +1236,13 @@ class GreenJunctionTask:
             if gap > settings.junction_gap_grace:
                 return self._failed("lost the junction while turning")
 
-        settled = (
-            self._turn_elapsed(now) >= settings.turn_min_duration
-            and line_is_centered(
-                self.last_line,
-                settings.line_center_deadband,
-                settings.line_valid_confidence,
-            )
-        )
+        centered, line_source = self._line_centered(frame, now)
+        settled = self._turn_elapsed(now) >= settings.turn_min_duration and centered
         if settled:
             self._enter(JunctionState.SETTLE, now)
-            return self._running(now, "branch entered, checking line stability")
+            return self._running(
+                now, "branch entered, checking line stability (%s)" % line_source
+            )
 
         return self._running(
             now,
@@ -975,17 +1257,14 @@ class GreenJunctionTask:
         if self._run_started_at is not None and now - self._run_started_at > settings.total_timeout:
             return self._failed("task total timeout while settling")
 
-        stable = line_is_centered(
-            self.last_line,
-            settings.line_center_deadband,
-            settings.line_valid_confidence,
-        )
-        if stable and self._turn_elapsed(now) >= settings.turn_min_duration:
+        centered, line_source = self._line_centered(frame, now)
+        stable = centered and self._turn_elapsed(now) >= settings.turn_min_duration
+        if stable:
             self._rearm_ready_at = now + settings.rearm_cooldown
-            return self._completed("junction passed; line reacquired")
+            return self._completed("junction passed; line reacquired (%s)" % line_source)
 
         if self._elapsed(now) > settings.settle_timeout:
-            return self._failed("line did not return after the turn")
+            return self._failed("line did not return after the turn (%s)" % line_source)
 
         return self._running(now, "settling on the new branch")
 
@@ -999,6 +1278,13 @@ def detections_for_log(detection: Optional[JunctionDetection]) -> dict:
         "split_row": detection.split_row,
         "split_center_x": detection.split_center_x,
         "confidence": round(float(detection.confidence), 4),
+        "fork_bottom_row": detection.fork_bottom_row,
+        "band_rows": detection.band_rows,
+        "band_bottom_ratio": round(float(detection.band_bottom_ratio), 3),
+        "trend_ratio": (
+            None if detection.trend_ratio is None else round(float(detection.trend_ratio), 3)
+        ),
+        "has_stem": bool(detection.has_stem),
         "branches": [
             {
                 "side": item.side.value,

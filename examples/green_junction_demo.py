@@ -100,6 +100,12 @@ def run_demo(light_probe=green_right) -> List[str]:
     now += FRAME_DT
     update = task.step(FramePacket(junction_frame(), 4, now), now, tracking.detection)
     if update.status is not TaskStatus.RUNNING:
+        if light_probe is None:
+            # 一个判据来源都没有（没有探针、fallback_color 也是 "none"）：
+            # 本模块在这个岔路口不可能成功，所以**不接管**，让协调器去问
+            # 后面注册的模块（free_junction）。这是设计好的行为。
+            trace.append("task:not-triggered")
+            return trace
         raise RuntimeError("task did not take over at the junction")
     trace.append("task:running")
 
