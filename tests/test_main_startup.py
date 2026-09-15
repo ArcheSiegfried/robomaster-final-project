@@ -13,6 +13,7 @@ import contextlib
 import io
 import pathlib
 import sys
+import tempfile
 import types
 import unittest
 
@@ -83,6 +84,90 @@ class MainStartupTests(unittest.TestCase):
         self.assertNotEqual(banner, -1, "启动提示不见了")
         self.assertNotEqual(initialize, -1, "找不到 initialize 调用")
         self.assertLess(banner, initialize, "启动提示必须排在连接硬件之前")
+
+
+class RuntimeDiagnosticsTests(unittest.TestCase):
+    """运行结束时把接线层自检结果写进运行记录。
+
+    为什么要有这个测试：`run_20260915_161540` 里数字标识一次都没接管，而
+    `report.md` 里查不到"SDK 的 marker 订阅到底成没成功、回调多少 Hz"，
+    于是只能猜是模块的问题还是现场的问题。这条测试锁死"跑完就有答案"。
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+
+    def _recorder(self):
+        from evidence import EvidenceRecorder
+
+        recorder = EvidenceRecorder(directory=self._tmp.name)
+        self.addCleanup(recorder.close)
+        return recorder
+
+    def _report(self, recorder):
+        return (recorder.run_directory / "report.md").read_text(encoding="utf-8")
+
+    def test_marker_subscription_status_lands_in_the_run_record(self):
+        import main
+
+        recorder = self._recorder()
+        coordinator = types.SimpleNamespace(observers=[recorder])
+
+        class _Source:
+            def stats(self):
+                return {
+                    "subscribed": True,
+                    "callback_hz": 9.5,
+                    "coordinate_mode": "pixels",
+                    "markers_in_snapshot": 1,
+                }
+
+            def rate_warning(self):
+                return ""
+
+        main.record_runtime_diagnostics(coordinator, _Source())
+        recorder.close()
+
+        text = self._report(recorder)
+        self.assertIn("数字标识", text)
+        self.assertIn("| callback_hz | 9.5 |", text)
+        self.assertIn("| coordinate_mode | pixels |", text)
+
+    def test_silent_subscription_is_reported_with_its_reason(self):
+        """一个 marker 回调都没收到时，记录里要写清这一点。"""
+        import main
+
+        recorder = self._recorder()
+        coordinator = types.SimpleNamespace(observers=[recorder])
+
+        class _Source:
+            def stats(self):
+                return {"subscribed": False, "callbacks": 0, "callback_hz": 0.0}
+
+            def rate_warning(self):
+                return "还没有收到任何 marker 回调。"
+
+        main.record_runtime_diagnostics(coordinator, _Source())
+        recorder.close()
+
+        text = self._report(recorder)
+        self.assertIn("还没有收到任何 marker 回调。", text)
+
+
+    def test_missing_marker_subscription_is_recorded_too(self):
+        """连订阅都没建起来时（marker_source 为空），记录里不能是一片空白。"""
+        import main
+
+        recorder = self._recorder()
+        coordinator = types.SimpleNamespace(observers=[recorder])
+
+        main.record_runtime_diagnostics(coordinator, None)
+        recorder.close()
+
+        text = self._report(recorder)
+        self.assertIn("数字标识", text)
+        self.assertIn("没有建立", text)
 
 
 if __name__ == "__main__":

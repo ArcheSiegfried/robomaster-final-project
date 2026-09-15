@@ -541,6 +541,27 @@ class RunReportTests(unittest.TestCase):
         self.assertIn("没有产生得分截图", text)
         self.assertIn("没有任何模块接管", text)
 
+    def test_report_can_carry_runtime_diagnostics(self):
+        """运行结束的记录里要能带上"接线层自检结果"。
+
+        为什么要有这个测试：`run_20260915_161540` 里数字标识一次都没接管，
+        而记录里查不到"SDK 的 marker 订阅到底成没成功、回调多少 Hz、坐标是
+        像素还是归一化"，于是只能靠猜。把自检结果写进 report.md，下一次跑完
+        就有答案。
+        """
+        recorder = EvidenceRecorder(directory=self.directory)
+        self.addCleanup(recorder.close)
+        recorder.observe(FramePacket(line_frame(320), 1, 1.0), 1.0)
+        recorder.record_diagnostics(
+            "数字标识观测（SDK marker 订阅）",
+            {"subscribed": True, "callback_hz": 9.5},
+        )
+        recorder.close()
+
+        text = (recorder.run_directory / "report.md").read_text(encoding="utf-8")
+        self.assertIn("## 数字标识观测（SDK marker 订阅）", text)
+        self.assertIn("| callback_hz | 9.5 |", text)
+
 
 if __name__ == "__main__":
     unittest.main()

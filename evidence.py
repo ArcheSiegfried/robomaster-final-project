@@ -201,6 +201,9 @@ class EvidenceRecorder:
         # 结束时写成 report.md，可以直接贴进报告发给别人。
         self.task_evidence: List[dict] = []
         self.events: List[dict] = []
+        # 接线层的自检结果（例如 SDK marker 订阅状态）。运行结束时作为独立
+        # 小节写进 report.md，用来回答"某个模块为什么一次都没动"。
+        self.diagnostics: List[tuple] = []
         self.event_limit = 500
         self._last_event_key = None
         self._last_errors: tuple = ()
@@ -427,6 +430,22 @@ class EvidenceRecorder:
             }
         )
 
+    def record_diagnostics(self, title: str, values: dict) -> None:
+        """记一段本次运行的诊断信息，结束时作为独立小节写进 report.md。
+
+        给"某个模块为什么没动作"这类问题留证据：时间线只能看出"没接管"，
+        看不出原因。调用方通常传接线层的自检结果（例如数字标识的 SDK marker
+        订阅状态、回调频率、坐标模式）。
+
+        和本类其它方法一样：**绝不抛异常**，也绝不影响开车。
+        """
+        if self._closed or self.run_directory is None:
+            return
+        try:
+            self.diagnostics.append((str(title), dict(values)))
+        except Exception:
+            pass
+
     def _write_report(self) -> None:
         """把本次运行写成一份可以直接贴进报告的 report.md。绝不抛异常。"""
         if self.run_directory is None:
@@ -504,6 +523,14 @@ class EvidenceRecorder:
                         lines.append("- `%s` %s" % (clock(event["elapsed_s"]), error))
         else:
             lines.append("本次运行没有任何模块接管运动（全程基础巡线）。")
+        for title, values in self.diagnostics:
+            lines += ["", "## %s" % title, ""]
+            if values:
+                lines += ["| 项目 | 值 |", "|---|---|"]
+                for key, value in values.items():
+                    lines.append("| %s | %s |" % (key, value))
+            else:
+                lines.append("（没有可用的诊断数据。）")
         lines += [
             "",
             "---",
