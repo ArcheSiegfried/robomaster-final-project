@@ -35,8 +35,11 @@ from green_junction import (  # noqa: E402
     detections_for_log,
     evaluate_branches,
     line_is_centered,
+    near_field_line,
+    near_line_is_centered,
 )
 from examples.green_junction_demo import run_demo  # noqa: E402
+from tests.task_harness import TaskHarness  # noqa: E402
 from models import (  # noqa: E402
     FramePacket,
     LineDetection,
@@ -82,6 +85,26 @@ def junction_frame(split_y=SPLIT_ROW, spread=0.30):
             image,
             (WIDTH // 2, split_y),
             (WIDTH // 2 + sign * dx, HEIGHT - 2),
+            TAPE_BGR,
+            TAPE_HALF * 2,
+        )
+    return image
+
+
+def approach_frame(fork_y=290, far_y=120, reach=110):
+    """实车那次报告里的朝向：分叉点在画面**下方**，两条分支向上张开，下面一条腿。
+
+    和 :func:`junction_frame` 的唯一区别就是"张开的方向反过来"：老代码的
+    ``_opens_upward`` 只认 junction_frame 那种朝向，实车恰好是这一种，
+    于是把真岔路判成了 ``branches too short``（见 2026-09-15 实车测试报告）。
+    """
+    image = blank_frame()
+    cv2.line(image, (WIDTH // 2, fork_y), (WIDTH // 2, HEIGHT - 2), TAPE_BGR, TAPE_HALF * 2)
+    for sign in (-1, 1):
+        cv2.line(
+            image,
+            (WIDTH // 2, fork_y),
+            (WIDTH // 2 + sign * reach, far_y),
             TAPE_BGR,
             TAPE_HALF * 2,
         )
@@ -238,7 +261,113 @@ class DetectorTests(unittest.TestCase):
         self.assertTrue(summary["valid"])
         self.assertEqual(len(summary["branches"]), 2)
         self.assertNotIn("mask", summary)
+        # 实车排障要用的新字段：分叉带的下沿、行数、间距趋势、有没有"腿"。
+        self.assertIsNotNone(summary["fork_bottom_row"])
+        self.assertGreater(summary["band_rows"], 0)
+        self.assertIn("trend_ratio", summary)
+        self.assertIn("has_stem", summary)
+        self.assertIn("band_bottom_ratio", summary)
         self.assertFalse(detections_for_log(None)["valid"])
+
+    # -- 2026-09-15 实车测试报告里的三个问题 -----------------------------
+
+    def test_fork_opening_toward_the_camera_is_detected(self):
+        """分叉点在画面下方、两条分支向上张开（实车那次）也必须检出。
+
+        老代码只认反方向（``_opens_upward``），实车正是在这里被判成
+        ``branches too short``。
+        """
+        settings = JunctionConfig()
+        detection = JunctionDetector(settings).detect(approach_frame())
+        self.assertTrue(detection.valid, detection.message)
+        self.assertEqual(len(detection.branches), 2)
+        left = detection.branch(Branch.LEFT)
+        right = detection.branch(Branch.RIGHT)
+        self.assertLess(left.bearing_deg, 0.0)
+        self.assertGreater(right.bearing_deg, 0.0)
+        # 张开也好、收拢也好，趋势判据都认；两条平行色块才会被它挡掉。
+        self.assertIsNotNone(detection.trend_ratio)
+        self.assertGreaterEqual(detection.trend_ratio, settings.min_branch_opening_ratio)
+        # 这种朝向里分叉带在画面中上部：不该被当成"车已经开过岔路口"（A12）。
+        self.assertLess(detection.band_bottom_ratio, settings.drove_past_fork_row_ratio)
+
+    def test_a_row_split_into_three_runs_still_counts_as_two_branches(self):
+        """一条带子被噪点切成三段时，取最左最右两段（老代码要求"恰好两段"）。"""
+        detector = JunctionDetector(JunctionConfig())
+        row = np.zeros(200, np.uint8)
+        row[10:20] = 255
+        row[40:50] = 255      # 中间这段是噪点，不该把这条带子判成"没分叉"
+        row[120:140] = 255
+        pair = detector._two_runs(row, 200)
+        self.assertIsNotNone(pair)
+        self.assertEqual(pair[0], (10, 19))
+        self.assertEqual(pair[1], (120, 139))
+
+    def test_parallel_bands_without_a_stem_are_rejected(self):
+        """两条平行色块：间距不变、两头都不接带子 → 不是岔路。"""
+        image = blank_frame()
+        cv2.rectangle(image, (60, 200), (200, 340), TAPE_BGR, -1)
+        cv2.rectangle(image, (440, 200), (580, 340), TAPE_BGR, -1)
+        detection = JunctionDetector(JunctionConfig()).detect(image)
+        self.assertFalse(detection.valid)
+        self.assertIn("parallel", detection.message)
+
+    def test_trend_ratio_never_divides_by_zero(self):
+        """P1：老的 ``_opens_upward`` 在有效行数 0/1/2 时 ``span=0`` 会除零。
+
+        实车日志里出现过 34 条 ``float division by zero``。
+        """
+        detector = JunctionDetector(JunctionConfig())
+        for count in (0, 1, 2, 3, 5):
+            band = [(200 + index, ((0, 10), (100 + index, 110 + index))) for index in range(count)]
+            self.assertIsNone(
+                detector._band_trend_ratio(band),
+                "行数不够时应该返回 None，而不是猜一个数",
+            )
+        # 行数够了就给出比值；9 行里间距从 20 涨到 40 → 2.0 左右。
+        band = [(200 + index, ((0, 10), (20 + index * 5, 30 + index * 5))) for index in range(9)]
+        ratio = detector._band_trend_ratio(band)
+        self.assertIsNotNone(ratio)
+        self.assertGreater(ratio, 1.0)
+
+    def test_short_band_needs_a_stem(self):
+        """行数太少时趋势不可信，这时必须靠"腿"：孤零零两条短色块不算岔路。"""
+        image = blank_frame()
+        cv2.rectangle(image, (250, 250), (290, 252), TAPE_BGR, -1)
+        cv2.rectangle(image, (350, 250), (390, 252), TAPE_BGR, -1)
+        detection = JunctionDetector(JunctionConfig()).detect(image)
+        self.assertFalse(detection.valid)
+
+
+class NearLineTests(unittest.TestCase):
+    """A11：coordinator 只传 (frame, now)，"线回中央了没有"只能自己从画面算。"""
+
+    def test_straight_line_is_centred(self):
+        error, reason = near_field_line(line_frame())
+        self.assertIsNotNone(error, reason)
+        self.assertLess(abs(error), 0.05)
+        self.assertTrue(near_line_is_centered(line_frame())[0])
+
+    def test_off_centre_line_is_not_centred(self):
+        centered, _ = near_line_is_centered(line_frame(x=120))
+        self.assertFalse(centered)
+
+    def test_blank_frame_has_no_line(self):
+        error, reason = near_field_line(blank_frame())
+        self.assertIsNone(error)
+        self.assertIn("no tape", reason)
+        self.assertFalse(near_line_is_centered(blank_frame())[0])
+
+    def test_two_branches_in_the_near_band_are_not_centred(self):
+        """岔路的两条分支伸到车头前 → 不是"一条居中的线"。"""
+        error, reason = near_field_line(junction_frame())
+        self.assertIsNone(error)
+        self.assertIn("split", reason)
+        self.assertFalse(near_line_is_centered(junction_frame())[0])
+
+    def test_bad_image_is_not_centred(self):
+        self.assertIsNone(near_field_line(None)[0])
+        self.assertIsNone(near_field_line(np.zeros((10, 10), np.uint8))[0])
 
 
 class LineCentredTests(unittest.TestCase):
@@ -367,7 +496,10 @@ class StateMachineTests(unittest.TestCase):
     def test_waiting_for_a_rule_keeps_the_car_stopped(self):
         """还没拿到判据时只能保持停车，不能自己往前冲。"""
         settings = JunctionConfig(decision_timeout=5.0)
-        task = GreenJunctionTask(settings=settings)
+        task = GreenJunctionTask(
+            settings=settings,
+            light_probe=lambda frame, now: LightReading(color=LightColor.UNKNOWN),
+        )
         now = self._advance_until(task, JunctionState.DECIDE)
         update = task.step(packet(junction_frame(), 20, now), now, fake_line(error=0.9))
         self.assertEqual(update.status, TaskStatus.RUNNING)
@@ -401,8 +533,25 @@ class StateMachineTests(unittest.TestCase):
         self.assertEqual(task.state, JunctionState.FAILED)
         self.assertIn("red", update.message)
 
-    def test_no_light_source_at_all_fails_instead_of_guessing(self):
+    def test_no_rule_source_at_all_never_takes_over(self):
+        """一个判据来源都没有 → 不接管，把岔路让给后面的模块（free_junction）。
+
+        这样"检测修好了"不会变成"每个岔路口都被本模块抢走然后 FAILED"。
+        """
         settings = JunctionConfig(decision_timeout=0.4)
+        task = GreenJunctionTask(settings=settings)
+        now = 300.0
+        for index in range(20):
+            now += FRAME_DT
+            update = task.step(packet(junction_frame(), index + 1, now), now, fake_line(error=0.9))
+            self.assertEqual(update.status, TaskStatus.NOT_TRIGGERED)
+            self.assertEqual(update.motion, STOP)
+        self.assertEqual(task.state, JunctionState.IDLE)
+        self.assertIn("no light rule source", update.message)
+
+    def test_the_fail_safe_path_is_still_available_on_request(self):
+        """想要老行为（接管 → 停住 → 超时 FAILED）时，一个参数切回去。"""
+        settings = JunctionConfig(decision_timeout=0.4, require_rule_source=False)
         task = GreenJunctionTask(settings=settings)
         now = self._advance_until(task, JunctionState.DECIDE)
         now += settings.decision_timeout + 0.5
@@ -451,7 +600,10 @@ class StateMachineTests(unittest.TestCase):
 
     def test_losing_the_junction_before_a_rule_fails_and_stops(self):
         settings = JunctionConfig(decision_timeout=0.5)
-        task = GreenJunctionTask(settings=settings)
+        task = GreenJunctionTask(
+            settings=settings,
+            light_probe=lambda frame, now: LightReading(color=LightColor.UNKNOWN),
+        )
         now = self._advance_until(task, JunctionState.DECIDE)
         now += 1.0
         update = task.step(packet(blank_frame(), 5, now), now, fake_line())
@@ -461,7 +613,10 @@ class StateMachineTests(unittest.TestCase):
     def test_driving_past_the_junction_without_a_rule_fails(self):
         """线已经回到中央、岔路形态还在，连续几帧都这样 → 车其实开过了 → 失败停车。"""
         settings = JunctionConfig(decision_timeout=5.0)
-        task = GreenJunctionTask(settings=settings)
+        task = GreenJunctionTask(
+            settings=settings,
+            light_probe=lambda frame, now: LightReading(color=LightColor.UNKNOWN),
+        )
         now = self._advance_until(task, JunctionState.DECIDE)
         for index in range(settings.drove_past_frames):
             now += FRAME_DT
@@ -470,10 +625,52 @@ class StateMachineTests(unittest.TestCase):
         self.assertEqual(update.motion, STOP)
         self.assertIn("past the junction", update.message)
 
+    def test_normal_approach_is_not_mistaken_for_driving_past(self):
+        """A12：正常进近时车头前的带子也是单条居中，不能因此判"开过了"。
+
+        这里连 ``line`` 都不传——就是协调器的真实调用方式。
+        """
+        settings = JunctionConfig(decision_timeout=5.0, confirm_frames=2)
+        task = GreenJunctionTask(
+            settings=settings,
+            light_probe=lambda frame, now: LightReading(color=LightColor.UNKNOWN),
+        )
+        now = 50.0
+        statuses = []
+        for index in range(12):
+            now += FRAME_DT
+            update = task.step(packet(approach_frame(), index + 1, now), now)
+            statuses.append(update.status)
+        self.assertIn(TaskStatus.RUNNING, statuses)
+        self.assertNotIn(TaskStatus.FAILED, statuses)
+        self.assertNotIn("drove past", task.last_message)
+
+    def test_completes_without_the_line_argument(self):
+        """P0 接口修复：协调器只调 ``step(frame, now)`` 也必须能走完整条流程。
+
+        老代码的 TURN→SETTLE→COMPLETED 两道门全靠 ``line``，实车上恒为 False，
+        只能超时失败。
+        """
+        task = GreenJunctionTask(light_probe=lambda frame, now: green(Branch.RIGHT))
+        statuses = []
+        now = 200.0
+        for index in range(30):
+            now += FRAME_DT
+            update = task.step(packet(approach_frame(), index + 1, now), now)  # 只有两个参数
+            statuses.append(update.status)
+        self.assertIn(TaskStatus.RUNNING, statuses)
+        self.assertEqual(task.state, JunctionState.COMPLETED)
+        self.assertEqual(update.status, TaskStatus.COMPLETED)
+        self.assertEqual(update.motion, STOP)
+        self.assertEqual(update.detection.target_id, "right")
+
     def test_single_contradictory_frame_is_not_enough_to_fail(self):
         """单帧巧合不算：判定"开过了"要连续几帧都矛盾。"""
         settings = JunctionConfig(decision_timeout=5.0)
-        task = GreenJunctionTask(settings=settings)
+        task = GreenJunctionTask(
+            settings=settings,
+            light_probe=lambda frame, now: LightReading(color=LightColor.UNKNOWN),
+        )
         now = self._advance_until(task, JunctionState.DECIDE)
         now += FRAME_DT
         update = task.step(packet(junction_frame(), 40, now), now, fake_line(error=0.02))
@@ -598,6 +795,35 @@ class StateMachineTests(unittest.TestCase):
         raise AssertionError("module never reached %s" % state.value)
 
 
+class CoordinatorHarnessTests(unittest.TestCase):
+    """把模块塞进**真正的** TaskCoordinator 跑一遍（协调器只调 ``step(frame, now)``）。
+
+    这是 2026-09-15 报告里"44 条用例全都在传 line，没覆盖实车调用路径"的直接回应：
+    这一条从头到尾都不传 ``line``，走的就是实车那条路。
+    """
+
+    def test_takeover_turn_and_release_through_the_coordinator(self):
+        task = GreenJunctionTask(light_probe=lambda frame, now: green(Branch.RIGHT))
+        harness = TaskHarness(task=task)
+        harness.start_line(now=1.0)
+        now = 1.05
+        for _ in range(60):
+            now += 0.05
+            decision = harness.feed_image(now, approach_frame())
+            if task.finished and decision.owner == "line":
+                break
+        self.assertTrue(
+            any(row.task_name == "green_junction" for row in harness.traces),
+            "模块在真正的协调器里没有接管",
+        )
+        self.assertEqual(task.state, JunctionState.COMPLETED)
+        self.assertEqual(harness.owner, "line", "完成后必须把控制权交回巡线")
+        # 转向请求必须落在骨架的护栏里（0.30 m/s、90 deg/s）。
+        moved = harness.chassis.motion_calls
+        self.assertTrue(moved)
+        self.assertLessEqual(max(abs(item["z"]) for item in moved), 90.0)
+
+
 class ConstantContractTests(unittest.TestCase):
     def test_stop_is_zero_motion(self):
         self.assertEqual(STOP, MotionCommand(0.0, 0.0, 0.0))
@@ -616,7 +842,7 @@ class OfflineDemoTests(unittest.TestCase):
                 "owner:external",
                 "task:running",
                 "branch:right",
-                "motion:yaw=16.9",
+                "motion:yaw=16.3",
                 "task:completed",
                 "owner:line",
                 "line:TRACKING",
