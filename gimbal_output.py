@@ -22,10 +22,15 @@ class GimbalOutput:
         self._gimbal = gimbal
         self._settings = settings
         self._last_command: Optional[GimbalCommand] = None
+        self._last_action = None
 
     @property
     def last_command(self) -> Optional[GimbalCommand]:
         return self._last_command
+
+    @property
+    def last_action_state(self) -> Optional[str]:
+        return getattr(self._last_action, "state", None)
 
     @property
     def line_view(self) -> GimbalCommand:
@@ -56,6 +61,14 @@ class GimbalOutput:
         """
         applied = self._clamp(command)
         if applied == self._last_command:
+            if self.last_action_state in (
+                "action_failed",
+                "action_rejected",
+                "action_exception",
+            ):
+                raise RuntimeError(
+                    "previous gimbal action ended as %s" % self.last_action_state
+                )
             return applied
         action = self._gimbal.moveto(
             pitch=applied.pitch,
@@ -65,6 +78,7 @@ class GimbalOutput:
         )
         if action is None:
             raise RuntimeError("gimbal moveto did not return an action")
+        self._last_action = action
         self._last_command = applied
         return applied
 

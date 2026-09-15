@@ -24,12 +24,16 @@ class MotionOutput:
     def send(self, owner: str, command: MotionCommand) -> None:
         if owner != self._owner:
             raise RuntimeError(f"motion outlet belongs to {self._owner}")
-        self._chassis.drive_speed(
+        accepted = self._chassis.drive_speed(
             x=command.forward,
             y=command.lateral,
             z=command.yaw,
             timeout=self._settings.command_timeout,
         )
+        # RoboMaster returns False when the synchronous command was rejected.
+        # Older test doubles return None, so only an explicit False is failure.
+        if accepted is False:
+            raise RuntimeError("chassis rejected drive_speed command")
 
     def hard_stop(self) -> bool:
         """Immediate stop bypasses controller rate limiting."""

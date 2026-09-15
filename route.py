@@ -45,22 +45,26 @@ END_MISSING_SECONDS = 0.14
 # failing at the physical endpoint before it could raise the view.  Keep this
 # phase bounded, but allow roughly 0.40 m of bottom-line following.
 END_APPROACH_MAX_SECONDS = 5.0
-END_APPROACH_SPEED = 0.08
+END_APPROACH_SPEED = 0.10
 END_APPROACH_YAW_GAIN = 32.0
 END_APPROACH_MAX_YAW = 16.0
 
 VIEW_SETTLE_MARGIN_SECONDS = 0.12
 TOTAL_RECOVERY_SECONDS = 19.0
 BRIDGE_MAX_SECONDS = 3.0
-BRIDGE_FORWARD_SPEED = 0.12
-BRIDGE_SLOW_SPEED = 0.08
+# Real-car feedback showed that the previous 0.12 m/s request could fail to
+# overcome the stopped chassis' static friction.  Keep this well inside the
+# external-task envelope, but give the bounded crossing a usable start speed.
+BRIDGE_MIN_SECONDS = 0.80
+BRIDGE_FORWARD_SPEED = 0.18
+BRIDGE_SLOW_SPEED = 0.14
 BRIDGE_YAW_GAIN = 34.0
 BRIDGE_HEADING_GAIN = 0.24
 BRIDGE_MAX_YAW = 26.0
 FRAGMENT_LOSS_SECONDS = 0.20
 
-SEARCH_YAW_SPEED = 30.0
-SEARCH_CONFIRM_YAW_SPEED = 14.0
+SEARCH_YAW_SPEED = 45.0
+SEARCH_CONFIRM_YAW_SPEED = 30.0
 SEARCH_SOFT_LIMIT_DEG = 95.0
 SEARCH_HARD_LIMIT_DEG = 100.0
 SEARCH_TARGETS_DEG = (30.0, 60.0, 95.0, -30.0, -60.0, -95.0)
@@ -689,7 +693,11 @@ class RouteTask:
 
         if self.state == BRIDGING:
             ready, reason = self._candidate_ready(frame)
-            if ready:
+            bridge_elapsed = now - float(self._phase_started_at)
+            # The raised camera can still see the route just left behind.
+            # Never stop the first crossing merely because that old fragment
+            # survives the generic candidate filter for three frames.
+            if ready and bridge_elapsed >= BRIDGE_MIN_SECONDS:
                 if self._candidate.near:
                     self._start_align(now)
                 else:
@@ -697,13 +705,15 @@ class RouteTask:
                 return self._running(
                     now, STOP_COMMAND, reason, self._candidate.detection
                 )
-            if now - float(self._phase_started_at) >= BRIDGE_MAX_SECONDS:
+            if bridge_elapsed >= BRIDGE_MAX_SECONDS:
                 self._begin_search(now)
                 return self._running(
                     now, STOP_COMMAND, "blank bridge budget ended; starting fan search"
                 )
             message = "crossing bounded blank along old-route tangent"
             if self._candidate is not None:
+                if bridge_elapsed < BRIDGE_MIN_SECONDS:
+                    reason = "ignoring candidate during initial old-line clearance"
                 message = f"{message}; {reason}"
             return self._running(
                 now,

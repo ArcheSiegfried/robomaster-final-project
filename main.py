@@ -273,6 +273,21 @@ class ConsoleStatus:
             state += "（已丢线 %.1fs）" % max(0.0, now - self._lost_since)
         bits.append("巡线 %s" % state)
         bits.append("任务 %s" % (getattr(decision, "task_name", None) or self._task_name or "无"))
+        if getattr(decision, "state", None) == TASK_ACTIVE:
+            command = decision.command
+            bits.append(
+                "实际命令 x=%.2f y=%.2f yaw=%.0f"
+                % (command.forward, command.lateral, command.yaw)
+            )
+            update = getattr(decision, "task_update", None)
+            if update is not None and update.gimbal is not None:
+                bits.append(
+                    "云台 pitch=%.0f yaw=%.0f"
+                    % (update.gimbal.pitch, update.gimbal.yaw)
+                )
+            message = str(getattr(decision, "message", "") or "")
+            if message:
+                bits.append(message)
         return "-- " + " | ".join(bits)
 
 

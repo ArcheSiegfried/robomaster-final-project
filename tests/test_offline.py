@@ -49,6 +49,12 @@ class FakeChassis:
         self.calls.append(("wheels", kwargs))
 
 
+class RejectingChassis(FakeChassis):
+    def drive_speed(self, **kwargs):
+        super().drive_speed(**kwargs)
+        return False
+
+
 class FakeCamera:
     def __init__(self):
         self.frames = queue.Queue()
@@ -199,6 +205,11 @@ class OfflineTests(unittest.TestCase):
             chassis.calls[-1][1],
             {"w1": 0, "w2": 0, "w3": 0, "w4": 0},
         )
+
+    def test_explicit_chassis_rejection_is_not_silently_ignored(self):
+        output = MotionOutput(RejectingChassis(), CONFIG)
+        with self.assertRaisesRegex(RuntimeError, "rejected"):
+            output.send("line", MotionCommand(0.1, 0, 0))
 
     def test_importing_main_does_not_import_robomaster(self):
         sys.modules.pop("main", None)

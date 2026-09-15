@@ -19,7 +19,7 @@ from coordinator import (  # noqa: E402
     TASK_ACTIVE,
     CoordinatorDecision,
 )
-from models import TaskStatus, TaskUpdate  # noqa: E402
+from models import GimbalCommand, MotionCommand, TaskStatus, TaskUpdate  # noqa: E402
 
 from main import ConsoleStatus  # noqa: E402
 
@@ -134,6 +134,30 @@ class ConsoleStatusTests(unittest.TestCase):
         self.console.update(decision("LINE_LOST"), 1.0)
         self.console.update(decision("LINE_LOST"), 3.5)
         self.assertIn("已丢线", self.text)
+
+    def test_task_heartbeat_shows_real_command_view_and_phase(self):
+        command = MotionCommand(forward=0.18, yaw=45.0)
+        update = TaskUpdate(
+            TaskStatus.RUNNING,
+            motion=command,
+            gimbal=GimbalCommand(pitch=-5.0, yaw=0.0),
+            message="crossing bounded blank",
+        )
+        active = CoordinatorDecision(
+            state=TASK_ACTIVE,
+            owner="external",
+            line=_Line("STOPPED"),
+            task_name="route",
+            task_update=update,
+            command=command,
+            message=update.message,
+        )
+        self.console.update(active, 1.0)
+        self.console.update(active, 3.5)
+        self.assertIn("实际命令 x=0.18", self.text)
+        self.assertIn("yaw=45", self.text)
+        self.assertIn("云台 pitch=-5", self.text)
+        self.assertIn("crossing bounded blank", self.text)
 
     def test_a_broken_terminal_never_raises(self):
         console = ConsoleStatus(stream=_Boom(), heartbeat_interval=2.0)

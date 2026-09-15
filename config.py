@@ -79,7 +79,11 @@ class RuntimeConfig:
     camera_strategy: str = "newest"
     camera_read_timeout: float = 0.06
     consumer_wait_timeout: float = 0.012
-    video_gap_stop_seconds: float = 0.22
+    # Real AP-mode logs contained isolated 0.41 s and 0.50 s delivery gaps
+    # followed by healthy frames.  The chassis command itself still expires
+    # after 0.15 s, so allowing 0.60 s before latching VIDEO_LOST does not let
+    # an old motion command run through the gap.
+    video_gap_stop_seconds: float = 0.60
     command_timeout: float = 0.15
     resume_detection_max_age: float = 0.15
     gimbal_pitch: int = -25

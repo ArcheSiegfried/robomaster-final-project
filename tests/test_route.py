@@ -16,6 +16,7 @@ from models import TaskStatus  # noqa: E402
 from route import (  # noqa: E402
     ALIGNING,
     BRIDGE_FORWARD_SPEED,
+    BRIDGE_MIN_SECONDS,
     BRIDGE_SLOW_SPEED,
     END_APPROACH,
     END_APPROACH_SPEED,
@@ -213,17 +214,17 @@ class RouteRecoveryTests(unittest.TestCase):
     def test_far_fragment_needs_confirmation_then_approaches_slowly(self):
         _, harness, _ = start_and_trigger()
         settle_into_bridge(harness)
-        first = harness.feed_image(2.21, far_fragment_frame())
-        second = harness.feed_image(2.26, far_fragment_frame())
-        confirmed = harness.feed_image(2.31, far_fragment_frame())
-        approach = harness.feed_image(2.36, far_fragment_frame())
+        first = harness.feed_image(3.01, far_fragment_frame())
+        second = harness.feed_image(3.06, far_fragment_frame())
+        confirmed = harness.feed_image(3.11, far_fragment_frame())
+        approach = harness.feed_image(3.16, far_fragment_frame())
         self.assertEqual(first.command.forward, BRIDGE_FORWARD_SPEED)
         self.assertEqual(second.command.forward, BRIDGE_FORWARD_SPEED)
         self.assertEqual(confirmed.command.forward, 0.0)
         self.assertEqual(approach.command.forward, BRIDGE_SLOW_SPEED)
         self.assertGreater(approach.command.yaw, 0.0)
 
-    def test_near_line_is_rejected_until_old_route_is_cleared(self):
+    def test_candidate_cannot_interrupt_initial_old_route_clearance(self):
         task, harness, _ = start_and_trigger()
         settle_into_bridge(harness)
         decisions = [
@@ -232,15 +233,19 @@ class RouteRecoveryTests(unittest.TestCase):
         ]
         self.assertNotEqual(task.state, ALIGNING)
         self.assertTrue(
-            any("before clearing old route" in item.message for item in decisions)
+            any("initial old-line clearance" in item.message for item in decisions)
         )
+        self.assertTrue(
+            all(item.command.forward == BRIDGE_FORWARD_SPEED for item in decisions)
+        )
+        self.assertGreater(BRIDGE_MIN_SECONDS, 0.0)
 
     def test_oblique_route_uses_center_and_heading_to_turn_towards_it(self):
         _, harness, _ = start_and_trigger()
         settle_into_bridge(harness)
-        for now in (2.21, 2.26, 2.31):
+        for now in (3.01, 3.06, 3.11):
             harness.feed_image(now, angled_far_frame())
-        approach = harness.feed_image(2.36, angled_far_frame())
+        approach = harness.feed_image(3.16, angled_far_frame())
         self.assertEqual(approach.command.forward, BRIDGE_SLOW_SPEED)
         self.assertGreater(approach.command.yaw, 0.0)
         self.assertLessEqual(abs(approach.command.yaw), 26.0)
@@ -258,20 +263,20 @@ class RouteRecoveryTests(unittest.TestCase):
     def test_new_route_requires_approach_alignment_and_fresh_handoff_frames(self):
         _, harness, _ = start_and_trigger()
         settle_into_bridge(harness)
-        for now in (2.21, 2.26, 2.31):
+        for now in (3.01, 3.06, 3.11):
             harness.feed_image(now, far_fragment_frame(x=320))
-        harness.feed_image(2.36, near_route_frame())
-        for now in (2.41, 2.46, 2.51, 2.56, 2.61):
+        harness.feed_image(3.16, near_route_frame())
+        for now in (3.21, 3.26, 3.31, 3.36, 3.41):
             decision = harness.feed_image(now, near_route_frame())
             self.assertEqual(decision.state, TASK_ACTIVE)
-        done = harness.feed_image(2.66, near_route_frame())
+        done = harness.feed_image(3.46, near_route_frame())
         self.assertEqual(done.state, RELEASING)
         self.assertEqual(done.task_update.status, TaskStatus.COMPLETED)
         self.assertEqual(harness.gimbal.last_move()["pitch"], -25.0)
 
-        waiting = harness.feed_line(2.90, x=320)
+        waiting = harness.feed_line(3.70, x=320)
         self.assertEqual(waiting.state, RELEASING)
-        resumed = harness.feed_line(3.12, x=320)
+        resumed = harness.feed_line(3.92, x=320)
         self.assertEqual(resumed.state, LINE_FOLLOWING)
         self.assertTrue(harness.follower.motion_enabled)
 
