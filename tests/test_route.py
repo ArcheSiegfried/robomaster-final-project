@@ -17,6 +17,7 @@ from route import (  # noqa: E402
     ALIGNING,
     BRIDGE_FORWARD_SPEED,
     BRIDGE_SLOW_SPEED,
+    END_APPROACH,
     END_APPROACH_SPEED,
     MONITORING,
     SEARCH_HARD_LIMIT_DEG,
@@ -148,6 +149,34 @@ class RouteRecoveryTests(unittest.TestCase):
         self.assertEqual(first_blank.command.forward, 0.0)
         self.assertEqual(confirmed.command.forward, 0.0)
         self.assertEqual(harness.gimbal.last_move()["pitch"], -5.0)
+
+    def test_endpoint_after_old_two_point_five_second_budget_still_recovers(self):
+        """Real feedback: far sampling can vanish >0.20 m before line end."""
+        task = RouteTask()
+        harness = TaskHarness(task=task)
+        harness.start_line(now=1.0, x=400)
+        harness.feed_image(1.05, near_old_line_frame())
+        harness.feed_image(1.15, near_old_line_frame())
+
+        # This is already beyond the previous 2.5 s phase limit.  The task
+        # must still follow the visible bottom line instead of failing.
+        after_old_limit = harness.feed_image(3.80, near_old_line_frame())
+        self.assertEqual(after_old_limit.state, TASK_ACTIVE)
+        self.assertEqual(task.state, END_APPROACH)
+        self.assertEqual(after_old_limit.command.forward, END_APPROACH_SPEED)
+
+        harness.feed_blank(3.85)
+        raising = harness.feed_blank(4.01)
+        self.assertEqual(raising.state, TASK_ACTIVE)
+        self.assertEqual(raising.command.forward, 0.0)
+        self.assertEqual(harness.gimbal.last_move()["pitch"], -5.0)
+
+        bridge = harness.feed_blank(4.81)
+        self.assertEqual(bridge.command.forward, BRIDGE_FORWARD_SPEED)
+        harness.feed_blank(7.82)
+        search = harness.feed_blank(7.87)
+        self.assertEqual(search.command.forward, 0.0)
+        self.assertEqual(search.command.yaw, SEARCH_YAW_SPEED)
 
     def test_blank_after_raise_crosses_a_bounded_distance(self):
         task, harness, _ = start_and_trigger()

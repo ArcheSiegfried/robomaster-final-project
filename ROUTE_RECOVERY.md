@@ -40,7 +40,7 @@ ALIGNING（中心误差 ≤ 0.13、线方向 ≤ 18°，连续 3 帧）
   → REACQUIRING（停车再确认 3 张新帧）
   → COMPLETED
 
-活动状态总计达到 19 s、走到旧线尾超时或扇扫耗尽 → FAILED 并停车
+活动状态总计达到 19 s、走到旧线尾超过 5 s 或扇扫耗尽 → FAILED 并停车
 ```
 
 每次 `step(frame, now)` 只处理一帧并返回一个 `TaskUpdate`，不存在 `sleep` 或阻塞扫描。任务只产生 `MotionCommand`/`GimbalCommand`，底盘和云台仍分别经过 `MotionOutput` 与 `GimbalOutput`。

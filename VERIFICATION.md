@@ -61,6 +61,8 @@ python scripts\check_module.py route
 powershell -ExecutionPolicy Bypass -File scripts\check_offline.ps1 -Python .\.venv\Scripts\python.exe
 ```
 
-结果：路线与协调器相关回归 `51/51` 通过；`route.py`/`route_detector.py` 静态契约检查和路线专测 `18/18` 通过；同步最新 `integration` 后，统一脚本语法检查 `40` 个 Python 文件、完整单元测试 `299/299`、离线接管示例和全部登记模块检查均通过，末尾输出 `OFFLINE_CHECK_OK`。
+结果：路线与协调器相关回归 `52/52` 通过；`route.py`/`route_detector.py` 静态契约检查和路线专测 `19/19` 通过；同步最新 `integration` 后，统一脚本语法检查 `40` 个 Python 文件、完整单元测试 `300/300`、离线接管示例和全部登记模块检查均通过，末尾输出 `OFFLINE_CHECK_OK`。
+
+首次实车运行还暴露了线尾阶段的时间预算错误：原 `END_APPROACH_MAX_SECONDS=2.5` 配合 `0.08 m/s` 只能覆盖约 `0.20 m`，会在到达物理线尾附近时直接失败，因而不可能进入抬头、空白跨越和扇扫。现保留硬上限但调整为 `5.0 s`（约 `0.40 m`），并增加超过旧 2.5 秒后完整进入跨越与扇扫的回归用例。该距离仍须结合实际相机视野标定。
 
 本轮没有运行 `main.py`，没有连接机器人、相机或视频流，也没有向实车发送任何运动/云台命令。合成图只能证明状态机、限幅、几何筛选和故障路径符合当前约定，不能证明真实断口恢复成功率。抬头 ROI、HSV/形态学、0.12 m/s 空白跨越、30°/s 搜索、±95° 搜索范围、底盘 yaw 符号、旧线排除效果和云台异步完成时间仍须实车验证。
