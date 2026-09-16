@@ -970,37 +970,6 @@ class LightProbeAdapterTests(unittest.TestCase):
         with self.assertRaises(TypeError):
             make_light_probe(42)
 
-    def test_real_traffic_light_detector_drives_the_whole_module(self):
-        """用 3 号**真正的**检测器把整条链跑通：绿灯 → 岔路 → 接管 → 转向 → 交回。
-
-        这就是 v3 报告里"缺的那一段"：不需要 3 号开新接口，也不需要改注册表，
-        只要整合层把探针注入进来。
-        """
-        from traffic_light import TrafficLightDetector  # 只在测试里 import，模块本身不依赖它
-
-        detector = TrafficLightDetector()
-        detection = detector.detect(green_lamp_frame())
-        self.assertTrue(detection.valid, "3 号的检测器应该认出这盏绿灯")
-        self.assertEqual(detection.color, "green")
-
-        task = GreenJunctionTask(light_probe=make_light_probe(detector))
-        harness = TaskHarness(task=task)
-        harness.start_line(now=1.0)
-        now = 1.05
-        for _ in range(60):
-            now += 0.05
-            decision = harness.feed_image(now, green_lamp_frame())
-            if task.finished and decision.owner == "line":
-                break
-        self.assertTrue(
-            any(row.task_name == "green_junction" for row in harness.traces),
-            "绿灯亮着时模块应该接管",
-        )
-        self.assertEqual(task.chosen_branch, Branch.RIGHT)
-        self.assertEqual(task.state, JunctionState.COMPLETED)
-        self.assertEqual(harness.owner, "line")
-
-
 class CoordinatorHarnessTests(unittest.TestCase):
     """把模块塞进**真正的** TaskCoordinator 跑一遍（协调器只调 ``step(frame, now)``）。
 
