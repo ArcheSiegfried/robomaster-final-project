@@ -30,6 +30,7 @@ from route_detector import (
     RoutePathObservation,
     RouteVision,
 )
+from route_distance import load_optional_calibration
 
 
 KIND = "route"
@@ -59,17 +60,21 @@ END_APPROACH_YAW_GAIN = 32.0
 END_APPROACH_MAX_YAW = 16.0
 
 VIEW_SETTLE_MARGIN_SECONDS = 0.12
-TOTAL_RECOVERY_SECONDS = 19.0
+TOTAL_RECOVERY_SECONDS = 19.7
 BRIDGE_MAX_SECONDS = 3.0
+BRIDGE_METRIC_MAX_SECONDS = 5.0
 # Real-car feedback showed that the previous 0.12 m/s request could fail to
 # overcome the stopped chassis' static friction.  Keep this well inside the
 # external-task envelope, but give the bounded crossing a usable start speed.
 BRIDGE_MIN_SECONDS = 0.80
 BRIDGE_FORWARD_SPEED = 0.15
-# Once the new endpoint is reliably locked, keep crossing a short measured
-# distance before turning.  Real-car logs showed that turning at the first
-# valid near-band observation left the chassis roughly 5 cm short of the
-# useful rotation point.
+BRIDGE_MIDDLE_SPEED = 0.12
+BRIDGE_NEAR_SPEED = 0.08
+BRIDGE_MIDDLE_DISTANCE = 0.15
+BRIDGE_NEAR_DISTANCE = 0.05
+BRIDGE_TARGET_TOLERANCE = 0.015
+BRIDGE_BLIND_MAX_DISTANCE = 0.12
+# Safe fallback when the local metric calibration is absent or invalid.
 BRIDGE_POST_LOCK_DISTANCE = 0.05
 FRAGMENT_LOSS_SECONDS = 0.35
 
@@ -149,6 +154,10 @@ class RouteTask:
         self._search_pitch = float(
             getattr(self.settings, "gimbal_search_pitch", CONFIG.gimbal_search_pitch)
         )
+        (
+            self._distance_calibration,
+            self._distance_calibration_status,
+        ) = load_optional_calibration(self._search_pitch)
         self._search_yaw = float(
             getattr(self.settings, "gimbal_yaw", CONFIG.gimbal_yaw)
         )
@@ -206,6 +215,8 @@ class RouteTask:
         self._side_hint_frames = 0
         self._side_hint_last_sequence: Optional[int] = None
         self._bridge_lock_forward: Optional[float] = None
+        self._bridge_target_forward: Optional[float] = None
+        self._bridge_metric_active = False
         self._reacquire_view_already_low = False
 
     @property
@@ -264,6 +275,8 @@ class RouteTask:
         self._side_hint_frames = 0
         self._side_hint_last_sequence = None
         self._bridge_lock_forward = None
+        self._bridge_target_forward = None
+        self._bridge_metric_active = False
         self._reacquire_view_already_low = False
         self.last_detection = VisualDetection.no_result(KIND)
         self._line_detector.reset()
@@ -626,6 +639,46 @@ class RouteTask:
             return False, "near candidate rejected before clearing old route"
         return True, "candidate confirmed ahead of old-route gate"
 
+    def _calibrated_remaining_distance(self) -> Optional[float]:
+        """Return a measured one-axis remainder for a stable route endpoint."""
+        if self._distance_calibration is None or self._candidate is None:
+            return None
+        endpoint = self._candidate.entry_endpoint
+        if (
+            endpoint is None
+            or not endpoint.internal
+            or self._candidate_frames < CANDIDATE_CONFIRM_FRAMES
+        ):
+            return None
+        return self._distance_calibration.estimate_remaining(
+            self._candidate.bottom_ratio
+        )
+
+    def _update_bridge_metric_target(self, remaining: float) -> None:
+        """Fuse each visible endpoint measurement into one bounded target."""
+        if self._bridge_lock_forward is None:
+            self._bridge_lock_forward = self._pose_forward
+        proposed = self._pose_forward + max(0.0, float(remaining))
+        maximum = self._bridge_lock_forward + 0.45
+        proposed = min(proposed, maximum)
+        if self._bridge_target_forward is None:
+            self._bridge_target_forward = proposed
+        else:
+            # Pixel endpoints jitter by several rows.  Smooth the implied
+            # absolute turn point while still following real approach motion.
+            self._bridge_target_forward = (
+                0.65 * self._bridge_target_forward + 0.35 * proposed
+            )
+        self._bridge_metric_active = True
+
+    @staticmethod
+    def _bridge_approach_speed(remaining: float) -> float:
+        if remaining <= BRIDGE_NEAR_DISTANCE:
+            return BRIDGE_NEAR_SPEED
+        if remaining <= BRIDGE_MIDDLE_DISTANCE:
+            return BRIDGE_MIDDLE_SPEED
+        return BRIDGE_FORWARD_SPEED
+
     def _begin_end_approach(self, now: float) -> None:
         self.state = END_APPROACH
         self.started_at = now
@@ -665,6 +718,8 @@ class RouteTask:
         self._side_hint_frames = 0
         self._side_hint_last_sequence = None
         self._bridge_lock_forward = None
+        self._bridge_target_forward = None
+        self._bridge_metric_active = False
         self._line_detector.reset()
 
     def _begin_search(self, now: float) -> None:
@@ -1393,26 +1448,62 @@ class RouteTask:
                 )
 
             ready, reason = self._candidate_ready(frame)
+            measured_remaining = self._calibrated_remaining_distance()
+            if ready and measured_remaining is not None:
+                self._update_bridge_metric_target(measured_remaining)
             if (
                 ready
                 and bridge_elapsed >= BRIDGE_MIN_SECONDS
-                and self._bridge_lock_forward is None
+                and self._bridge_target_forward is None
             ):
+                if self._distance_calibration is not None:
+                    return self._finish(
+                        TaskStatus.FAILED,
+                        "confirmed endpoint is outside the measured distance table",
+                    )
                 self._bridge_lock_forward = self._pose_forward
-            if self._bridge_lock_forward is not None:
-                post_lock_distance = max(
-                    0.0, self._pose_forward - self._bridge_lock_forward
+                self._bridge_target_forward = (
+                    self._pose_forward + BRIDGE_POST_LOCK_DISTANCE
                 )
-                if (
-                    post_lock_distance < BRIDGE_POST_LOCK_DISTANCE
-                    and bridge_elapsed < BRIDGE_MAX_SECONDS
-                ):
+                self._bridge_metric_active = False
+            if self._bridge_target_forward is not None:
+                remaining = max(
+                    0.0, self._bridge_target_forward - self._pose_forward
+                )
+                tolerance = (
+                    BRIDGE_TARGET_TOLERANCE
+                    if self._bridge_metric_active
+                    else 0.005
+                )
+                if remaining > tolerance:
+                    if (
+                        self._bridge_metric_active
+                        and measured_remaining is None
+                        and remaining > BRIDGE_BLIND_MAX_DISTANCE
+                    ):
+                        return self._finish(
+                            TaskStatus.FAILED,
+                            "endpoint left calibrated view with too much "
+                            "blind travel remaining",
+                        )
+                    budget = (
+                        BRIDGE_METRIC_MAX_SECONDS
+                        if self._bridge_metric_active
+                        else BRIDGE_MAX_SECONDS
+                    )
+                    if bridge_elapsed >= budget:
+                        return self._finish(
+                            TaskStatus.FAILED,
+                            "measured blank crossing did not reach its bounded "
+                            "turn point",
+                        )
+                    speed = self._bridge_approach_speed(remaining)
+                    mode = "measured" if self._bridge_metric_active else "fallback"
                     return self._running(
                         now,
-                        MotionCommand(forward=BRIDGE_FORWARD_SPEED),
-                        "candidate locked; advancing to turn point "
-                        f"{post_lock_distance:.2f}/"
-                        f"{BRIDGE_POST_LOCK_DISTANCE:.2f}m",
+                        MotionCommand(forward=speed),
+                        f"{mode} turn-point approach; remaining "
+                        f"{remaining:.2f}m at {speed:.2f}m/s",
                         self._candidate.detection
                         if self._candidate is not None
                         else None,
@@ -1421,7 +1512,12 @@ class RouteTask:
                 return self._running(
                     now,
                     STOP_COMMAND,
-                    "post-lock approach complete; lowering before turn",
+                    (
+                        "measured turn point reached; lowering before turn"
+                        if self._bridge_metric_active
+                        else "fallback approach complete; lowering before turn; "
+                        + self._distance_calibration_status
+                    ),
                     self._candidate.detection
                     if self._candidate is not None
                     else None,
