@@ -34,6 +34,9 @@ from green_junction import (  # noqa: E402
     blue_branch_mask,
     detections_for_log,
     evaluate_branches,
+    LampSpotter,
+    LIGHT_OWNER,
+    LIGHT_OWNER_LEGACY,
     line_is_centered,
     make_light_probe,
     make_two_lamp_probe,
@@ -201,8 +204,15 @@ class ComplianceTests(unittest.TestCase):
         )
         self.assertIn("from models import", text, "只使用公共接口 models.py")
 
-    def test_light_rule_belongs_to_other_module(self):
-        self.assertEqual(LIGHT_OWNER, "traffic_light.py")
+    def test_light_rule_now_belongs_to_this_module(self):
+        """灯的判据归属：2026-09-16 团队删掉了 ``traffic_light.py``（``6dc2c1f``）。
+
+        理由：赛题里没有"独立的红绿灯停车"这一项，而它在实车上反复把红色物体
+        判成红灯、原地锁停。但第一个岔路口两边各有一盏灯、车要往绿灯那边走，
+        所以"绿灯在哪一边"这个判据由本模块提供（A17）；注入式探针仍然保留。
+        """
+        self.assertEqual(LIGHT_OWNER, "green_junction.py")
+        self.assertEqual(LIGHT_OWNER_LEGACY, "traffic_light.py")
 
 
 class NoTriggerTests(unittest.TestCase):
@@ -569,29 +579,30 @@ class StateMachineTests(unittest.TestCase):
         self.assertEqual(update.status, TaskStatus.RUNNING)
         self.assertEqual(update.motion, STOP)
 
-    def test_red_light_waits_then_fails_and_stops(self):
+    def test_red_only_never_takes_over(self):
+        """**绝不为红灯锁停**（A14/A17）：只有红灯时本模块不接管。
+
+        团队删掉 ``traffic_light.py`` 的理由就是"它会为了红灯原地锁停、
+        浪费跑圈时间"（``6dc2c1f``）。本模块只在**真的有绿灯证据**时才接管；
+        只有红灯时岔路交给后面的模块，车不会停在这里。
+        """
         settings = JunctionConfig(decision_timeout=2.0)
         task = GreenJunctionTask(
             settings=settings,
             light_probe=lambda frame, now: LightReading(color=LightColor.RED),
         )
-        now = self._advance_until(task, JunctionState.DECIDE)
-        update = task.step(packet(junction_frame(), 21, now), now, fake_line(error=0.9))
-        self.assertEqual(update.status, TaskStatus.RUNNING)
-        self.assertEqual(update.motion, STOP)
-        now += settings.decision_timeout + 0.5
-        update = task.step(packet(junction_frame(), 22, now), now, fake_line(error=0.9))
-        self.assertEqual(update.status, TaskStatus.FAILED)
-        self.assertEqual(update.motion, STOP)
-        self.assertEqual(task.state, JunctionState.FAILED)
-        self.assertIn("red", update.message)
+        now = 50.0
+        for index in range(20):
+            now += FRAME_DT
+            update = task.step(packet(junction_frame(), index + 1, now), now, fake_line(error=0.9))
+            self.assertEqual(update.status, TaskStatus.NOT_TRIGGERED)
+            self.assertEqual(update.motion, STOP)
+        self.assertEqual(task.state, JunctionState.IDLE)
+        self.assertIn("no usable light reading", update.message)
 
     def test_no_rule_source_at_all_never_takes_over(self):
-        """一个判据来源都没有 → 不接管，把岔路让给后面的模块（free_junction）。
-
-        这样"检测修好了"不会变成"每个岔路口都被本模块抢走然后 FAILED"。
-        """
-        settings = JunctionConfig(decision_timeout=0.4)
+        """连内置检测器都关掉、又没有探针 → 同样不接管（消息也不一样）。"""
+        settings = JunctionConfig(decision_timeout=0.4, builtin_lamp_detection=False)
         task = GreenJunctionTask(settings=settings)
         now = 300.0
         for index in range(20):
@@ -626,13 +637,19 @@ class StateMachineTests(unittest.TestCase):
             self.assertEqual(task.state, JunctionState.IDLE)
             self.assertIn("no usable light reading", update.message)
 
-    def test_red_reading_is_still_a_real_reading(self):
-        """红灯算"真的拿到读数"：接管 → 原地停 → 超时 FAILED（安全方向，不许走）。"""
-        settings = JunctionConfig(decision_timeout=0.4)
-        task = GreenJunctionTask(
-            settings=settings, light_probe=lambda frame, now: LightReading(color=LightColor.RED)
-        )
+    def test_green_then_red_still_stops_safely(self):
+        """已经接管之后灯变红 → 原地停 + 超时 FAILED（安全方向，不许硬闯）。"""
+        settings = JunctionConfig(decision_timeout=0.4, fallback_rule="none")
+        state = {"red": False}
+
+        def probe(frame, now):
+            if state["red"]:
+                return LightReading(color=LightColor.RED)
+            return green_without_side()
+
+        task = GreenJunctionTask(settings=settings, light_probe=probe)
         now = self._advance_until(task, JunctionState.DECIDE)
+        state["red"] = True
         now += settings.decision_timeout + 0.5
         update = task.step(packet(junction_frame(), 7, now), now, fake_line(error=0.9))
         self.assertEqual(update.status, TaskStatus.FAILED)
@@ -985,20 +1002,19 @@ class LightProbeAdapterTests(unittest.TestCase):
         with self.assertRaises(TypeError):
             make_light_probe(42)
 
-    def test_real_traffic_light_detector_drives_the_whole_module(self):
-        """用 3 号**真正的**检测器把整条链跑通：绿灯 → 岔路 → 接管 → 转向 → 交回。
+    def test_builtin_spotter_drives_the_whole_module(self):
+        """用**内置**检测器（本模块自己的 LampSpotter）把整条链跑通。
 
-        这就是 v3 报告里"缺的那一段"：不需要 3 号开新接口，也不需要改注册表，
-        只要整合层把探针注入进来。
+        ``traffic_light.py`` 已在 ``6dc2c1f`` 被删除，所以这条链现在不依赖任何
+        外部模块：绿灯 → 岔路 → 接管 → 转向 → 交回巡线。
         """
-        from traffic_light import TrafficLightDetector  # 只在测试里 import，模块本身不依赖它
+        spotter = LampSpotter()
+        readings = spotter.readings(green_lamp_frame())
+        self.assertTrue(readings, "内置检测器应该认出这盏绿灯")
+        self.assertIs(readings[0].color, LightColor.GREEN)
 
-        detector = TrafficLightDetector()
-        detection = detector.detect(green_lamp_frame())
-        self.assertTrue(detection.valid, "3 号的检测器应该认出这盏绿灯")
-        self.assertEqual(detection.color, "green")
-
-        task = GreenJunctionTask(light_probe=make_light_probe(detector))
+        # 注入形态也支持（把 spotter 当别人给的检测器用）。
+        task = GreenJunctionTask(light_probe=make_light_probe(spotter))
         harness = TaskHarness(task=task)
         harness.start_line(now=1.0)
         now = 1.05
@@ -1161,44 +1177,71 @@ class TwoLampTests(unittest.TestCase):
         self.assertIs(readings[0].color, LightColor.GREEN)
         self.assertIs(readings[0].branch, Branch.LEFT)
 
-    def test_adapter_reads_a_lamp_sitting_on_the_split_line(self):
-        """灯正好骑在切分线上时也必须认出来（整合侧接线测试就是这么摆的）。
-
-        硬按 0.5 裁、不留重叠的话，这盏灯在半幅图里会掉到 3 号 ROI 外面
-        （形状判据直接丢掉），于是"绿灯亮着却不接管"。
-        """
-        from traffic_light import TrafficLightDetector
-
+    def test_builtin_spotter_handles_a_lamp_on_the_split_line(self):
+        """内置检测器扫整幅图，所以骑在画面中心线上的灯天然不会丢。"""
         image = approach_frame()
-        # 3 号那盏灯的位置：x=300..380，正好跨过画面中心 320。
-        cv2.rectangle(image, (300, 80), (380, 160), (0, 255, 0), -1)
-        probe = make_two_lamp_probe(TrafficLightDetector(), min_confidence=0.40)
-        readings = probe(packet(image, 1, 0.0), 0.0)
-        self.assertEqual(len(readings), 1, "骑在切分线上的灯应该只算一盏")
+        cv2.circle(image, (340, 120), 40, (0, 255, 0), -1)
+        readings = LampSpotter().readings(image)
+        self.assertEqual(len(readings), 1, readings)
         self.assertIs(readings[0].color, LightColor.GREEN)
         self.assertIs(readings[0].branch, Branch.RIGHT, "灯中心在 320 右边 → 右分支")
+
+    def test_adapter_places_a_straddling_lamp_by_its_centre(self):
+        """给"只回报一盏、但带 center"的外部检测器用：骑线也要归到正确的一边。
+
+        硬按 0.5 裁、不留重叠的话，这盏灯在半幅图里会被裁掉一半、形状判据就认不出来了。
+        """
+        class CentreDetector:
+            """像真检测器那样：在传进来的图里找绿灯，回报它**在本图里**的 center。"""
+
+            def detect(self, image):
+                hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+                mask = cv2.inRange(
+                    hsv,
+                    np.array((40, 90, 60), np.uint8),
+                    np.array((85, 255, 255), np.uint8),
+                )
+                ys, xs = np.nonzero(mask)
+                if len(xs) == 0:
+                    return VisualDetection.no_result("traffic_light")
+                return VisualDetection(
+                    valid=True,
+                    kind="traffic_light",
+                    center=(float(np.median(xs)), float(np.median(ys))),
+                    color="green",
+                    confidence=0.6,
+                )
+
+        image = approach_frame()
+        cv2.circle(image, (340, 120), 40, (0, 255, 0), -1)  # 骑在 x=320 上
+        probe = make_two_lamp_probe(CentreDetector(), min_confidence=0.40)
+        readings = probe(packet(image, 1, 0.0), 0.0)
+        self.assertEqual(len(readings), 1, "同一盏灯在重叠区被看到两次，要去重成一条")
+        self.assertIs(readings[0].color, LightColor.GREEN)
+        self.assertIs(readings[0].branch, Branch.RIGHT, "灯心 340 在切分线右边 → 右分支")
 
     def test_adapter_with_no_lamps_returns_nothing(self):
         readings = make_two_lamp_probe(lambda image: None)(packet(approach_frame(), 1, 0.0), 0.0)
         self.assertEqual(readings, [])
 
-    # -- 和 3 号真检测器串起来 ---------------------------------------------
+    # -- 内置检测器：一次找出两盏 ------------------------------------------
 
-    def test_single_lamp_adapter_only_reports_red_when_both_are_visible(self):
-        """说明为什么必须做左右切分：整帧只问一次时，``red_priority`` 只会报红。"""
-        from traffic_light import TrafficLightDetector
+    def test_builtin_spotter_sees_both_lamps_at_once(self):
+        """内置检测器一次就把两盏都找出来（不像被删掉的那个模块只报一盏、红优先）。"""
+        for green_on_left in (True, False):
+            readings = LampSpotter().readings(two_lamp_frame(green_on_left=green_on_left))
+            self.assertEqual(len(readings), 2, readings)
+            colours = {item.branch.value: item.color.value for item in readings}
+            self.assertEqual(
+                colours,
+                {"left": "green", "right": "red"} if green_on_left
+                else {"left": "red", "right": "green"},
+            )
 
-        probe = make_light_probe(TrafficLightDetector())
-        reading = probe(packet(two_lamp_frame(), 1, 0.0), 0.0)
-        self.assertIsNotNone(reading)
-        self.assertIs(reading.color, LightColor.RED)
-
-    def test_real_detector_two_lamps_drives_the_module_to_the_green_side(self):
-        """本关卡的正式场景，端到端：绿灯在哪边，车就走哪边。"""
-        from traffic_light import TrafficLightDetector
-
+    def test_no_probe_at_all_drives_the_module_to_the_green_side(self):
+        """**实车配置**：不注入任何探针，靠内置检测器；绿灯在哪边就走哪边。"""
         for green_on_left, expected in ((True, Branch.LEFT), (False, Branch.RIGHT)):
-            task = GreenJunctionTask(light_probe=make_two_lamp_probe(TrafficLightDetector()))
+            task = GreenJunctionTask()  # 没有 light_probe
             harness = TaskHarness(task=task)
             harness.start_line(now=1.0)
             now = 1.05
@@ -1219,10 +1262,8 @@ class TwoLampTests(unittest.TestCase):
             self.assertEqual(task.state, JunctionState.COMPLETED)
             self.assertEqual(harness.owner, "line")
 
-    def test_two_lamp_probe_readings_are_exposed_for_logging(self):
-        from traffic_light import TrafficLightDetector
-
-        task = GreenJunctionTask(light_probe=make_two_lamp_probe(TrafficLightDetector()))
+    def test_two_lamp_readings_are_exposed_for_logging(self):
+        task = GreenJunctionTask()
         now = 10.0
         for index in range(4):
             now += FRAME_DT
@@ -1233,6 +1274,104 @@ class TwoLampTests(unittest.TestCase):
         greens = [item for item in task.last_readings if item.color is LightColor.GREEN]
         self.assertEqual(len(greens), 1)
         self.assertEqual(greens[0].branch.value, "right")
+
+
+class BuiltinLampTests(unittest.TestCase):
+    """A17：内置认灯器（算法来自 3 号那版实车上调过的 vision_tasks.py）。"""
+
+    def setUp(self):
+        self.spotter = LampSpotter()
+
+    def _frame_with(self, draw):
+        image = approach_frame()
+        draw(image)
+        return image
+
+    def test_round_green_lamp_is_found_on_the_left(self):
+        image = self._frame_with(lambda img: cv2.circle(img, (100, 100), 22, (0, 255, 0), -1))
+        readings = self.spotter.readings(image)
+        self.assertEqual(len(readings), 1)
+        self.assertIs(readings[0].color, LightColor.GREEN)
+        self.assertIs(readings[0].branch, Branch.LEFT)
+
+    def test_elongated_red_bar_is_not_a_lamp(self):
+        """长条状红/绿物不是灯（圆度判据）——被删掉那个模块吃过这个亏。"""
+        image = self._frame_with(
+            lambda img: cv2.rectangle(img, (60, 60), (300, 90), (0, 0, 255), -1)
+        )
+        self.assertEqual(self.spotter.readings(image), [])
+
+    def test_tiny_speck_is_not_a_lamp(self):
+        """半径太小（< lamp_min_radius）的亮点不是灯。"""
+        image = self._frame_with(lambda img: cv2.circle(img, (100, 100), 3, (0, 0, 255), -1))
+        self.assertEqual(self.spotter.readings(image), [])
+
+    def test_colour_competition_rejects_a_mismatched_colour(self):
+        """候选灯圆内另一色像素更多时判掉（像素竞争）。"""
+        image = approach_frame()
+        # 半径 26 的"绿灯"里塞一个半径 20 的红块：绿轮廓仍然近似圆（外轮廓不外扩），
+        # 但圆内红色像素比绿色多 → 绿色候选必须被竞争判据挡掉。
+        cv2.circle(image, (300, 100), 26, (0, 255, 0), -1)
+        cv2.circle(image, (300, 100), 20, (0, 0, 255), -1)
+        readings = self.spotter.readings(image)
+        self.assertEqual(
+            [item for item in readings if item.color is LightColor.GREEN],
+            [],
+            "绿色候选应该被像素竞争挡掉",
+        )
+        # 关掉竞争判据后，绿色候选就会露出来（说明确实是这条判据挡的）。
+        tolerant = LampSpotter(JunctionConfig(lamp_require_colour_dominance=False))
+        greens = [item for item in tolerant.readings(image) if item.color is LightColor.GREEN]
+        self.assertTrue(greens)
+
+    def test_builtin_detection_can_be_switched_off(self):
+        settings = JunctionConfig(builtin_lamp_detection=False)
+        task = GreenJunctionTask(settings=settings)
+        now = 20.0
+        for index in range(10):
+            now += FRAME_DT
+            update = task.step(
+                packet(two_lamp_frame(), index + 1, now), now, fake_line(error=0.9)
+            )
+            self.assertEqual(update.status, TaskStatus.NOT_TRIGGERED)
+        self.assertIn("no light rule source", update.message)
+
+    def test_light_side_must_repeat_before_turning(self):
+        """A15：同一个"哪边是绿灯"要连续 light_confirm_frames 帧才算数。
+
+        ``confirm_frames=1`` 时，IDLE 那一帧只把岔路记成候选，下一帧才进 DECIDE，
+        所以前两帧是"确认岔路"，之后才开始数灯。
+        """
+        settings = JunctionConfig(light_confirm_frames=2, confirm_frames=1)
+        task = GreenJunctionTask(settings=settings)
+        now = 30.0
+        for index in (1, 2):  # 确认岔路（第 2 帧进 DECIDE，还没数灯）
+            now += FRAME_DT
+            update = task.step(
+                packet(two_lamp_frame(green_on_left=True), index, now), now, fake_line(error=0.9)
+            )
+        self.assertIsNone(task.chosen_branch)
+        # 第 3 帧：绿灯在左 → 只数到 1，不许转身
+        now += FRAME_DT
+        update = task.step(
+            packet(two_lamp_frame(green_on_left=True), 3, now), now, fake_line(error=0.9)
+        )
+        self.assertIsNone(task.chosen_branch)
+        self.assertIn("confirming light side left (1/2", update.message)
+        # 第 4 帧：绿灯换到右边 → 计数清零，仍然不许转身
+        now += FRAME_DT
+        update = task.step(
+            packet(two_lamp_frame(green_on_left=False), 4, now), now, fake_line(error=0.9)
+        )
+        self.assertIsNone(task.chosen_branch)
+        self.assertIn("confirming light side right (1/2", update.message)
+        # 第 5 帧：同一侧再来一帧 → 走右边
+        now += FRAME_DT
+        update = task.step(
+            packet(two_lamp_frame(green_on_left=False), 5, now), now, fake_line(error=0.9)
+        )
+        self.assertIs(task.chosen_branch, Branch.RIGHT)
+        self.assertIn("take right branch", update.message)
 
 
 class CoordinatorHarnessTests(unittest.TestCase):
