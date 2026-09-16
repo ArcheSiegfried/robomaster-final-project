@@ -91,6 +91,8 @@ CENTER_REALIGN_ANGLE_DEG = 18.0
 ALIGN_YAW_GAIN = 0.38
 ALIGN_MIN_YAW = 5.0
 ALIGN_MAX_YAW = 18.0
+ALIGN_VISIBILITY_GAIN = 0.12
+ALIGN_MAX_LATERAL = 0.07
 DOCK_FORWARD_SPEED = 0.08
 DOCK_TARGET_ERROR = 0.07
 DOCK_ANGLE_DEG = 25.0
@@ -427,6 +429,8 @@ class RouteTask:
                         bottom_ratio=float(bottom_ratio),
                         lower_point=endpoint.point,
                         entry_endpoint=endpoint,
+                        # Use the origin and direction of the same fit.
+                        line_point=endpoint.line_point,
                         score=(
                             candidate.score
                             + 0.08 * center_score
@@ -451,6 +455,10 @@ class RouteTask:
         # leave through the bottom edge while the chassis docks onto it.
         if not endpoint.internal and self._candidate_center is None:
             return False
+        # Image slope is not ground-plane yaw. After acquisition, use image
+        # continuity rather than adding it to command-integrated chassis yaw.
+        if self.state in (ALIGNING, CENTERING, DOCKING):
+            return True
         if self._old_tangent_world is None:
             return True
         world_tangent = self._heading_offset + endpoint.tangent_deg
@@ -466,7 +474,9 @@ class RouteTask:
         )
         self._candidate = selected
         if selected is None or selected.detection.center is None:
-            target_locked = self.state in (CENTERING, DOCKING)
+            target_locked = self.state in (ALIGNING, CENTERING, DOCKING)
+            self._stable_frames = 0
+            self._stable_last_sequence = None
             if not target_locked and (
                 self._candidate_last_at is None
                 or now - self._candidate_last_at >= FRAGMENT_LOSS_SECONDS
@@ -794,14 +804,14 @@ class RouteTask:
         if self._candidate is None:
             if (
                 self._candidate_last_at is not None
-                and now - self._candidate_last_at < FRAGMENT_LOSS_SECONDS
+                and now - self._candidate_last_at < LOCKED_TARGET_LOSS_SECONDS
             ):
                 return self._running(
                     now, STOP_COMMAND, "route heading briefly missing; stopped"
                 )
-            self._begin_search(now)
-            return self._running(
-                now, STOP_COMMAND, "route heading lost; returning to search"
+            return self._finish(
+                TaskStatus.FAILED,
+                "locked route lost during alignment; stopped without rescan",
             )
         aligned = abs(self._candidate.angle_deg) <= ALIGN_ANGLE_DEG
         if frame.sequence != self._stable_last_sequence:
@@ -816,10 +826,18 @@ class RouteTask:
                 self._candidate.detection,
             )
         yaw = self._alignment_yaw(self._candidate.angle_deg)
+        # Small image-feedback visibility correction, not a metric move to
+        # the endpoint. A near-horizontal axis cannot be extrapolated safely
+        # to a bottom reference row, so use the tracked endpoint here.
+        visibility_error = self._candidate_target_error(self._candidate, frame)
+        lateral = max(
+            -ALIGN_MAX_LATERAL,
+            min(visibility_error * ALIGN_VISIBILITY_GAIN, ALIGN_MAX_LATERAL),
+        ) if abs(visibility_error) > CENTER_TARGET_ERROR else 0.0
         return self._running(
             now,
-            MotionCommand(yaw=yaw),
-            f"aligning route heading {self._stable_frames}/"
+            MotionCommand(lateral=lateral, yaw=yaw),
+            f"aligning with visibility correction {self._stable_frames}/"
             f"{REACQUIRE_STABLE_FRAMES}",
             self._candidate.detection,
         )

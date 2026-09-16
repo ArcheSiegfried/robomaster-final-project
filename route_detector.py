@@ -47,6 +47,7 @@ class RouteEndpoint:
     tangent_deg: float
     internal: bool
     branch_length: float
+    line_point: Optional[Tuple[float, float]] = None
 
 
 @dataclass(frozen=True)
@@ -290,6 +291,7 @@ class RouteVision:
                     tangent_deg=float(angle),
                     internal=internal,
                     branch_length=branch_length,
+                    line_point=(x0 + left, y0 + top),
                 )
             )
         return tuple(features)
