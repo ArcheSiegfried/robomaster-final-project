@@ -12,6 +12,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from config import CONFIG  # noqa: E402
+from evidence import render_task_evidence  # noqa: E402
 from models import FramePacket, GimbalCommand, TaskStatus  # noqa: E402
 from number_marker import (  # noqa: E402
     MEASURED_DISTANCE,
@@ -24,7 +25,6 @@ from number_marker import (  # noqa: E402
     evaluate_number_markers,
     is_marker_eligible,
     marker_candidates_from_normalized,
-    render_evidence_image,
     select_target_marker,
 )
 from tests.task_harness import (  # noqa: E402
@@ -84,6 +84,10 @@ def advance_to_evidence(task, marker_id="1", start=1.0):
 
 
 class NumberMarkerContractTests(unittest.TestCase):
+    def test_default_team_number_is_03(self):
+        self.assertEqual(NumberMarkerConfig().team_number, "03")
+        self.assertEqual(NumberMarkerTask().settings.team_number, "03")
+
     def test_module_source_obeys_the_safety_rules(self):
         assert_module_source_is_clean(self, "number_marker.py")
 
@@ -333,7 +337,30 @@ class AimingStateTests(unittest.TestCase):
         update = task.step(packet(3, 1.10), 1.40)
         self.assertIsNone(update.gimbal)
         self.assertIs(update.status, TaskStatus.FAILED)
+        self.assertEqual(update.motion.yaw, 0.0)
         self.assertIsNone(task.target_pitch)
+        self.assertIsNone(task.pending_evidence_request)
+        set_current(task, 4, 1.41, candidate("2"))
+        task.step(packet(4, 1.41), 1.41)
+        self.assertEqual(task.target_id, "2")
+
+    def test_task_timeout_clears_queued_evidence_and_stops(self):
+        settings = replace(BASE_CONFIG, aim_stable_frames=1, max_task_seconds=0.05)
+        task = NumberMarkerTask(settings)
+        advance_to_evidence(task)
+        stale_request = task.pending_evidence_request
+        self.assertIsNotNone(stale_request)
+        failed = task.step(packet(3, 1.20), 1.20)
+        self.assertIs(failed.status, TaskStatus.FAILED)
+        self.assertEqual(failed.message, "FAILED:TASK_TIMEOUT")
+        self.assertEqual(failed.motion.yaw, 0.0)
+        self.assertIsNone(failed.gimbal)
+        self.assertIsNone(task.target_pitch)
+        self.assertIsNone(task.pending_evidence_request)
+        self.assertFalse(task.acknowledge_evidence(stale_request.request_id, True))
+        set_current(task, 4, 1.21, candidate("2"))
+        task.step(packet(4, 1.21), 1.21)
+        self.assertEqual(task.target_id, "2")
 
     def test_evidence_pending_steps_do_not_accumulate_pitch(self):
         runtime = replace(CONFIG, gimbal_pitch=-10)
@@ -418,12 +445,20 @@ class AimingStateTests(unittest.TestCase):
 
     def test_target_loss_timeout_fails_stopped(self):
         settings = replace(BASE_CONFIG, target_lost_timeout=0.05)
-        task = self.begin(candidate(x=180), settings)
-        task.update_candidates(())
+        task = self.begin(candidate(x=180, y=80), settings)
+        set_current(task, 2, 1.01, candidate(x=180, y=80))
         task.step(packet(2, 1.01), 1.01)
-        update = task.step(packet(3, 1.07), 1.07)
+        task.update_candidates(())
+        task.step(packet(3, 1.02), 1.02)
+        update = task.step(packet(4, 1.08), 1.08)
         self.assertIs(update.status, TaskStatus.FAILED)
         self.assertEqual(update.motion.yaw, 0.0)
+        self.assertIsNone(update.gimbal)
+        self.assertIsNone(task.target_pitch)
+        self.assertIsNone(task.pending_evidence_request)
+        set_current(task, 5, 1.09, candidate("2"))
+        task.step(packet(5, 1.09), 1.09)
+        self.assertEqual(task.target_id, "2")
 
     def test_stale_frame_during_aiming_fails_stopped(self):
         task = self.begin(candidate(x=180))
@@ -475,13 +510,122 @@ class EvidenceTests(unittest.TestCase):
         self.assertIsNotNone(request.detection.box)
         self.assertEqual(request.image.shape, (HEIGHT, WIDTH, 3))
 
-    def test_annotation_preserves_full_scene_and_does_not_mutate_source(self):
+    def test_default_annotation_uses_actual_id_and_custom_team_still_works(self):
+        for marker_id in ("2", "3"):
+            task = NumberMarkerTask(replace(NumberMarkerConfig(), aim_stable_frames=1))
+            advance_to_evidence(task, marker_id=marker_id)
+            request = task.take_evidence_request()
+            self.assertEqual(
+                request.annotation,
+                "Team 03 detects a marker with ID of {}".format(marker_id),
+            )
+        custom = NumberMarkerTask(
+            replace(NumberMarkerConfig(), team_number="17", aim_stable_frames=1)
+        )
+        advance_to_evidence(custom, marker_id="5")
+        self.assertEqual(
+            custom.take_evidence_request().annotation,
+            "Team 17 detects a marker with ID of 5",
+        )
+
+    def test_request_uses_locking_frame_and_full_frame_pixel_coordinates(self):
+        task = NumberMarkerTask(replace(NumberMarkerConfig(), aim_stable_frames=1))
+        item = candidate("2", x=320, y=180, width=160, height=100)
+        set_current(task, 1, 1.0, item)
+        task.step(packet(1, 1.0), 1.0)
+        image = np.full((HEIGHT, WIDTH, 3), 27, dtype=np.uint8)
+        image[20, 30] = (2, 3, 4)
+        original = image.copy()
+        locked_frame = FramePacket(image, 2, 1.01)
+        set_current(task, 2, 1.01, item)
+        update = task.step(locked_frame, 1.01)
+        request = task.take_evidence_request()
+
+        self.assertIs(update.status, TaskStatus.RUNNING)
+        self.assertEqual(request.marker_id, "2")
+        self.assertEqual(request.request_id, "marker:2:frame:2:attempt:1")
+        self.assertEqual(request.frame_sequence, 2)
+        self.assertEqual(request.captured_at, 1.01)
+        self.assertEqual(request.detection.center, (320, 180))
+        self.assertEqual(request.detection.box, (240, 130, 400, 230))
+        self.assertEqual(request.annotation, "Team 03 detects a marker with ID of 2")
+        self.assertEqual(request.image.shape, (HEIGHT, WIDTH, 3))
+        self.assertTrue(np.array_equal(request.image, original))
+        image[:] = 99
+        self.assertTrue(np.array_equal(request.image, original))
+
+    def test_integration_renderer_preserves_full_scene_and_request_image(self):
         task, request = self.task_at_evidence()
         before = request.image.copy()
-        shown = render_evidence_image(request)
+        shown = render_task_evidence(request)
         self.assertEqual(shown.shape, before.shape)
         self.assertTrue(np.array_equal(request.image, before))
         self.assertFalse(np.array_equal(shown, before))
+
+    def test_pending_keeps_ownership_and_zero_motion_until_real_ack(self):
+        task = NumberMarkerTask(replace(NumberMarkerConfig(), aim_stable_frames=1))
+        locked = advance_to_evidence(task, marker_id="2")
+        self.assertIs(task.state, MarkerState.EVIDENCE_PENDING)
+        self.assertIs(locked.status, TaskStatus.RUNNING)
+        self.assertEqual(locked.motion.forward, 0.0)
+        self.assertEqual(locked.motion.lateral, 0.0)
+        self.assertEqual(locked.motion.yaw, 0.0)
+        self.assertIsNone(locked.gimbal)
+        original_pitch = task.target_pitch
+        for sequence, now in ((3, 1.02), (4, 1.03)):
+            set_current(task, sequence, now, candidate("2", x=460, y=80))
+            pending = task.step(packet(sequence, now), now)
+            self.assertIs(pending.status, TaskStatus.RUNNING)
+            self.assertEqual(pending.motion.yaw, 0.0)
+            self.assertIsNone(pending.gimbal)
+            self.assertEqual(task.target_pitch, original_pitch)
+        request = task.take_evidence_request()
+        self.assertTrue(task.acknowledge_evidence(request.request_id, True))
+        completed = task.step(packet(5, 1.04), 1.04)
+        self.assertIs(completed.status, TaskStatus.COMPLETED)
+        self.assertEqual(completed.motion.yaw, 0.0)
+
+    def test_retry_ids_are_unique_old_ack_is_rejected_and_attempts_end(self):
+        settings = replace(NumberMarkerConfig(), aim_stable_frames=1, max_evidence_attempts=3)
+        task, first = self.task_at_evidence(settings)
+        self.assertEqual(first.request_id, "marker:1:frame:2:attempt:1")
+        self.assertTrue(task.acknowledge_evidence(first.request_id, False))
+        second = task.take_evidence_request()
+        self.assertEqual(second.attempt, 2)
+        self.assertNotEqual(second.request_id, first.request_id)
+        self.assertFalse(task.acknowledge_evidence(first.request_id, True))
+        self.assertNotIn("1", task.saved_ids)
+        self.assertTrue(task.acknowledge_evidence(second.request_id, False))
+        third = task.take_evidence_request()
+        self.assertEqual(third.attempt, 3)
+        self.assertEqual(len({first.request_id, second.request_id, third.request_id}), 3)
+        self.assertFalse(task.acknowledge_evidence(second.request_id, True))
+        self.assertTrue(task.acknowledge_evidence(third.request_id, False))
+        self.assertFalse(task.acknowledge_evidence(third.request_id, True))
+        failed = task.step(packet(3, 1.03), 1.03)
+        self.assertIs(failed.status, TaskStatus.FAILED)
+        self.assertEqual(failed.message, "FAILED:EVIDENCE_WRITE_FAILED")
+        self.assertEqual(failed.motion.yaw, 0.0)
+        self.assertIsNone(task.pending_evidence_request)
+        self.assertNotIn("1", task.saved_ids)
+
+    def test_evidence_write_failure_clears_queued_request_at_terminal_step(self):
+        task = NumberMarkerTask(replace(NumberMarkerConfig(), aim_stable_frames=1))
+        advance_to_evidence(task)
+        request = task.pending_evidence_request
+        self.assertIsNotNone(request)
+        self.assertTrue(task.acknowledge_evidence(request.request_id, False))
+        failed = task.step(packet(3, 1.03), 1.03)
+        self.assertIs(failed.status, TaskStatus.FAILED)
+        self.assertEqual(failed.motion.yaw, 0.0)
+        self.assertIsNone(failed.gimbal)
+        self.assertIsNone(task.target_pitch)
+        self.assertIsNone(task.pending_evidence_request)
+        self.assertFalse(task.acknowledge_evidence(request.request_id, True))
+        next_item = candidate("2")
+        set_current(task, 4, 1.04, next_item)
+        task.step(packet(4, 1.04), 1.04)
+        self.assertEqual(task.target_id, "2")
 
     def test_success_ack_separately_marks_saved_and_completes(self):
         task, request = self.task_at_evidence()
@@ -496,8 +640,28 @@ class EvidenceTests(unittest.TestCase):
         self.assertTrue(task.acknowledge_evidence(request.request_id, False))
         update = task.step(packet(3, 1.03), 1.03)
         self.assertIs(update.status, TaskStatus.FAILED)
+        self.assertEqual(update.message, "FAILED:EVIDENCE_WRITE_FAILED")
+        self.assertEqual(update.motion.yaw, 0.0)
+        self.assertIsNone(task.pending_evidence_request)
         self.assertIn("1", task.aimed_ids)
         self.assertNotIn("1", task.saved_ids)
+
+    def test_completed_id_is_not_scored_again_but_new_id_is_available(self):
+        task = NumberMarkerTask(replace(NumberMarkerConfig(), aim_stable_frames=1))
+        advance_to_evidence(task, marker_id="2")
+        first = task.take_evidence_request()
+        self.assertTrue(task.acknowledge_evidence(first.request_id, True))
+        self.assertIs(task.step(packet(3, 1.03), 1.03).status, TaskStatus.COMPLETED)
+        self.assertEqual(task.aimed_ids, {"2"})
+        self.assertEqual(task.saved_ids, {"2"})
+        set_current(task, 4, 1.04, candidate("2"))
+        duplicate = task.step(packet(4, 1.04), 1.04)
+        self.assertIs(duplicate.status, TaskStatus.NOT_TRIGGERED)
+        self.assertIsNone(task.pending_evidence_request)
+        set_current(task, 5, 1.05, candidate("3"))
+        fresh = task.step(packet(5, 1.05), 1.05)
+        self.assertIs(fresh.status, TaskStatus.RUNNING)
+        self.assertEqual(task.target_id, "3")
 
     def test_failed_write_can_be_configured_for_one_retry(self):
         settings = replace(BASE_CONFIG, aim_stable_frames=1, max_evidence_attempts=2)
@@ -516,7 +680,7 @@ class EvidenceTests(unittest.TestCase):
         self.assertNotIn(request.marker_id, task.saved_ids)
 
     def test_aim_lock_without_team_number_fails_before_false_evidence(self):
-        task = NumberMarkerTask(NumberMarkerConfig(aim_stable_frames=1))
+        task = NumberMarkerTask(NumberMarkerConfig(aim_stable_frames=1, team_number=None))
         update = advance_to_evidence(task)
         self.assertIs(update.status, TaskStatus.FAILED)
         self.assertIsNone(task.pending_evidence_request)
