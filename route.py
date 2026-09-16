@@ -84,6 +84,8 @@ NEAR_EXIT_RATIO = 0.70
 OLD_LINE_CLEAR_DISTANCE = 0.07
 MIN_ENDPOINT_GAP_DISTANCE = 0.08
 MAX_ENDPOINT_GAP_DISTANCE = 1.40
+MIN_LOCK_BRANCH_PIXELS = 100.0
+MIN_LOCK_BOTTOM_RATIO = 0.80
 ALIGN_ANGLE_DEG = 18.0
 ALIGN_YAW_GAIN = 0.38
 ALIGN_MIN_YAW = 5.0
@@ -92,11 +94,12 @@ DOCK_FORWARD_SPEED = 0.08
 DOCK_TARGET_ERROR = 0.13
 DOCK_ANGLE_DEG = 25.0
 DOCK_MAX_YAW = 22.0
-CORNER_FORWARD_SPEED = 0.07
+CORNER_FORWARD_SPEED = 0.055
 CORNER_MAX_YAW = 38.0
 CENTER_TARGET_ERROR = 0.11
 CENTER_LATERAL_GAIN = 0.16
 CENTER_MAX_LATERAL = 0.12
+PREALIGN_CENTER_ERROR = 0.22
 DOCK_LATERAL_GAIN = 0.12
 DOCK_MAX_LATERAL = 0.09
 RIGHT_ANGLE_MIN_DEG = 50.0
@@ -346,7 +349,14 @@ class RouteTask:
         if not candidates:
             return None
         if self._candidate_center is None:
-            return max(candidates, key=lambda item: item.score)
+            return max(
+                candidates,
+                key=lambda item: (
+                    item.bottom_ratio,
+                    item.entry_endpoint.branch_length,
+                    item.score,
+                ),
+            )
 
         ranked = []
         for candidate in candidates:
@@ -429,6 +439,11 @@ class RouteTask:
         """Cheap gate applied before temporal tracking can lock onto old tape."""
         endpoint = candidate.entry_endpoint
         if endpoint is None:
+            return False
+        # Tiny remote pieces must not enter temporal tracking at all.  If they
+        # are merely rejected later by _candidate_ready(), their history keeps
+        # the real, closer endpoint from being selected.
+        if endpoint.branch_length < MIN_LOCK_BRANCH_PIXELS:
             return False
         # A new target must first present a physical internal endpoint.  Once
         # that same target has been tracked, its endpoint may legitimately
@@ -531,10 +546,14 @@ class RouteTask:
         endpoint = self._candidate.entry_endpoint
         if endpoint is None or not endpoint.internal:
             return False, "candidate has no internal gap-facing endpoint"
+        if endpoint.branch_length < MIN_LOCK_BRANCH_PIXELS:
+            return False, "candidate branch is too short to identify a route end"
         height = frame.image.shape[0]
         endpoint_ratio = endpoint.point[1] / max(height, 1)
         if endpoint_ratio < MIN_CANDIDATE_ENDPOINT_Y_RATIO:
             return False, "candidate endpoint is too close to the upper image edge"
+        if endpoint_ratio < MIN_LOCK_BOTTOM_RATIO:
+            return False, "waiting for gap endpoint to enter the near band"
         if self._old_tangent_world is not None:
             world_tangent = self._heading_offset + endpoint.tangent_deg
             turn = self._angle_difference(world_tangent, self._old_tangent_world)
@@ -761,6 +780,20 @@ class RouteTask:
             self._begin_search(now)
             return self._running(
                 now, STOP_COMMAND, "route heading lost; returning to search"
+            )
+        target_error = self._candidate_target_error(self._candidate, frame)
+        if abs(target_error) > PREALIGN_CENTER_ERROR:
+            self._stable_frames = 0
+            self._stable_last_sequence = frame.sequence
+            lateral = max(
+                -CENTER_MAX_LATERAL,
+                min(target_error * CENTER_LATERAL_GAIN, CENTER_MAX_LATERAL),
+            )
+            return self._running(
+                now,
+                MotionCommand(lateral=lateral),
+                "centering near gap endpoint before heading alignment",
+                self._candidate.detection,
             )
         aligned = abs(self._candidate.angle_deg) <= ALIGN_ANGLE_DEG
         if frame.sequence != self._stable_last_sequence:
@@ -1035,11 +1068,34 @@ class RouteTask:
         self._observe_candidate(frame, now)
 
         if self.state == BRIDGING:
-            ready, reason = self._candidate_ready(frame)
             bridge_elapsed = now - float(self._phase_started_at)
             # The raised camera can still see the route just left behind.
-            # Never stop the first crossing merely because that old fragment
-            # survives the generic candidate filter for three frames.
+            # Do not even accumulate confirmation history during clearance:
+            # real logs showed candidate_frames already at 15/26 when this
+            # phase ended, so the task immediately aligned to a far fragment.
+            if bridge_elapsed < BRIDGE_MIN_SECONDS:
+                observed = (
+                    self._candidate.detection
+                    if self._candidate is not None
+                    else None
+                )
+                self._candidate = None
+                self._candidate_frames = 0
+                self._candidate_seen_far = False
+                self._candidate_near = False
+                self._candidate_center = None
+                self._candidate_angle = None
+                self._candidate_last_at = None
+                self._candidate_last_sequence = None
+                return self._running(
+                    now,
+                    MotionCommand(forward=BRIDGE_FORWARD_SPEED),
+                    "crossing bounded blank; candidate history disabled "
+                    "during initial old-line clearance",
+                    observed,
+                )
+
+            ready, reason = self._candidate_ready(frame)
             if ready and bridge_elapsed >= BRIDGE_MIN_SECONDS:
                 self._start_align(now)
                 return self._running(
@@ -1052,8 +1108,6 @@ class RouteTask:
                 )
             message = "crossing bounded blank along old-route tangent"
             if self._candidate is not None:
-                if bridge_elapsed < BRIDGE_MIN_SECONDS:
-                    reason = "ignoring candidate during initial old-line clearance"
                 message = f"{message}; {reason}"
             return self._running(
                 now,

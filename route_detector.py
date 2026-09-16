@@ -28,6 +28,11 @@ MIN_FRAGMENT_MAJOR_PIXELS = 28.0
 # a physical endpoint.
 ENDPOINT_BORDER_PIXELS = 28
 MIN_ENDPOINT_BRANCH_PIXELS = 24.0
+# Steering at the farthest visible endpoint makes a connected corner look
+# sharper and earlier than it really is.  Follow a point this far along the
+# skeleton from the robot-side end instead; the far endpoint remains available
+# only for deciding whether the tape physically ends.
+CORNER_LOOKAHEAD_PIXELS = 65.0
 
 
 @dataclass(frozen=True)
@@ -331,6 +336,24 @@ class RouteVision:
                 item.point[1] - robot_end.point[1],
             ),
         )
+        skeleton = self._thin(component)
+        skeleton_y, skeleton_x = np.nonzero(skeleton)
+        if skeleton_x.size:
+            full_x = skeleton_x + left + local_x
+            full_y = skeleton_y + top + local_y
+            distances = np.hypot(
+                full_x - robot_end.point[0],
+                full_y - robot_end.point[1],
+            )
+            lookahead_index = int(
+                np.argmin(np.abs(distances - CORNER_LOOKAHEAD_PIXELS))
+            )
+            lookahead = (
+                int(full_x[lookahead_index]),
+                int(full_y[lookahead_index]),
+            )
+        else:
+            lookahead = far_end.point
         x, y, box_width, box_height = (
             local_x + left,
             local_y + top,
@@ -344,11 +367,11 @@ class RouteVision:
             confidence=1.0,
             box=(x, y, x + box_width, y + box_height),
         )
-        error = (far_end.point[0] - width / 2.0) / max(width / 2.0, 1.0)
+        error = (lookahead[0] - width / 2.0) / max(width / 2.0, 1.0)
         return RoutePathObservation(
             True,
             endpoint=far_end,
-            lookahead_point=far_end.point,
+            lookahead_point=lookahead,
             error=float(error),
             detection=detection,
         )
