@@ -15,7 +15,6 @@ from dataclasses import dataclass, replace
 from enum import Enum
 from typing import Callable, FrozenSet, Iterable, Optional, Sequence, Tuple
 
-import cv2
 import numpy as np
 
 from config import CONFIG
@@ -85,7 +84,7 @@ class NumberMarkerConfig:
     pitch_direction_sign: float = PITCH_FOLLOW_SIGN
     max_pitch_integration_dt: float = MAX_PITCH_INTEGRATION_DT
     max_evidence_attempts: int = 1
-    team_number: Optional[str] = None
+    team_number: Optional[str] = "03"
 
 
 @dataclass(frozen=True)
@@ -340,24 +339,6 @@ def compute_aim_intent(
     )
 
 
-def render_evidence_image(request: EvidenceRequest) -> np.ndarray:
-    """Annotate a copy while preserving the complete original camera scene."""
-
-    shown = request.image.copy()
-    left, top, right, bottom = request.detection.box
-    cv2.rectangle(shown, (left, top), (right, bottom), (0, 255, 255), 2)
-    font = cv2.FONT_HERSHEY_SIMPLEX
-    scale = 0.55
-    thickness = 2
-    (text_width, text_height), _ = cv2.getTextSize(
-        request.annotation, font, scale, thickness
-    )
-    x = max(0, min(shown.shape[1] - text_width, request.text_anchor[0] - text_width // 2))
-    y = max(text_height, min(shown.shape[0] - 1, request.text_anchor[1]))
-    cv2.putText(shown, request.annotation, (x, y), font, scale, (0, 255, 255), thickness)
-    return shown
-
-
 class NumberMarkerTask:
     """Non-blocking Final number-marker state machine."""
 
@@ -478,7 +459,11 @@ class NumberMarkerTask:
 
         with self._observation_lock:
             request = self._active_evidence
-            if request is None or request.request_id != request_id:
+            if (
+                request is None
+                or request.request_id != request_id
+                or self._evidence_outcome is not None
+            ):
                 return False
             if saved:
                 self.saved_ids.add(request.marker_id)
@@ -563,6 +548,15 @@ class NumberMarkerTask:
         self._target_pitch = None
         self._last_step_at = None
 
+    def _clear_terminal_transients(self) -> None:
+        """End this task's pitch/evidence state without touching coordinator ownership."""
+
+        self._reset_pitch_tracking()
+        with self._observation_lock:
+            self._active_evidence = None
+            self._queued_evidence = None
+            self._evidence_outcome = None
+
     def step(self, frame: FramePacket, now: float) -> TaskUpdate:
         """Run one bounded state transition for the current shared frame."""
 
@@ -575,7 +569,7 @@ class NumberMarkerTask:
 
         if self._started_at is not None and now - self._started_at > self.settings.max_task_seconds:
             self.state = MarkerState.FAILED
-            self._reset_pitch_tracking()
+            self._clear_terminal_transients()
             return TaskUpdate(
                 TaskStatus.FAILED,
                 motion=MotionCommand(),
@@ -614,7 +608,7 @@ class NumberMarkerTask:
             self.state = MarkerState.TARGET_TOO_SMALL
             if self._target_id is not None:
                 self.state = MarkerState.FAILED
-                self._reset_pitch_tracking()
+                self._clear_terminal_transients()
                 return TaskUpdate(
                     TaskStatus.FAILED,
                     motion=MotionCommand(),
@@ -677,7 +671,7 @@ class NumberMarkerTask:
         self.aimed_ids.add(candidate.target_id)
         if not self.settings.team_number:
             self.state = MarkerState.FAILED
-            self._reset_pitch_tracking()
+            self._clear_terminal_transients()
             return TaskUpdate(
                 TaskStatus.FAILED,
                 motion=MotionCommand(),
@@ -718,7 +712,7 @@ class NumberMarkerTask:
             self._lost_since = now
         if now - self._lost_since > self.settings.target_lost_timeout:
             self.state = MarkerState.FAILED
-            self._reset_pitch_tracking()
+            self._clear_terminal_transients()
             return TaskUpdate(
                 TaskStatus.FAILED,
                 motion=MotionCommand(),
@@ -737,7 +731,7 @@ class NumberMarkerTask:
             outcome = self._evidence_outcome
         if outcome is True:
             self.state = MarkerState.COMPLETED
-            self._reset_pitch_tracking()
+            self._clear_terminal_transients()
             return TaskUpdate(
                 TaskStatus.COMPLETED,
                 motion=MotionCommand(),
@@ -746,7 +740,7 @@ class NumberMarkerTask:
             )
         if outcome is False:
             self.state = MarkerState.FAILED
-            self._reset_pitch_tracking()
+            self._clear_terminal_transients()
             return TaskUpdate(
                 TaskStatus.FAILED,
                 motion=MotionCommand(),
@@ -801,7 +795,7 @@ class NumberMarkerTask:
         self.last_aim_intent = None
         if active:
             self.state = MarkerState.FAILED
-            self._reset_pitch_tracking()
+            self._clear_terminal_transients()
             return TaskUpdate(
                 TaskStatus.FAILED,
                 motion=MotionCommand(),
@@ -826,8 +820,4 @@ class NumberMarkerTask:
         self._lost_since = None
         self._stable_frames = 0
         self._last_centered_sequence = None
-        self._reset_pitch_tracking()
-        with self._observation_lock:
-            self._active_evidence = None
-            self._queued_evidence = None
-            self._evidence_outcome = None
+        self._clear_terminal_transients()
