@@ -92,7 +92,7 @@ A6            两条分支**只有一条**有车 → 走另一条；**两条都�
               停车报失败（或走 `fallback_branch`）；**两条都没有车** → 这不是
               "无拥堵岔路"场景 → **不接管**（`require_blockage_to_trigger`），
               把控制权留给巡线 / 6 号，避免无谓地在场地中间停车。
-A7            选路是一段有限动作：DECIDE（原地等判据）→ APPROACH（对准）→
+A7            选路是**闭环**有限动作：DECIDE（原地等判据）→ APPROACH（对准）→
               TURN（有限转向）→ EXIT（直行离开），每段都有独立超时，
               总时长不超过 `max_task_seconds`（远小于骨架 20 s 硬上限）。
 A8            转向符号沿用项目约定：**yaw 正值右转、负值左转**。
@@ -291,6 +291,12 @@ class FreeJunctionConfig:
     #: 真车实测：只按时间转固定角度会出现"原地多转几十度"；而线一旦回到车头
     #: 正前方，就说明已经拐进分支了，不必把剩下的角度转满。
     turn_min_seconds: float = 0.5
+    #: 闭环转向的增益：yaw = 增益 × 胶带偏移（-1..1），再限幅到 `turn_yaw`。
+    #: 看得到胶带就朝它转、越接近中央转得越慢；看不到才按选定方向满速转。
+    turn_steer_gain: float = 90.0
+    #: EXIT 阶段顺线修正的增益（比转向温柔）：交回巡线时车头尽量正对着线，
+    #: 免得"拐是拐过去了，但斜着出线"导致底座拿不到有效线（2026-09-16 真车症状）。
+    exit_steer_gain: float = 45.0
     #: "线回到画面中央"的容差（相对画面宽度）与需要的连续帧数。
     center_tolerance_ratio: float = 0.18
     center_confirm_frames: int = 2
@@ -640,22 +646,20 @@ class VehicleDetector:
             )
         return mask
 
-    def detect(
-        self, region: Optional[np.ndarray], line: Optional[np.ndarray] = None
-    ) -> Tuple[bool, float, Optional[Tuple[int, int, int, int]]]:
-        """返回 (这段走廊里有没有车, 证据强度 0~1, 外接框或 None)。"""
+    def build_mask(self, region: np.ndarray) -> np.ndarray:
+        """把一块区域一次算成"可能是车"的掩码（两个判据按开关组合）。
+
+        左右两条走廊共用同一块区域，所以**整块只算一次**再按分界线切开 ——
+        真车日志里曾经因为每侧各算一遍，step() 花了 31ms（预算 20ms）。
+        """
         settings = self.settings
         if region is None or region.size == 0:
-            return False, 0.0, None
+            return np.zeros((0, 0), np.uint8)
         height, width = region.shape[:2]
-        if height < 8 or width < 8:
-            return False, 0.0, None
-
-        if line is None:
-            # 调用方没给蓝带掩码时自己算一遍（用的还是同一套 HSV，见 _blue_mask）。
-            line = _blue_mask(region, settings)
-
         mask = np.zeros((height, width), np.uint8)
+        if height < 8 or width < 8:
+            return mask
+        line = _blue_mask(region, settings)
         # 判据一（默认）：大尺度局部对比度。判据二（默认关）：Canny 结构。
         if settings.use_local_contrast:
             mask = cv2.bitwise_or(mask, self.contrast_mask(region, line))
@@ -663,7 +667,17 @@ class VehicleDetector:
             mask = cv2.bitwise_or(mask, self.structure_mask(region, line))
         if settings.use_color_ranges:
             mask = cv2.bitwise_or(mask, self.color_mask(region))
-        if not bool(np.any(mask)):
+        return mask
+
+    def pick(
+        self, mask: np.ndarray, region: np.ndarray
+    ) -> Tuple[bool, float, Optional[Tuple[int, int, int, int]]]:
+        """在掩码里挑一个"像车"的外接框（形状闸门 + 肤色剔除）。"""
+        settings = self.settings
+        if mask is None or mask.size == 0 or region is None:
+            return False, 0.0, None
+        height, width = mask.shape[:2]
+        if height < 8 or width < 8 or not bool(np.any(mask)):
             return False, 0.0, None
 
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -682,8 +696,20 @@ class VehicleDetector:
             return False, 0.0, None
         score, box = best
         x, y, box_width, box_height = box
-        absolute = (int(x), int(y), int(x + box_width), int(y + box_height))
-        return True, round(float(score), 3), absolute
+        return True, round(float(score), 3), (
+            int(x), int(y), int(x + box_width), int(y + box_height)
+        )
+
+    def detect(
+        self, region: Optional[np.ndarray], line: Optional[np.ndarray] = None
+    ) -> Tuple[bool, float, Optional[Tuple[int, int, int, int]]]:
+        """返回 (这块区域里有没有车, 证据强度 0~1, 外接框或 None)。
+
+        `line` 参数只为兼容旧调用保留；现在蓝带掩码在 `build_mask` 里自己算。
+        """
+        if region is None or region.size == 0:
+            return False, 0.0, None
+        return self.pick(self.build_mask(region), region)
 
     def _skin_mask(self, region: np.ndarray) -> np.ndarray:
         hsv = cv2.cvtColor(region, cv2.COLOR_BGR2HSV)
@@ -903,10 +929,10 @@ class FreeJunctionTask:
         left_region = region[:, :divider]
         right_region = region[:, divider:]
 
-        # 蓝带掩码由 VehicleDetector 在这个区域里自己算（同一套 HSV），
-        # 这样"抹掉胶带"用的是本区域的掩码，不会张冠李戴。
-        left_blocked, left_score, left_box = self.vehicle.detect(left_region)
-        right_blocked, right_score, right_box = self.vehicle.detect(right_region)
+        # 整块区域**只算一次**掩码，再按分界线切开给左右两侧用（省一半时间）。
+        mask = self.vehicle.build_mask(region)
+        left_blocked, left_score, left_box = self.vehicle.pick(mask[:, :divider], left_region)
+        right_blocked, right_score, right_box = self.vehicle.pick(mask[:, divider:], right_region)
 
         if left_blocked and right_blocked:
             reading = BLOCKAGE_BOTH
@@ -1079,9 +1105,18 @@ class FreeJunctionTask:
         if self.state is JunctionState.TURN:
             if self._elapsed(now) >= settings.turn_timeout:
                 return self._fail(now, "turn timed out")
-            # 线已经回到车头正前方 → 说明已经拐进分支了，不必把剩下的角度转满。
-            # （真车实测：只按时间转，会把车在原地多拧几十度，然后停住。）
-            self._center_count = self._center_count + 1 if self._tape_centered() else 0
+            # **闭环转向**：盯住"车头正前方那条胶带"，朝它转；它回到中央就收工。
+            # 不再"按秒表转固定角度"——真车实测那样会转过头：2026-09-16 17:26
+            # 那次转了约 50°，而岔路实际角度小得多，出线之后底座接不回来。
+            offset = self._turn_offset(fork)
+            if offset is None:
+                # 还看不到单条胶带（车还压在岔路口上）：按选定方向继续转，
+                # 但**时间兜底照样要管**（否则会一路转到 turn_timeout 才失败）。
+                self._center_count = 0
+            elif abs(offset) <= float(settings.center_tolerance_ratio):
+                self._center_count += 1
+            else:
+                self._center_count = 0
             centered = self._center_count >= max(1, int(settings.center_confirm_frames))
             if self._elapsed(now) >= settings.turn_seconds:
                 self._enter(JunctionState.EXIT, now)
@@ -1131,16 +1166,35 @@ class FreeJunctionTask:
                 ),
             )
         if self.state is JunctionState.TURN:
-            yaw = settings.turn_yaw * self._branch_sign()
+            # 闭环：看得到岔路就朝"选中那条分支"转，岔路没了就朝车头前的胶带转；
+            # 越接近正前方转得越慢，到中央就收工。
+            offset = self._turn_offset(self.last_detection)
+            if offset is None:
+                yaw = settings.turn_yaw * self._branch_sign()
+            else:
+                yaw = _clamp(
+                    settings.turn_steer_gain * offset,
+                    -settings.turn_yaw,
+                    settings.turn_yaw,
+                )
             return MotionCommand(
                 forward=_clamp(settings.turn_forward, 0.0, settings.max_forward),
                 lateral=0.0,
                 yaw=_clamp(yaw, -settings.max_yaw, settings.max_yaw),
             )
+        # EXIT：直行离开岔路口；看得到胶带就**轻轻顺一下**，保证交回时车正对着线。
+        offset = self._tape_offset()
+        yaw = 0.0
+        if offset is not None:
+            yaw = _clamp(
+                settings.exit_steer_gain * offset,
+                -settings.max_approach_yaw,
+                settings.max_approach_yaw,
+            )
         return MotionCommand(
             forward=_clamp(settings.exit_forward, 0.0, settings.max_forward),
             lateral=0.0,
-            yaw=0.0,
+            yaw=_clamp(yaw, -settings.max_yaw, settings.max_yaw),
         )
 
     def _approach_yaw(self) -> float:
@@ -1175,34 +1229,51 @@ class FreeJunctionTask:
             return True
         return self._last_blue_ratio >= self.settings.min_blue_ratio
 
-    def _tape_centered(self) -> bool:
-        """车头正前方（画面中央、ROI 底部那一条）是不是又只有一条线了？
+    def _tape_offset(self) -> Optional[float]:
+        """车头正前方那条胶带偏了多少：-1 = 最左，0 = 正中，+1 = 最右。
 
-        用来判断"已经拐进分支"，好让 TURN 提前收工 —— 只在**已经转够
-        `turn_min_seconds`** 并且连续 `center_confirm_frames` 帧满足时才算。
-        要求三件事：
-
-        * ROI 底部那一小条里有蓝线；
-        * 那一条上**只有一段**线（出现两段说明车还压在岔路口上）；
-        * 这一段的中心离画面中线不超过 `center_tolerance_ratio` × 画面宽度。
+        只算 ROI 底部那一小条，而且必须**只有一段**（出现两段说明车还压在岔路口上）。
+        看不到、或不止一段 → 返回 None。
         """
         line = self._last_line_mask
         if line is None:
-            return False
+            return None
         height, width = line.shape[:2]
         if height <= 0 or width <= 0:
-            return False
-        band_top = int(height * 0.75)
-        band = line[band_top:, :]
+            return None
+        band = line[int(height * 0.75):, :]
         if band.size == 0:
-            return False
-        row = band[band.shape[0] // 2]
-        runs = _row_runs(row, self.settings.merge_gap_px, self.settings.min_run_px)
+            return None
+        runs = _row_runs(
+            band[band.shape[0] // 2], self.settings.merge_gap_px, self.settings.min_run_px
+        )
         if len(runs) != 1:
-            return False
+            return None
         center = (runs[0][0] + runs[0][1]) / 2.0
-        tolerance = float(self.settings.center_tolerance_ratio) * width
-        return abs(center - width / 2.0) <= tolerance
+        half = max(1.0, width / 2.0)
+        return (center - width / 2.0) / half
+
+    def _turn_offset(self, fork: Optional[ForkDetection]) -> Optional[float]:
+        """转弯阶段"还要往哪边转多少"（-1..1）。
+
+        * 还看得见岔路 → 用**选中那条分支**的偏角（分支还没摆到正前方就继续转）；
+        * 岔路已经从画面里消失 → 用**车头前方那条胶带**的偏移（这时它就是分支的胶带）。
+
+        为什么不能只看胶带：刚进转弯时车头前面那条是**主干**，正的、就在中央，
+        只按它判会得出"已经对齐"→ 根本不转（2026-09-16 本地测试踩出来过）。
+        """
+        if fork is not None and fork.valid and fork.frame_width > 0:
+            target = fork.left_x if self.chosen_branch is Branch.LEFT else fork.right_x
+            half = max(1.0, fork.frame_width / 2.0)
+            return (float(target) - fork.frame_width / 2.0) / half
+        return self._tape_offset()
+
+    def _tape_centered(self) -> bool:
+        """那条胶带是不是已经回到画面中央附近（用来判断"已经拐进分支"）。"""
+        offset = self._tape_offset()
+        if offset is None:
+            return False
+        return abs(offset) <= float(self.settings.center_tolerance_ratio)
 
     def _fork_gone(self, fork: ForkDetection) -> bool:
         """分叉是否已经消失（说明车已经开进分支里了）。"""
