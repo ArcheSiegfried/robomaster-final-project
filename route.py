@@ -87,16 +87,17 @@ MAX_ENDPOINT_GAP_DISTANCE = 1.40
 MIN_LOCK_BRANCH_PIXELS = 100.0
 MIN_LOCK_BOTTOM_RATIO = 0.80
 ALIGN_ANGLE_DEG = 10.0
+CENTER_REALIGN_ANGLE_DEG = 18.0
 ALIGN_YAW_GAIN = 0.38
 ALIGN_MIN_YAW = 5.0
 ALIGN_MAX_YAW = 18.0
 DOCK_FORWARD_SPEED = 0.08
-DOCK_TARGET_ERROR = 0.13
+DOCK_TARGET_ERROR = 0.07
 DOCK_ANGLE_DEG = 25.0
 DOCK_MAX_YAW = 22.0
 CORNER_FORWARD_SPEED = 0.055
 CORNER_MAX_YAW = 38.0
-CENTER_TARGET_ERROR = 0.11
+CENTER_TARGET_ERROR = 0.04
 CENTER_LATERAL_GAIN = 0.16
 CENTER_MAX_LATERAL = 0.12
 DOCK_LATERAL_GAIN = 0.12
@@ -106,6 +107,7 @@ RIGHT_ANGLE_MAX_DEG = 130.0
 MIN_CANDIDATE_ENDPOINT_Y_RATIO = 0.25
 HANDOFF_VIEW_TIMEOUT_SECONDS = 2.0
 MAX_INTEGRATION_STEP_SECONDS = 0.20
+LOCKED_TARGET_LOSS_SECONDS = 0.80
 
 
 class RouteTask:
@@ -464,7 +466,8 @@ class RouteTask:
         )
         self._candidate = selected
         if selected is None or selected.detection.center is None:
-            if (
+            target_locked = self.state in (CENTERING, DOCKING)
+            if not target_locked and (
                 self._candidate_last_at is None
                 or now - self._candidate_last_at >= FRAGMENT_LOSS_SECONDS
             ):
@@ -667,6 +670,26 @@ class RouteTask:
         )
 
     @staticmethod
+    def _candidate_axis_error(
+        candidate: RouteCandidate, frame: FramePacket
+    ) -> float:
+        """Near-field cross-track error of the fitted new-route axis."""
+        height, width = frame.image.shape[:2]
+        if candidate.line_point is None:
+            return RouteTask._candidate_target_error(candidate, frame)
+        x0, y0 = candidate.line_point
+        angle = radians(candidate.angle_deg)
+        vx = sin(angle)
+        vy = -cos(angle)
+        reference_y = height * 0.84
+        axis_x = x0
+        if abs(vy) >= 0.25:
+            axis_x = x0 + (reference_y - y0) * vx / vy
+        return float(
+            (axis_x - width / 2.0) / max(width / 2.0, 1.0)
+        )
+
+    @staticmethod
     def _alignment_yaw(angle_deg: float) -> float:
         if abs(angle_deg) <= ALIGN_ANGLE_DEG:
             return 0.0
@@ -789,7 +812,7 @@ class RouteTask:
             return self._running(
                 now,
                 STOP_COMMAND,
-                "route heading aligned; centering gap endpoint",
+                "route heading aligned; centering fitted route axis",
                 self._candidate.detection,
             )
         yaw = self._alignment_yaw(self._candidate.angle_deg)
@@ -805,21 +828,21 @@ class RouteTask:
         if self._candidate is None:
             if (
                 self._candidate_last_at is not None
-                and now - self._candidate_last_at < FRAGMENT_LOSS_SECONDS
+                and now - self._candidate_last_at < LOCKED_TARGET_LOSS_SECONDS
             ):
                 return self._running(
-                    now, STOP_COMMAND, "route endpoint briefly missing; stopped"
+                    now, STOP_COMMAND, "locked route model briefly missing; stopped"
                 )
-            self._begin_search(now)
-            return self._running(
-                now, STOP_COMMAND, "route endpoint lost; returning to search"
+            return self._finish(
+                TaskStatus.FAILED,
+                "locked route model lost while centering",
             )
-        if abs(self._candidate.angle_deg) > ALIGN_ANGLE_DEG:
+        if abs(self._candidate.angle_deg) > CENTER_REALIGN_ANGLE_DEG:
             self._start_align(now)
             return self._running(
                 now, STOP_COMMAND, "heading drifted while centering; realigning"
             )
-        error = self._candidate_target_error(self._candidate, frame)
+        error = self._candidate_axis_error(self._candidate, frame)
         centered = abs(error) <= CENTER_TARGET_ERROR
         if frame.sequence != self._stable_last_sequence:
             self._stable_frames = self._stable_frames + 1 if centered else 0
@@ -827,7 +850,7 @@ class RouteTask:
         if self._stable_frames >= REACQUIRE_STABLE_FRAMES:
             self._start_docking(now)
             return self._running(
-                now, STOP_COMMAND, "gap endpoint centered; docking"
+                now, STOP_COMMAND, "fitted route axis centered; docking"
             )
         lateral = max(
             -CENTER_MAX_LATERAL,
@@ -836,7 +859,7 @@ class RouteTask:
         return self._running(
             now,
             MotionCommand(lateral=lateral),
-            f"centering gap endpoint {self._stable_frames}/"
+            f"centering fitted route axis {self._stable_frames}/"
             f"{REACQUIRE_STABLE_FRAMES}",
             self._candidate.detection,
         )
@@ -845,14 +868,14 @@ class RouteTask:
         if self._candidate is None:
             if (
                 self._candidate_last_at is not None
-                and now - self._candidate_last_at < FRAGMENT_LOSS_SECONDS
+                and now - self._candidate_last_at < LOCKED_TARGET_LOSS_SECONDS
             ):
                 return self._running(
-                    now, STOP_COMMAND, "final-approach route briefly missing; stopped"
+                    now, STOP_COMMAND, "locked route model briefly missing; stopped"
                 )
-            self._begin_search(now)
-            return self._running(
-                now, STOP_COMMAND, "final-approach route lost; returning to search"
+            return self._finish(
+                TaskStatus.FAILED,
+                "locked route model lost during final approach",
             )
         if abs(self._candidate.angle_deg) > DOCK_ANGLE_DEG:
             self._start_align(now)
@@ -862,7 +885,7 @@ class RouteTask:
                 "route heading drifted; realigning before final approach",
                 self._candidate.detection,
             )
-        target_error = self._candidate_target_error(self._candidate, frame)
+        target_error = self._candidate_axis_error(self._candidate, frame)
         ready = self._candidate_near and abs(target_error) <= DOCK_TARGET_ERROR
         if frame.sequence != self._stable_last_sequence:
             self._stable_frames = self._stable_frames + 1 if ready else 0

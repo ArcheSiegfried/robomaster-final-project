@@ -80,6 +80,7 @@ class RouteCandidate:
     score: float
     endpoints: Tuple[RouteEndpoint, ...] = ()
     entry_endpoint: Optional[RouteEndpoint] = None
+    line_point: Optional[Tuple[float, float]] = None
 
 
 class RouteVision:
@@ -131,10 +132,11 @@ class RouteVision:
         points = contour.reshape(-1, 2).astype(np.float32)
         if len(points) < 2:
             return None
-        vx, vy, _, _ = cv2.fitLine(
-            points, cv2.DIST_L2, 0, 0.01, 0.01
+        vx, vy, x0, y0 = cv2.fitLine(
+            points, cv2.DIST_HUBER, 0, 0.01, 0.01
         ).reshape(-1)
         vx, vy = float(vx), float(vy)
+        x0, y0 = float(x0), float(y0)
         # The route tangent is undirected.  Prefer the direction that points
         # towards the top of the image, i.e. away from the robot.
         if vy > 0.0 or (abs(vy) < 1e-6 and vx < 0.0):
@@ -150,6 +152,7 @@ class RouteVision:
             angle,
             (int(round(upper[0])), int(round(upper[1]))),
             (int(round(lower[0])), int(round(lower[1]))),
+            (x0, y0),
         )
 
     @staticmethod
@@ -474,7 +477,7 @@ class RouteVision:
             geometry = self._line_geometry(contour)
             if geometry is None:
                 continue
-            angle, upper_local, lower_local = geometry
+            angle, upper_local, lower_local, line_point_local = geometry
             contour_x, contour_y, contour_width, contour_height = cv2.boundingRect(contour)
             component = np.zeros((contour_height, contour_width), dtype=np.uint8)
             shifted = contour.copy()
@@ -540,6 +543,10 @@ class RouteVision:
                     score=float(score),
                     endpoints=endpoints,
                     entry_endpoint=entry_endpoint,
+                    line_point=(
+                        float(line_point_local[0] + left),
+                        float(line_point_local[1] + top),
+                    ),
                 )
             )
 
