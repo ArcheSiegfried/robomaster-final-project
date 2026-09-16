@@ -20,16 +20,21 @@ from traffic_light import TrafficLightTask
 
 # 功能模块：一个文件 = 一个名额 = 一个人。顺序即接管优先级。
 #
-# 2026-09-16 按实车反馈调整：`number_marker` 从第 2 位降到第 5 位。它在实车上的表现
-# 是"看到了标识却不接管"（不拍照、不停车），却因为排在第 2 位而挡在岔路/红绿灯前面；
-# 先让真正会动作的模块先接管。它的诊断见 marker_source.stats() 的宽度字段。
+# 2026-09-16 按实车反馈调整（第二版，集成负责人确认）：
+#   红绿灯 → 红绿灯岔路 → 障碍物绕行 → 短线巡回 → 障碍物岔路 → 数字识别
+# 变化：`obstacle` 从第 6 位升到第 3 位（车前方的障碍必须先处理）；
+#       `free_junction` 从第 3 位降到第 5 位；
+#       `number_marker` 挪到最后（它目前在实车上"看到标识却不接管"，
+#       先让真正会动作的模块先接管；它的诊断见 marker_source.stats() 的宽度字段）。
+# 注意顺序的代价：`obstacle` 现在会优先于岔路/巡回/标识接管，
+# 而它的误触发率还不低（29 次运行里 26 帧被判成障碍），修判据之前要留意。
 MOTION_TASK_CLASSES = (
-    TrafficLightTask,  # 红灯是停车条件，最先判断
-    GreenJunctionTask,  # 绿灯岔路
-    FreeJunctionTask,  # 无拥堵岔路
-    RouteTask,  # 长断线巡回
-    NumberMarkerTask,  # 数字标识（2026-09-16 从第 2 位降到第 5 位）
-    ObstacleTask,  # 动作最复杂，放最后
+    TrafficLightTask,  # 1 红绿灯（红灯是停车条件，最先判断）
+    GreenJunctionTask,  # 2 红绿灯岔路
+    ObstacleTask,  # 3 障碍物绕行
+    RouteTask,  # 4 短线巡回
+    FreeJunctionTask,  # 5 障碍物岔路
+    NumberMarkerTask,  # 6 数字识别
 )
 
 # 基础设施观察者：每帧都能看到，但永远不能接管运动。
