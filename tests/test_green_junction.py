@@ -1114,7 +1114,11 @@ class TwoLampTests(unittest.TestCase):
 
     def test_adapter_splits_the_frame_into_left_and_right(self):
         class CropDetector:
-            """按调用顺序返回：第一刀（左半边）红、第二刀（右半边）绿。"""
+            """按调用顺序返回：第一刀（左半边）红、第二刀（右半边）绿。
+
+            注意 ``center`` 要按**传进来那张图**的坐标给（真检测器就是这样）：
+            适配器用灯的整幅图坐标归边（见 ``overlap`` 那段注释）。
+            """
 
             def __init__(self):
                 self.calls = 0
@@ -1124,7 +1128,7 @@ class TwoLampTests(unittest.TestCase):
                 return VisualDetection(
                     valid=True,
                     kind="traffic_light",
-                    center=(10, 10),
+                    center=(image.shape[1] // 2, image.shape[0] // 2),
                     color="red" if self.calls == 1 else "green",
                 )
 
@@ -1145,7 +1149,10 @@ class TwoLampTests(unittest.TestCase):
                 self.calls += 1
                 if self.calls == 1:
                     return VisualDetection(
-                        valid=True, kind="traffic_light", center=(10, 10), color="green"
+                        valid=True,
+                        kind="traffic_light",
+                        center=(image.shape[1] // 2, image.shape[0] // 2),
+                        color="green",
                     )
                 raise RuntimeError("右半边炸了")
 
@@ -1153,6 +1160,23 @@ class TwoLampTests(unittest.TestCase):
         self.assertEqual(len(readings), 1)
         self.assertIs(readings[0].color, LightColor.GREEN)
         self.assertIs(readings[0].branch, Branch.LEFT)
+
+    def test_adapter_reads_a_lamp_sitting_on_the_split_line(self):
+        """灯正好骑在切分线上时也必须认出来（整合侧接线测试就是这么摆的）。
+
+        硬按 0.5 裁、不留重叠的话，这盏灯在半幅图里会掉到 3 号 ROI 外面
+        （形状判据直接丢掉），于是"绿灯亮着却不接管"。
+        """
+        from traffic_light import TrafficLightDetector
+
+        image = approach_frame()
+        # 3 号那盏灯的位置：x=300..380，正好跨过画面中心 320。
+        cv2.rectangle(image, (300, 80), (380, 160), (0, 255, 0), -1)
+        probe = make_two_lamp_probe(TrafficLightDetector(), min_confidence=0.40)
+        readings = probe(packet(image, 1, 0.0), 0.0)
+        self.assertEqual(len(readings), 1, "骑在切分线上的灯应该只算一盏")
+        self.assertIs(readings[0].color, LightColor.GREEN)
+        self.assertIs(readings[0].branch, Branch.RIGHT, "灯中心在 320 右边 → 右分支")
 
     def test_adapter_with_no_lamps_returns_nothing(self):
         readings = make_two_lamp_probe(lambda image: None)(packet(approach_frame(), 1, 0.0), 0.0)

@@ -352,18 +352,36 @@ def _packet_like(frame, image: np.ndarray) -> FramePacket:
     )
 
 
+def _value_center(value):
+    """从别人给的读数里挖出 ``(x, y)``（相对于**传进去的那张图**）；没有就返回 ``None``。"""
+    if value is None or isinstance(value, (str, bytes)):
+        return None
+    inner = getattr(value, "detection", None)
+    if inner is not None:
+        return _value_center(inner)
+    centre = getattr(value, "center", None)
+    if isinstance(centre, (tuple, list)) and len(centre) >= 1:
+        try:
+            x = float(centre[0])
+            y = float(centre[1]) if len(centre) > 1 else 0.0
+        except (TypeError, ValueError):
+            return None
+        return x, y
+    return None
+
+
 def make_two_lamp_probe(
     source,
     split: float = 0.5,
     min_confidence: float = 0.0,
+    overlap: float = 0.08,
 ) -> LightProbe:
     """左右各问一次，返回**两盏灯的读数列表**（A15：一边红一边绿）。
 
     为什么需要它：本关卡在岔路口**两边各放一盏灯**（灯立在路边），而 3 号的
     ``TrafficLightDetector.detect()`` 整帧只挑**一盏得分最高的**，并且
     ``red_priority=True`` —— 两盏同时可见时它只会报红，直接用就会让车
-    "看到绿灯也不走"。这里改成把画面竖着切一刀，左右半边各问一次检测器，
-    再把读数按"来自哪一半"翻成左/右分支（A13）：
+    "看到绿灯也不走"。这里改成左右各问一次检测器，再把读数归到左/右分支：
 
     ```python
     from green_junction import make_two_lamp_probe
@@ -372,12 +390,25 @@ def make_two_lamp_probe(
     GreenJunctionTask(light_probe=make_two_lamp_probe(TrafficLightDetector()))
     ```
 
-    返回的是 ``[LightReading, ...]``（可能有 0、1 或 2 盏）；
-    ``split`` 是切分位置（占画面宽度的比例，默认 0.5）。
-    某一半里看不懂 / 抛异常，只丢那一半，不影响另一半。
+    实现上的三个坑（都在这台机器上实测过）：
+
+    * ``split``：切分位置（占画面宽度的比例，默认 0.5）；
+    * ``overlap``：两半之间留的重叠（默认 0.08），**必须有** —— 3 号的 ROI 是
+      按"传进去的那张图"算的，硬按 0.5 裁的话，正好骑在切分线附近的灯会掉到
+      半幅 ROI 外面、形状判据直接把它丢掉（整合侧 `test_green_junction_wiring.py`
+      里那盏 x=300..380 的灯就是这么丢的）。留一点重叠，两边都能看到它；
+    * 归边用灯的**整幅图坐标**（不是"它来自哪一半"）：整幅 x < 切分线 → 左，
+      否则右；同一侧、同一颜色的重复读数按置信度去重。
+
+    ``split`` 在实车上怎么定：用配套工具 ``green_junction_selftest.py --captures``
+    看"左/右灯"那一列（打的就是这个探针的结果）。
+
+    返回 ``[LightReading, ...]``（0／1／2 盏都合法）；某一半看不懂 / 抛异常，
+    只丢那一半，不影响另一半。
     """
     kind, reader = _resolve_light_source(source)
     ratio = min(max(float(split), 0.05), 0.95)
+    span = min(max(float(overlap), 0.0), 0.45)
 
     def probe(frame, now) -> List[LightReading]:
         image = _frame_image(frame)
@@ -388,8 +419,16 @@ def make_two_lamp_probe(
             return []
         cut = int(round(width * ratio))
         cut = max(1, min(width - 1, cut))
-        readings: List[LightReading] = []
-        for side, crop in ((Branch.LEFT, image[:, :cut]), (Branch.RIGHT, image[:, cut:])):
+        margin = int(round(width * span))
+        windows = (
+            (0, max(1, min(width, cut + margin))),
+            (max(0, min(width - 1, cut - margin)), width),
+        )
+        kept = {}
+        for start, stop in windows:
+            crop = image[:, start:stop]
+            if crop.size == 0:
+                continue
             try:
                 if kind in ("detect", "image"):
                     value = reader(crop)
@@ -397,12 +436,25 @@ def make_two_lamp_probe(
                     value = reader(_packet_like(frame, crop), now)
             except Exception:
                 continue
+            centre = _value_center(value)
+            if centre is not None:
+                full_x = start + centre[0]
+            else:
+                # 读数不带位置：按这一半自己的中心算（左半 → 左，右半 → 右）。
+                full_x = (start + stop) / 2.0
+            side = Branch.LEFT if full_x < cut else Branch.RIGHT
             for item in _as_readings(value, None, False, min_confidence):
-                # 半幅图里算出来的左右没有意义：直接按"它来自哪一半"定边（A13/A15）。
-                readings.append(
-                    LightReading(color=item.color, branch=side, confidence=item.confidence)
+                reading = LightReading(
+                    color=item.color, branch=side, confidence=item.confidence
                 )
-        return readings
+                key = (side, item.color)
+                previous = kept.get(key)
+                if previous is None or reading.confidence > previous.confidence:
+                    kept[key] = reading
+        order = {Branch.LEFT: 0, Branch.RIGHT: 1}
+        return sorted(
+            kept.values(), key=lambda item: (order.get(item.branch, 2), -item.confidence)
+        )
 
     return probe
 
