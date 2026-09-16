@@ -188,9 +188,14 @@ class ConsoleStatus:
     """
 
     def __init__(self, stream=None, heartbeat_interval: float = 2.0,
-                 enabled: bool = True) -> None:
+                 enabled: bool = True, task_heartbeat_interval: float = 0.5,
+                 task_order=()) -> None:
         self.stream = stream
         self.heartbeat_interval = float(heartbeat_interval)
+        #: 有模块接管时用更快的节奏：调优先级时要看得出"此刻谁在跑、跑了多久"。
+        self.task_heartbeat_interval = float(task_heartbeat_interval)
+        #: 注册表顺序 = 撞车时的裁判顺序。用来告诉操作员"谁没被轮到"。
+        self.task_order = tuple(task_order or ())
         self.enabled = bool(enabled)
         self.started_at = None
         self.frames = 0
@@ -198,6 +203,7 @@ class ConsoleStatus:
         self._line_state = None
         self._coordinator_state = None
         self._task_name = None
+        self._task_started_at = None
         self._lost_since = None
         self._last_heartbeat = None
         self._errors: tuple = ()
@@ -222,6 +228,17 @@ class ConsoleStatus:
             pass
 
     # -- 内部 ----------------------------------------------------------
+    def _modules_after(self, name):
+        """排在赢家后面、这一帧根本没被问到的模块（调优先级用）。
+
+        协调器按注册表顺序依次问，遇到第一个返回 RUNNING 的模块就接管，所以
+        排在它后面的模块这一帧不会被调用。这个信息是免费的——不需要额外问任何模块。
+        """
+        order = list(self.task_order)
+        if not name or name not in order:
+            return []
+        return order[order.index(name) + 1:]
+
     def _say(self, now: float, text: str) -> None:
         if self.started_at is None:
             stamp = 0.0
@@ -247,18 +264,34 @@ class ConsoleStatus:
             previous, self._coordinator_state = self._coordinator_state, state
             message = str(getattr(decision, "message", "") or "")
             if state == TASK_ACTIVE:
+                self._task_started_at = now
                 self._say(
                     now,
                     ">> %s 接管：%s" % (name or self._task_name or "?", message),
                 )
+                not_asked = self._modules_after(name or self._task_name)
+                if not_asked:
+                    # 协调器按注册表顺序问，遇到第一个 RUNNING 就停：排在它后面的
+                    # 这些模块这一帧根本没被问过。这就是"优先级被截断"的位置。
+                    self._say(
+                        now,
+                        "   优先级截断：排在它后面、这一帧没被问到的模块 → %s"
+                        % ", ".join(not_asked),
+                    )
             elif state == RELEASING and previous == TASK_ACTIVE:
                 update = getattr(decision, "task_update", None)
                 status = getattr(getattr(update, "status", None), "name", None)
                 self._say(
                     now,
-                    "<< %s 结束（%s）：%s"
-                    % (self._task_name or "?", status or "-", message),
+                    "<< %s 结束（%s，共 %.1fs）：%s"
+                    % (
+                        self._task_name or "?",
+                        status or "-",
+                        max(0.0, now - (self._task_started_at or now)),
+                        message,
+                    ),
                 )
+                self._task_started_at = None
             elif state == LINE_FOLLOWING and previous == RELEASING:
                 self._say(now, "巡线恢复")
             if state != LINE_FOLLOWING:
@@ -289,9 +322,16 @@ class ConsoleStatus:
         if self._last_heartbeat is None:
             # 第一帧不打心跳：启动横幅已经说明"还活着"，再打一行是噪音。
             self._last_heartbeat = now
-        elif now - self._last_heartbeat >= self.heartbeat_interval:
-            self._last_heartbeat = now
-            self._say(now, self._heartbeat_text(decision, now))
+        else:
+            # 有模块在接管时用更快的节奏：调优先级时要看得出"此刻谁在跑、跑了多久"。
+            interval = (
+                self.task_heartbeat_interval
+                if self._coordinator_state == TASK_ACTIVE
+                else self.heartbeat_interval
+            )
+            if now - self._last_heartbeat >= interval:
+                self._last_heartbeat = now
+                self._say(now, self._heartbeat_text(decision, now))
 
     def _heartbeat_text(self, decision, now: float) -> str:
         bits = [
@@ -302,7 +342,13 @@ class ConsoleStatus:
         if state == "LINE_LOST" and self._lost_since is not None:
             state += "（已丢线 %.1fs）" % max(0.0, now - self._lost_since)
         bits.append("巡线 %s" % state)
-        bits.append("任务 %s" % (getattr(decision, "task_name", None) or self._task_name or "无"))
+        task_name = getattr(decision, "task_name", None) or self._task_name or "无"
+        if getattr(decision, "state", None) == TASK_ACTIVE and self._task_started_at is not None:
+            bits.append(
+                "任务 %s 已 %.1fs" % (task_name, max(0.0, now - self._task_started_at))
+            )
+        else:
+            bits.append("任务 %s" % task_name)
         if getattr(decision, "state", None) == TASK_ACTIVE:
             command = decision.command
             bits.append(
@@ -479,6 +525,8 @@ def main(
         console = ConsoleStatus(
             heartbeat_interval=CONFIG.console_heartbeat_seconds,
             enabled=CONFIG.console_status,
+            task_heartbeat_interval=CONFIG.console_task_heartbeat_seconds,
+            task_order=tuple(task.name for task in coordinator.motion_tasks),
         )
         sink = _find_evidence_sink(coordinator)
         run_directory = getattr(sink, "run_directory", None)

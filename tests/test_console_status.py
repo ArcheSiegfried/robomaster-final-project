@@ -100,7 +100,8 @@ class ConsoleStatusTests(unittest.TestCase):
             1.5,
         )
         self.assertIn(">> number_marker 接管", self.text)
-        self.assertIn("<< number_marker 结束（COMPLETED）", self.text)
+        self.assertIn("<< number_marker 结束（COMPLETED", self.text)
+        self.assertIn("共 ", self.text, "结束行要写出这个模块一共接管了多久")
 
     def test_errors_and_clamping_are_shown(self):
         self.console.update(
