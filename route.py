@@ -91,8 +91,13 @@ CENTER_REALIGN_ANGLE_DEG = 18.0
 ALIGN_YAW_GAIN = 0.38
 ALIGN_MIN_YAW = 5.0
 ALIGN_MAX_YAW = 18.0
-ALIGN_VISIBILITY_GAIN = 0.12
-ALIGN_MAX_LATERAL = 0.07
+# After the raised view identifies which side contains the new route, lower
+# the camera and commit to a substantial turn before asking the near-field
+# line detector to judge alignment.  This avoids stopping after only a few
+# degrees because an old or peripheral fragment briefly enters the low view.
+ALIGN_BASE_ROTATION_DEG = 50.0
+ALIGN_ROTATE_SECONDS = 0.25
+ALIGN_INSPECT_SECONDS = 0.18
 DOCK_FORWARD_SPEED = 0.08
 DOCK_TARGET_ERROR = 0.07
 DOCK_ANGLE_DEG = 25.0
@@ -180,6 +185,9 @@ class RouteTask:
         self._search_target_index = 0
         self._old_tangent_world: Optional[float] = None
         self._corner_missing_at: Optional[float] = None
+        self._align_direction = 0.0
+        self._align_phase = ""
+        self._align_phase_started_at: Optional[float] = None
 
     @property
     def active(self) -> bool:
@@ -230,6 +238,9 @@ class RouteTask:
         self._search_target_index = 0
         self._old_tangent_world = None
         self._corner_missing_at = None
+        self._align_direction = 0.0
+        self._align_phase = ""
+        self._align_phase_started_at = None
         self.last_detection = VisualDetection.no_result(KIND)
         self._line_detector.reset()
 
@@ -641,6 +652,18 @@ class RouteTask:
         self._phase_started_at = now
         self._stable_frames = 0
         self._stable_last_sequence = None
+        if self._candidate is not None:
+            self._align_direction = (
+                1.0 if self._candidate.angle_deg > 0.0 else -1.0
+            )
+        elif self._align_direction == 0.0:
+            self._align_direction = self._search_direction
+        self._align_phase = "lower"
+        self._align_phase_started_at = now
+        # Purple recovery geometry has completed its one job: choosing the
+        # turn direction. Subsequent stopping is decided by the normal green
+        # line detector at the normal camera pitch.
+        self.last_detection = VisualDetection.no_result(KIND)
 
     def _start_centering(self, now: float) -> None:
         self.state = CENTERING
@@ -717,6 +740,19 @@ class RouteTask:
             TaskStatus.RUNNING,
             motion=STOP_COMMAND,
             detection=self.last_detection,
+            message=message,
+            gimbal=GimbalCommand(pitch=self._line_pitch, yaw=self._search_yaw),
+        )
+
+    def _line_view_motion(
+        self, now: float, motion: MotionCommand, message: str
+    ) -> TaskUpdate:
+        """Issue chassis motion while explicitly keeping the camera low."""
+        self._record_motion(motion, now)
+        return TaskUpdate(
+            TaskStatus.RUNNING,
+            motion=motion,
+            detection=VisualDetection.no_result(KIND),
             message=message,
             gimbal=GimbalCommand(pitch=self._line_pitch, yaw=self._search_yaw),
         )
@@ -800,47 +836,94 @@ class RouteTask:
             self._candidate.detection if self._candidate is not None else None,
         )
 
-    def _step_align(self, frame: FramePacket, now: float) -> TaskUpdate:
-        if self._candidate is None:
-            if (
-                self._candidate_last_at is not None
-                and now - self._candidate_last_at < LOCKED_TARGET_LOSS_SECONDS
-            ):
-                return self._running(
-                    now, STOP_COMMAND, "route heading briefly missing; stopped"
-                )
-            return self._finish(
-                TaskStatus.FAILED,
-                "locked route lost during alignment; stopped without rescan",
-            )
-        aligned = abs(self._candidate.angle_deg) <= ALIGN_ANGLE_DEG
-        if frame.sequence != self._stable_last_sequence:
-            self._stable_frames = self._stable_frames + 1 if aligned else 0
-            self._stable_last_sequence = frame.sequence
-        if self._stable_frames >= REACQUIRE_STABLE_FRAMES:
-            self._start_centering(now)
-            return self._running(
-                now,
-                STOP_COMMAND,
-                "route heading aligned; centering fitted route axis",
-                self._candidate.detection,
-            )
-        yaw = self._alignment_yaw(self._candidate.angle_deg)
-        # Small image-feedback visibility correction, not a metric move to
-        # the endpoint. A near-horizontal axis cannot be extrapolated safely
-        # to a bottom reference row, so use the tracked endpoint here.
-        visibility_error = self._candidate_target_error(self._candidate, frame)
-        lateral = max(
-            -ALIGN_MAX_LATERAL,
-            min(visibility_error * ALIGN_VISIBILITY_GAIN, ALIGN_MAX_LATERAL),
-        ) if abs(visibility_error) > CENTER_TARGET_ERROR else 0.0
-        return self._running(
-            now,
-            MotionCommand(lateral=lateral, yaw=yaw),
-            f"aligning with visibility correction {self._stable_frames}/"
-            f"{REACQUIRE_STABLE_FRAMES}",
-            self._candidate.detection,
+    def _step_align(self, line, frame: FramePacket, now: float) -> TaskUpdate:
+        """Turn onto the new route using only the lowered camera.
+
+        The raised-view candidate is deliberately not refreshed here.  It has
+        already supplied the turn direction; continuing to steer from that
+        purple geometry caused overshoot and target switching in real tests.
+        """
+        phase_started = (
+            now if self._align_phase_started_at is None
+            else self._align_phase_started_at
         )
+        elapsed = now - phase_started
+
+        if self._align_phase == "lower":
+            if elapsed < self._view_settle_seconds:
+                return self._line_view_running(
+                    now, "lowering camera before the committed turn"
+                )
+            self._align_phase = "base_rotate"
+            self._align_phase_started_at = now
+            self._stable_frames = 0
+            self._stable_last_sequence = None
+            elapsed = 0.0
+
+        if self._align_phase == "base_rotate":
+            base_seconds = ALIGN_BASE_ROTATION_DEG / max(ALIGN_MAX_YAW, 1.0)
+            if elapsed < base_seconds:
+                yaw = self._align_direction * ALIGN_MAX_YAW
+                return self._line_view_motion(
+                    now,
+                    MotionCommand(yaw=yaw),
+                    f"committed low-view turn {min(elapsed * ALIGN_MAX_YAW, ALIGN_BASE_ROTATION_DEG):.0f}/"
+                    f"{ALIGN_BASE_ROTATION_DEG:.0f}deg",
+                )
+            self._align_phase = "inspect"
+            self._align_phase_started_at = now
+            self._stable_frames = 0
+            self._stable_last_sequence = None
+            elapsed = 0.0
+
+        if self._align_phase == "inspect":
+            if frame.sequence != self._stable_last_sequence:
+                self._stable_frames = self._stable_frames + 1 if line.valid else 0
+                self._stable_last_sequence = frame.sequence
+            if self._stable_frames >= REACQUIRE_STABLE_FRAMES:
+                return self._finish(
+                    TaskStatus.COMPLETED,
+                    "normal line detector confirmed route after low-view turn",
+                )
+            if elapsed < ALIGN_INSPECT_SECONDS:
+                return self._line_view_running(
+                    now,
+                    f"stopped low-view line check {self._stable_frames}/"
+                    f"{REACQUIRE_STABLE_FRAMES}",
+                )
+            self._align_phase = "rotate"
+            self._align_phase_started_at = now
+            self._stable_frames = 0
+            self._stable_last_sequence = None
+            elapsed = 0.0
+
+        if self._align_phase == "rotate":
+            # If the green detector sees the route during a pulse, stop first;
+            # confirmation is then done on sharp, stationary frames.
+            if line.valid:
+                self._align_phase = "inspect"
+                self._align_phase_started_at = now
+                self._stable_frames = 1
+                self._stable_last_sequence = frame.sequence
+                return self._line_view_running(
+                    now, "green route appeared during turn; stopped to confirm"
+                )
+            if elapsed >= ALIGN_ROTATE_SECONDS:
+                self._align_phase = "inspect"
+                self._align_phase_started_at = now
+                self._stable_frames = 0
+                self._stable_last_sequence = None
+                return self._line_view_running(
+                    now, "incremental turn complete; checking green route"
+                )
+            yaw = self._align_direction * ALIGN_MAX_YAW
+            return self._line_view_motion(
+                now,
+                MotionCommand(yaw=yaw),
+                "incremental low-view turn",
+            )
+
+        return self._finish(TaskStatus.FAILED, "invalid low-view alignment phase")
 
     def _step_centering(self, frame: FramePacket, now: float) -> TaskUpdate:
         if self._candidate is None:
@@ -1091,7 +1174,11 @@ class RouteTask:
             self._candidate_angle = None
             self._candidate_last_sequence = None
 
-        self._observe_candidate(frame, now)
+        # The raised view is used only to find the far-route shape and choose
+        # a turn direction.  Once alignment starts, keep the camera low and
+        # let the normal green line detector decide when the turn is complete.
+        if self.state != ALIGNING:
+            self._observe_candidate(frame, now)
 
         if self.state == BRIDGING:
             bridge_elapsed = now - float(self._phase_started_at)
@@ -1146,7 +1233,7 @@ class RouteTask:
             return self._step_search(frame, now)
 
         if self.state == ALIGNING:
-            return self._step_align(frame, now)
+            return self._step_align(line, frame, now)
 
         if self.state == CENTERING:
             return self._step_centering(frame, now)
