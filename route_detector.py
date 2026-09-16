@@ -8,7 +8,7 @@ for recovery.  It has no camera or robot dependency.
 """
 
 from dataclasses import dataclass
-from math import atan2, degrees
+from math import atan2, degrees, hypot
 from typing import List, Optional, Tuple
 
 import cv2
@@ -22,6 +22,33 @@ SEARCH_ROI = (0.02, 0.02, 0.98, 0.99)
 BOTTOM_ROI = (0.04, 0.74, 0.96, 0.99)
 MIN_FRAGMENT_ELONGATION = 2.25
 MIN_FRAGMENT_MAJOR_PIXELS = 28.0
+# Skeleton endpoints sit roughly half a tape width inside a filled contour.
+# A wider margin therefore represents a component that actually touches the
+# image boundary; 12 px incorrectly labelled boundary-clipped 20 px tape as
+# a physical endpoint.
+ENDPOINT_BORDER_PIXELS = 28
+MIN_ENDPOINT_BRANCH_PIXELS = 24.0
+
+
+@dataclass(frozen=True)
+class RouteEndpoint:
+    """A skeleton end and the directed tangent going into its route branch."""
+
+    point: Tuple[int, int]
+    tangent_deg: float
+    internal: bool
+    branch_length: float
+
+
+@dataclass(frozen=True)
+class RoutePathObservation:
+    """Route component connected to the robot-side (bottom) image band."""
+
+    present: bool
+    endpoint: Optional[RouteEndpoint] = None
+    lookahead_point: Optional[Tuple[int, int]] = None
+    error: float = 0.0
+    detection: Optional[VisualDetection] = None
 
 
 @dataclass(frozen=True)
@@ -42,6 +69,8 @@ class RouteCandidate:
     lower_point: Tuple[int, int]
     elongation: float
     score: float
+    endpoints: Tuple[RouteEndpoint, ...] = ()
+    entry_endpoint: Optional[RouteEndpoint] = None
 
 
 class RouteVision:
@@ -120,6 +149,205 @@ class RouteVision:
         major = max(float(side_a), float(side_b))
         minor = max(min(float(side_a), float(side_b)), 1.0)
         return major / minor, major, minor
+
+    @staticmethod
+    def _thin(binary: np.ndarray, max_iterations: int = 80) -> np.ndarray:
+        """Zhang-Suen thinning implemented with NumPy (no contrib dependency)."""
+        image = (binary > 0).astype(np.uint8)
+        for _ in range(max_iterations):
+            changed = False
+            for phase in (0, 1):
+                padded = np.pad(image, 1)
+                p2 = padded[:-2, 1:-1]
+                p3 = padded[:-2, 2:]
+                p4 = padded[1:-1, 2:]
+                p5 = padded[2:, 2:]
+                p6 = padded[2:, 1:-1]
+                p7 = padded[2:, :-2]
+                p8 = padded[1:-1, :-2]
+                p9 = padded[:-2, :-2]
+                neighbours = p2 + p3 + p4 + p5 + p6 + p7 + p8 + p9
+                transitions = (
+                    ((p2 == 0) & (p3 == 1)).astype(np.uint8)
+                    + ((p3 == 0) & (p4 == 1)).astype(np.uint8)
+                    + ((p4 == 0) & (p5 == 1)).astype(np.uint8)
+                    + ((p5 == 0) & (p6 == 1)).astype(np.uint8)
+                    + ((p6 == 0) & (p7 == 1)).astype(np.uint8)
+                    + ((p7 == 0) & (p8 == 1)).astype(np.uint8)
+                    + ((p8 == 0) & (p9 == 1)).astype(np.uint8)
+                    + ((p9 == 0) & (p2 == 1)).astype(np.uint8)
+                )
+                if phase == 0:
+                    preserve_a = p2 * p4 * p6 == 0
+                    preserve_b = p4 * p6 * p8 == 0
+                else:
+                    preserve_a = p2 * p4 * p8 == 0
+                    preserve_b = p2 * p6 * p8 == 0
+                remove = (
+                    (image == 1)
+                    & (neighbours >= 2)
+                    & (neighbours <= 6)
+                    & (transitions == 1)
+                    & preserve_a
+                    & preserve_b
+                )
+                if np.any(remove):
+                    image[remove] = 0
+                    changed = True
+            if not changed:
+                break
+        return image
+
+    @staticmethod
+    def _endpoint_features(
+        component: np.ndarray,
+        offset: Tuple[int, int],
+        frame_shape: Tuple[int, int],
+    ) -> Tuple[RouteEndpoint, ...]:
+        skeleton = RouteVision._thin(component)
+        if not np.any(skeleton):
+            return ()
+        padded = np.pad(skeleton, 1)
+        count = np.zeros_like(skeleton, dtype=np.uint8)
+        for dy in range(3):
+            for dx in range(3):
+                if dx == 1 and dy == 1:
+                    continue
+                count += padded[dy:dy + skeleton.shape[0], dx:dx + skeleton.shape[1]]
+        endpoint_pixels = np.argwhere((skeleton == 1) & (count == 1))
+        if len(endpoint_pixels) == 0:
+            return ()
+
+        points = np.argwhere(skeleton == 1)
+        left, top = offset
+        frame_height, frame_width = frame_shape
+        features = []
+        # A local Euclidean neighbourhood is more stable than the first two
+        # skeleton pixels and remains cheap for the small route components.
+        tangent_radius = 30.0
+        for y, x in endpoint_pixels:
+            distances = np.hypot(points[:, 1] - x, points[:, 0] - y)
+            band = points[
+                (distances >= MIN_ENDPOINT_BRANCH_PIXELS)
+                & (distances <= tangent_radius)
+            ]
+            if len(band) == 0:
+                far_index = int(np.argmax(distances))
+                target_y, target_x = points[far_index]
+            else:
+                # Median suppresses one-pixel skeleton spurs around a bend.
+                target_y, target_x = np.median(band, axis=0)
+            dx = float(target_x - x)
+            dy = float(target_y - y)
+            branch_length = float(np.max(distances))
+            if branch_length < MIN_ENDPOINT_BRANCH_PIXELS:
+                continue
+            angle = degrees(atan2(dx, max(-dy, 1e-6)))
+            while angle > 180.0:
+                angle -= 360.0
+            while angle <= -180.0:
+                angle += 360.0
+            full_x = int(x + left)
+            full_y = int(y + top)
+            internal = (
+                ENDPOINT_BORDER_PIXELS <= full_x < frame_width - ENDPOINT_BORDER_PIXELS
+                and ENDPOINT_BORDER_PIXELS <= full_y < frame_height - ENDPOINT_BORDER_PIXELS
+            )
+            features.append(
+                RouteEndpoint(
+                    point=(full_x, full_y),
+                    tangent_deg=float(angle),
+                    internal=internal,
+                    branch_length=branch_length,
+                )
+            )
+        return tuple(features)
+
+    def connected_path(
+        self,
+        frame: np.ndarray,
+        expected_x: Optional[float] = None,
+    ) -> RoutePathObservation:
+        """Describe the component connected to the bottom of the current view.
+
+        A far endpoint at an image boundary means the visible route continues
+        out of view (for example through a connected right-angle corner).  An
+        internal far endpoint is evidence of a physical tape end.
+        """
+        height, width = frame.shape[:2]
+        rect = self._roi_rect(frame, SEARCH_ROI)
+        left, top, _, _ = rect
+        mask = self._mask(frame, rect)
+        count, labels, stats, centroids = cv2.connectedComponentsWithStats(mask)
+        bottom_start = int(mask.shape[0] * 0.72)
+        choices = []
+        for label in range(1, count):
+            area = int(stats[label, cv2.CC_STAT_AREA])
+            if area < max(35, int(float(self.settings.min_area) * 0.35)):
+                continue
+            ys, xs = np.where(labels == label)
+            bottom = ys >= bottom_start
+            if not np.any(bottom):
+                continue
+            anchor_x = float(np.median(xs[bottom]) + left)
+            if expected_x is not None and abs(anchor_x - expected_x) / max(width, 1) > 0.34:
+                continue
+            continuity = 0.0 if expected_x is None else 1.0 - min(abs(anchor_x - expected_x) / (0.34 * width), 1.0)
+            choices.append((area + 300.0 * continuity, label, anchor_x))
+        if not choices:
+            return RoutePathObservation(False)
+
+        _, label, anchor_x = max(choices, key=lambda item: item[0])
+        local_x = int(stats[label, cv2.CC_STAT_LEFT])
+        local_y = int(stats[label, cv2.CC_STAT_TOP])
+        local_width = int(stats[label, cv2.CC_STAT_WIDTH])
+        local_height = int(stats[label, cv2.CC_STAT_HEIGHT])
+        component = np.where(
+            labels[
+                local_y:local_y + local_height,
+                local_x:local_x + local_width,
+            ] == label,
+            255,
+            0,
+        ).astype(np.uint8)
+        endpoints = self._endpoint_features(
+            component,
+            (left + local_x, top + local_y),
+            (height, width),
+        )
+        if not endpoints:
+            return RoutePathObservation(False)
+        # The robot-side end has the greatest y.  The opposite end describes
+        # whether the route genuinely terminates or merely leaves the image.
+        robot_end = max(endpoints, key=lambda item: item.point[1])
+        far_end = max(
+            endpoints,
+            key=lambda item: hypot(
+                item.point[0] - robot_end.point[0],
+                item.point[1] - robot_end.point[1],
+            ),
+        )
+        x, y, box_width, box_height = (
+            local_x + left,
+            local_y + top,
+            local_width,
+            local_height,
+        )
+        detection = VisualDetection(
+            valid=True,
+            kind=KIND,
+            center=far_end.point,
+            confidence=1.0,
+            box=(x, y, x + box_width, y + box_height),
+        )
+        error = (far_end.point[0] - width / 2.0) / max(width / 2.0, 1.0)
+        return RoutePathObservation(
+            True,
+            endpoint=far_end,
+            lookahead_point=far_end.point,
+            error=float(error),
+            detection=detection,
+        )
 
     def bottom_line(
         self,
@@ -201,6 +429,19 @@ class RouteVision:
             if geometry is None:
                 continue
             angle, upper_local, lower_local = geometry
+            contour_x, contour_y, contour_width, contour_height = cv2.boundingRect(contour)
+            component = np.zeros((contour_height, contour_width), dtype=np.uint8)
+            shifted = contour.copy()
+            shifted[:, :, 0] -= contour_x
+            shifted[:, :, 1] -= contour_y
+            cv2.drawContours(component, [shifted], -1, 255, thickness=-1)
+            endpoints = self._endpoint_features(
+                component,
+                (left + contour_x, top + contour_y),
+                (height, width),
+            )
+            if len(endpoints) < 2:
+                continue
             moments = cv2.moments(contour)
             if moments["m00"] <= 0:
                 continue
@@ -209,6 +450,20 @@ class RouteVision:
             x, y, box_width, box_height = cv2.boundingRect(contour)
             upper = (upper_local[0] + left, upper_local[1] + top)
             lower = (lower_local[0] + left, lower_local[1] + top)
+            # The gap-facing end is normally the endpoint nearest the robot.
+            # RouteTask applies the saved old-tangent and gap-pairing gates
+            # before it is ever allowed to command motion toward this point.
+            entry_endpoint = max(
+                endpoints,
+                key=lambda item: (
+                    item.point[1] / max(height, 1)
+                    - 0.35
+                    * abs(item.point[0] - width / 2.0)
+                    / max(width / 2.0, 1.0)
+                ),
+            )
+            lower = entry_endpoint.point
+            angle = entry_endpoint.tangent_deg
             bottom_ratio = lower[1] / max(height, 1)
             near = bottom_ratio >= 0.76
             center_distance = abs(center_x - width / 2.0) / max(width / 2.0, 1.0)
@@ -237,6 +492,8 @@ class RouteVision:
                     lower_point=lower,
                     elongation=float(elongation),
                     score=float(score),
+                    endpoints=endpoints,
+                    entry_endpoint=entry_endpoint,
                 )
             )
 
