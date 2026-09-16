@@ -54,6 +54,10 @@ def near_route_frame(x=320):
     return segment_frame((x, 355), (x, 120), thickness=24)
 
 
+def extending_route_frame(bottom_y, x=320):
+    return segment_frame((x, bottom_y), (x, 85), thickness=24)
+
+
 def near_old_line_frame(x=400):
     """Old route remains only in the bottom band; base detector is invalid."""
     return segment_frame((x, 355), (x, 300), thickness=24)
@@ -203,14 +207,14 @@ class RouteRecoveryTests(unittest.TestCase):
         harness.start_line(now=1.0, x=400)
 
         pending = harness.feed_image(1.05, near_old_line_frame())
-        takeover = harness.feed_image(1.15, near_old_line_frame())
+        takeover = harness.feed_image(1.25, near_old_line_frame())
         self.assertEqual(pending.state, LINE_FOLLOWING)
         self.assertEqual(takeover.state, TASK_ACTIVE)
         self.assertEqual(takeover.command.forward, END_APPROACH_SPEED)
         self.assertIsNone(harness.gimbal.last_move())
 
-        first_blank = harness.feed_blank(1.20)
-        confirmed = harness.feed_blank(1.36)
+        first_blank = harness.feed_blank(1.30)
+        confirmed = harness.feed_blank(1.46)
         self.assertEqual(first_blank.command.forward, 0.0)
         self.assertEqual(confirmed.command.forward, 0.0)
         self.assertEqual(
@@ -223,7 +227,7 @@ class RouteRecoveryTests(unittest.TestCase):
         harness = TaskHarness(task=task)
         harness.start_line(now=1.0, x=400)
         harness.feed_image(1.05, near_old_line_frame())
-        harness.feed_image(1.15, near_old_line_frame())
+        harness.feed_image(1.25, near_old_line_frame())
 
         # This is already beyond the previous 2.5 s phase limit.  The task
         # must still follow the visible bottom line instead of failing.
@@ -336,6 +340,26 @@ class RouteRecoveryTests(unittest.TestCase):
         task._observe_candidate(FramePacket(first, 3, 1.10), 1.10)
         self.assertTrue(task.candidate_near)
 
+    def test_temporal_tracking_keeps_the_same_horizontal_endpoint(self):
+        task = RouteTask()
+        first = segment_frame((250, 190), (350, 190))
+        shifted = segment_frame((290, 190), (390, 190))
+
+        task._observe_candidate(FramePacket(first, 1, 1.0), 1.0)
+        first_endpoint = task._candidate.entry_endpoint
+        task._observe_candidate(FramePacket(shifted, 2, 1.05), 1.05)
+        second_endpoint = task._candidate.entry_endpoint
+
+        self.assertGreater(first_endpoint.point[0], 320)
+        self.assertGreater(second_endpoint.point[0], 350)
+        self.assertLess(
+            RouteTask._directed_angle_difference(
+                first_endpoint.tangent_deg,
+                second_endpoint.tangent_deg,
+            ),
+            10.0,
+        )
+
     def test_perpendicular_candidate_is_valid_for_known_right_angle_gap(self):
         task, harness, _ = start_and_trigger()
         settle_into_bridge(harness)
@@ -387,8 +411,9 @@ class RouteRecoveryTests(unittest.TestCase):
         task._old_tangent_world = None
         for now in (3.01, 3.06, 3.11):
             harness.feed_image(now, far_fragment_frame(x=320))
-        harness.feed_image(3.16, near_route_frame())
-        for now in (3.21, 3.26, 3.31, 3.36, 3.41, 3.46, 3.51):
+        harness.feed_image(3.16, extending_route_frame(260))
+        harness.feed_image(3.21, extending_route_frame(310))
+        for now in (3.26, 3.31, 3.36, 3.41, 3.46, 3.51):
             decision = harness.feed_image(now, near_route_frame())
             self.assertEqual(decision.state, TASK_ACTIVE)
         lowering = harness.feed_image(3.56, near_route_frame())
@@ -416,8 +441,9 @@ class RouteRecoveryTests(unittest.TestCase):
         task._old_tangent_world = None
         for now in (3.01, 3.06, 3.11):
             harness.feed_image(now, far_fragment_frame(x=320))
-        harness.feed_image(3.16, near_route_frame())
-        for now in (3.21, 3.26, 3.31, 3.36, 3.41, 3.46, 3.51, 3.56):
+        harness.feed_image(3.16, extending_route_frame(260))
+        harness.feed_image(3.21, extending_route_frame(310))
+        for now in (3.26, 3.31, 3.36, 3.41, 3.46, 3.51, 3.56):
             harness.feed_image(now, near_route_frame())
 
         failed = harness.feed_blank(5.57)
@@ -431,12 +457,26 @@ class RouteRecoveryTests(unittest.TestCase):
         harness = TaskHarness(task=task)
         harness.start_line(now=1.0, x=320)
         first = harness.feed_image(1.05, connected_right_angle_frame())
-        corner = harness.feed_image(1.15, connected_right_angle_frame())
+        corner = harness.feed_image(1.25, connected_right_angle_frame())
         self.assertEqual(first.state, LINE_FOLLOWING)
         self.assertEqual(corner.state, TASK_ACTIVE)
         self.assertEqual(task.state, CORNERING)
         self.assertGreater(corner.command.forward, 0.0)
         self.assertLess(corner.command.yaw, 0.0)
+        self.assertIsNone(harness.gimbal.last_move())
+
+    def test_connected_corner_tolerates_a_short_path_dropout(self):
+        task = RouteTask()
+        harness = TaskHarness(task=task)
+        harness.start_line(now=1.0, x=320)
+        harness.feed_image(1.05, connected_right_angle_frame())
+        harness.feed_image(1.25, connected_right_angle_frame())
+
+        missing = harness.feed_blank(1.50)
+        recovered = harness.feed_image(1.60, connected_right_angle_frame())
+        self.assertEqual(task.state, CORNERING)
+        self.assertEqual(missing.command.forward, 0.0)
+        self.assertGreater(recovered.command.forward, 0.0)
         self.assertIsNone(harness.gimbal.last_move())
 
     def test_saved_old_tangent_rejects_old_line_and_accepts_perpendicular(self):

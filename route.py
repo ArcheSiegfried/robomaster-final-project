@@ -9,7 +9,8 @@ The module consumes only ``FramePacket`` and returns typed motion/gimbal
 requests.  It never connects hardware and every call is non-blocking.
 """
 
-from math import atan2, cos, degrees, radians, sin
+from dataclasses import replace
+from math import atan2, cos, degrees, hypot, radians, sin
 from typing import List, Optional, Tuple
 
 from config import CONFIG
@@ -45,8 +46,9 @@ REACQUIRING = "reacquiring"
 
 # Initial values only.  None has been validated on the real course.
 TRIGGER_MARGIN_SECONDS = 0.05
-END_PENDING_SECONDS = 0.08
+END_PENDING_SECONDS = 0.18
 END_MISSING_SECONDS = 0.14
+CORNER_PATH_LOSS_SECONDS = 0.40
 # At 0.08 m/s the previous 2.5 s budget covered only about 0.20 m.  On the
 # real camera the far sample can disappear earlier than that, so the task was
 # failing at the physical endpoint before it could raise the view.  Keep this
@@ -63,8 +65,8 @@ BRIDGE_MAX_SECONDS = 3.0
 # overcome the stopped chassis' static friction.  Keep this well inside the
 # external-task envelope, but give the bounded crossing a usable start speed.
 BRIDGE_MIN_SECONDS = 0.80
-BRIDGE_FORWARD_SPEED = 0.18
-FRAGMENT_LOSS_SECONDS = 0.20
+BRIDGE_FORWARD_SPEED = 0.15
+FRAGMENT_LOSS_SECONDS = 0.35
 
 SEARCH_YAW_SPEED = 45.0
 SEARCH_CONFIRM_YAW_SPEED = 30.0
@@ -75,7 +77,7 @@ SEARCH_TARGET_TOLERANCE_DEG = 2.5
 
 CANDIDATE_CONFIRM_FRAMES = 3
 REACQUIRE_STABLE_FRAMES = 3
-REACQUIRE_MAX_CENTER_JUMP = 0.24
+REACQUIRE_MAX_CENTER_JUMP = 0.14
 REACQUIRE_MAX_ANGLE_JUMP = 42.0
 NEAR_ENTER_RATIO = 0.78
 NEAR_EXIT_RATIO = 0.70
@@ -83,8 +85,9 @@ OLD_LINE_CLEAR_DISTANCE = 0.07
 MIN_ENDPOINT_GAP_DISTANCE = 0.08
 MAX_ENDPOINT_GAP_DISTANCE = 1.40
 ALIGN_ANGLE_DEG = 18.0
-ALIGN_YAW_GAIN = 0.55
-ALIGN_MIN_YAW = 8.0
+ALIGN_YAW_GAIN = 0.38
+ALIGN_MIN_YAW = 5.0
+ALIGN_MAX_YAW = 18.0
 DOCK_FORWARD_SPEED = 0.08
 DOCK_TARGET_ERROR = 0.13
 DOCK_ANGLE_DEG = 25.0
@@ -98,6 +101,7 @@ DOCK_LATERAL_GAIN = 0.12
 DOCK_MAX_LATERAL = 0.09
 RIGHT_ANGLE_MIN_DEG = 50.0
 RIGHT_ANGLE_MAX_DEG = 130.0
+MIN_CANDIDATE_ENDPOINT_Y_RATIO = 0.25
 HANDOFF_VIEW_TIMEOUT_SECONDS = 2.0
 MAX_INTEGRATION_STEP_SECONDS = 0.20
 
@@ -311,7 +315,8 @@ class RouteTask:
         if previous is None:
             return True
         return (
-            abs(current[0] - previous[0]) / max(frame_width, 1)
+            hypot(current[0] - previous[0], current[1] - previous[1])
+            / max(frame_width, 1)
             <= REACQUIRE_MAX_CENTER_JUMP
         )
 
@@ -321,27 +326,42 @@ class RouteTask:
         difference = abs(float(first) - float(second)) % 180.0
         return min(difference, 180.0 - difference)
 
+    @staticmethod
+    def _directed_angle_difference(first: float, second: float) -> float:
+        """Smallest difference between two directed endpoint tangents."""
+        return abs((float(first) - float(second) + 180.0) % 360.0 - 180.0)
+
     def _select_candidate(
-        self, candidates: List[RouteCandidate], frame_width: int
+        self,
+        candidates: List[RouteCandidate],
+        frame_width: int,
+        frame_height: int,
     ) -> Optional[RouteCandidate]:
-        candidates = [item for item in candidates if self._candidate_geometry_ok(item)]
+        candidates = self._candidate_variants(
+            candidates, frame_width, frame_height
+        )
+        candidates = [
+            item for item in candidates if self._candidate_geometry_ok(item)
+        ]
         if not candidates:
             return None
         if self._candidate_center is None:
-            return candidates[0]
+            return max(candidates, key=lambda item: item.score)
 
         ranked = []
         for candidate in candidates:
-            center = candidate.detection.center
-            if center is None:
+            endpoint = candidate.entry_endpoint
+            if endpoint is None:
                 continue
-            distance = abs(center[0] - self._candidate_center[0]) / max(
-                frame_width, 1
-            )
+            center = endpoint.point
+            distance = hypot(
+                center[0] - self._candidate_center[0],
+                center[1] - self._candidate_center[1],
+            ) / max(frame_width, 1)
             angle_jump = (
                 0.0
                 if self._candidate_angle is None
-                else self._angle_difference(
+                else self._directed_angle_difference(
                     candidate.angle_deg, self._candidate_angle
                 )
             )
@@ -359,6 +379,51 @@ class RouteTask:
                 (candidate.score + 0.30 * continuity + 0.15 * angle_score, candidate)
             )
         return max(ranked, key=lambda item: item[0])[1] if ranked else None
+
+    @staticmethod
+    def _candidate_variants(
+        candidates: List[RouteCandidate],
+        frame_width: int,
+        frame_height: int,
+    ) -> List[RouteCandidate]:
+        """Expand both skeleton ends so tracking can hold one physical end.
+
+        A horizontal contour has two opposite directed tangents.  Choosing its
+        closest endpoint independently on every frame made the selected end
+        alternate left/right and flipped the yaw command between +90/-90.
+        """
+        variants: List[RouteCandidate] = []
+        for candidate in candidates:
+            endpoints = candidate.endpoints or (
+                (candidate.entry_endpoint,)
+                if candidate.entry_endpoint is not None
+                else ()
+            )
+            for endpoint in endpoints:
+                if endpoint is None:
+                    continue
+                bottom_ratio = endpoint.point[1] / max(frame_height, 1)
+                center_score = 1.0 - min(
+                    abs(endpoint.point[0] - frame_width / 2.0)
+                    / max(frame_width / 2.0, 1.0),
+                    1.0,
+                )
+                variants.append(
+                    replace(
+                        candidate,
+                        angle_deg=endpoint.tangent_deg,
+                        near=bottom_ratio >= 0.76,
+                        bottom_ratio=float(bottom_ratio),
+                        lower_point=endpoint.point,
+                        entry_endpoint=endpoint,
+                        score=(
+                            candidate.score
+                            + 0.08 * center_score
+                            + 0.12 * min(bottom_ratio, 1.0)
+                        ),
+                    )
+                )
+        return variants
 
     def _candidate_geometry_ok(self, candidate: RouteCandidate) -> bool:
         """Cheap gate applied before temporal tracking can lock onto old tape."""
@@ -378,7 +443,11 @@ class RouteTask:
 
     def _observe_candidate(self, frame: FramePacket, now: float) -> None:
         candidates = self._route_vision.candidates(frame.image)
-        selected = self._select_candidate(candidates, frame.image.shape[1])
+        selected = self._select_candidate(
+            candidates,
+            frame.image.shape[1],
+            frame.image.shape[0],
+        )
         self._candidate = selected
         if selected is None or selected.detection.center is None:
             if (
@@ -395,12 +464,14 @@ class RouteTask:
             return
 
         self.last_detection = selected.detection
-        center = selected.detection.center
+        center = selected.entry_endpoint.point
         continuous = self._center_continuous(
             center, self._candidate_center, frame.image.shape[1]
         ) and (
             self._candidate_angle is None
-            or self._angle_difference(selected.angle_deg, self._candidate_angle)
+            or self._directed_angle_difference(
+                selected.angle_deg, self._candidate_angle
+            )
             <= REACQUIRE_MAX_ANGLE_JUMP
         )
         if self._candidate_near:
@@ -462,7 +533,7 @@ class RouteTask:
             return False, "candidate has no internal gap-facing endpoint"
         height = frame.image.shape[0]
         endpoint_ratio = endpoint.point[1] / max(height, 1)
-        if endpoint_ratio < 0.18:
+        if endpoint_ratio < MIN_CANDIDATE_ENDPOINT_Y_RATIO:
             return False, "candidate endpoint is too close to the upper image edge"
         if self._old_tangent_world is not None:
             world_tangent = self._heading_offset + endpoint.tangent_deg
@@ -582,8 +653,8 @@ class RouteTask:
         if abs(angle_deg) <= ALIGN_ANGLE_DEG:
             return 0.0
         yaw = max(
-            -SEARCH_CONFIRM_YAW_SPEED,
-            min(angle_deg * ALIGN_YAW_GAIN, SEARCH_CONFIRM_YAW_SPEED),
+            -ALIGN_MAX_YAW,
+            min(angle_deg * ALIGN_YAW_GAIN, ALIGN_MAX_YAW),
         )
         if abs(yaw) < ALIGN_MIN_YAW:
             yaw = ALIGN_MIN_YAW if yaw > 0.0 else -ALIGN_MIN_YAW
@@ -661,11 +732,12 @@ class RouteTask:
                 STOP_COMMAND,
                 f"search heading {target:.0f}deg inspected; advancing sweep",
             )
-        speed = (
-            SEARCH_CONFIRM_YAW_SPEED
-            if abs(error) < 12.0 or self._candidate is not None
-            else SEARCH_YAW_SPEED
-        )
+        if self._candidate is not None:
+            speed = ALIGN_MAX_YAW
+        elif abs(error) < 12.0:
+            speed = SEARCH_CONFIRM_YAW_SPEED
+        else:
+            speed = SEARCH_YAW_SPEED
         yaw = speed if error > 0.0 else -speed
         message = f"searching toward {target:.0f}deg"
         if self._candidate is not None:
@@ -813,7 +885,7 @@ class RouteTask:
         if not self._path.present or endpoint is None:
             if self._corner_missing_at is None:
                 self._corner_missing_at = now
-            if now - self._corner_missing_at >= END_MISSING_SECONDS:
+            if now - self._corner_missing_at >= CORNER_PATH_LOSS_SECONDS:
                 self._begin_raise(now)
                 return self._running(
                     now, STOP_COMMAND, "connected path ended; raising search view"

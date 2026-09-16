@@ -242,7 +242,11 @@ class RouteVision:
             branch_length = float(np.max(distances))
             if branch_length < MIN_ENDPOINT_BRANCH_PIXELS:
                 continue
-            angle = degrees(atan2(dx, max(-dy, 1e-6)))
+            # Keep the endpoint tangent directed.  In particular, a top end
+            # whose branch runs downwards is 180 degrees, not 0 degrees.  The
+            # old max(..., epsilon) collapsed both ends to the same angle and
+            # allowed the selected physical endpoint to flip every frame.
+            angle = degrees(atan2(dx, -dy))
             while angle > 180.0:
                 angle -= 360.0
             while angle <= -180.0:
