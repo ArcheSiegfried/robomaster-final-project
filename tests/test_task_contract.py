@@ -33,7 +33,6 @@ from runtime import LineFollower
 # evidence.py is infrastructure owned by the integration person, not a slot.
 EXPECTED_MODULE_FILES = {
     "number_marker.py": "step",
-    "traffic_light.py": "step",
     "obstacle.py": "step",
     "route.py": "step",
     "green_junction.py": "step",

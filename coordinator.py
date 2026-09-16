@@ -52,6 +52,9 @@ OWNER_LINE = "line"
 OWNER_EXTERNAL = "external"
 
 #: 红绿灯模块的注册名。有任务在接管时，协调器仍然每帧单独问它一次（红灯否决）。
+#: 注意：2026-09-16 起仓库里**没有** `traffic_light.py` 了（集成负责人决定删除：
+#: 它在实车上反复把红色物体判成红灯并锁停）。所以下面这套"红灯否决权"当前**不生效**
+#: （`light_task=None`，否决永不触发）；机制保留，将来若重新引入灯色模块会自动生效。
 LIGHT_TASK_NAME = "traffic_light"
 
 # The base line must be armed before any module may claim motion from it.

@@ -230,7 +230,7 @@ python -m unittest discover -s tests -v
 每个文件已在 `task_registry.py` 里登记好，组员**只替换文件内容**即可：
 
 ```python
-MOTION_TASK_CLASSES = (TrafficLightTask, NumberMarkerTask, ...)  # 可接管运动，顺序即优先级
+MOTION_TASK_CLASSES = (GreenJunctionTask, ObstacleTask, ...)  # 可接管运动，顺序即优先级
 OBSERVER_CLASSES = (EvidenceRecorder,)                            # 每帧可见，永不接管
 ```
 
