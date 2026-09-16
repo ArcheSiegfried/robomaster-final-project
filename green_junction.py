@@ -224,22 +224,25 @@ def make_light_probe(
 ) -> LightProbe:
     """把"别人给的灯读法"包成本模块要的探针 ``light_probe(frame, now)``（见 A13）。
 
-    3 号（``traffic_light.py``）**没有** ``reading()`` 这个方法，所以整合层不用等它
-    开新接口，下面两样现有东西都能直接接：
+    **2026-09-16 起仓库里没有 ``traffic_light.py`` 了**（集成负责人删除：它在实车上反复
+    把红色物体判成红灯并锁停，而赛题没有红绿灯这一项）。因此生产装配
+    （``task_registry.build_motion_tasks()``）**不再注入任何探针** → 本模块按 A14
+    （"真的拿到红/绿读数才算有判据来源"）**不会接管**：惰性，不会抢岔路口。
+
+    这个适配器保留着：将来谁提供灯色来源（老师给了红绿灯、或别的模块开一个
+    ``reading()``）都能直接接上——
 
     ```python
     from green_junction import make_light_probe
-    from traffic_light import TrafficLightDetector, TrafficLightTask
+    from some_light_module import LightDetector      # 只要它对外能报红/绿
 
-    GreenJunctionTask(light_probe=make_light_probe(TrafficLightDetector()))
-    # 或者（用已经带状态、带确认逻辑的那个任务）
-    GreenJunctionTask(light_probe=make_light_probe(TrafficLightTask()))
+    GreenJunctionTask(light_probe=make_light_probe(LightDetector()))
     ```
 
     支持的 ``source``：
 
-    * 有 ``detect(image)`` 的对象（例如 ``traffic_light.TrafficLightDetector``）；
-    * 有 ``step(frame, now)`` 的对象（例如 ``traffic_light.TrafficLightTask``）；
+    * 有 ``detect(image)`` 的对象；
+    * 有 ``step(frame, now)`` 的对象；
     * 可调用对象：按参数个数自动判断是 ``(frame, now)`` 还是 ``(image)``；
       返回值可以是 :class:`LightReading`、``VisualDetection``、``TaskUpdate``
       或直接是 ``"green"`` / ``"red"`` 字符串。
