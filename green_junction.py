@@ -68,6 +68,13 @@ A11           "线回到画面中央"这个判据**不依赖框架传参**：协
 A12           只有"分叉带已经贴到最后一截画面"（``drove_past_fork_row_ratio``）
               才可能判"车已经开过岔路口"：正常进近时车头前方的带子是单条且居中，
               和"开过了"长得一样，不加上这一条就会把正常进近误判成失败。
+A13           灯的**位置**可以拿来选边：探针给的读数如果带画面里的像素坐标
+              （``center``），左半边 → 走左分支，右半边 → 走右分支；没有坐标时才用
+              ``fallback_rule``。见 :func:`make_light_probe`。
+A14           "接了探针"不等于"有判据"：只有**这一帧真的拿到一个能用的读数**
+              （红灯或绿灯；``UNKNOWN`` / ``None`` / 探针抛异常都不算）才认为自己适用。
+              否则只要岔路一出现就会接管、白等 ``decision_timeout`` 再失败，
+              把岔路从后面的模块手里抢走（``require_rule_source``）。
 ============  ==========================================================
 
 修订说明（2026-09-15 实车测试报告）：本次改了三处，全部只在本文件里，
@@ -87,6 +94,8 @@ A12           只有"分叉带已经贴到最后一截画面"（``drove_past_for
 from dataclasses import dataclass
 from enum import Enum
 from typing import Callable, List, Optional, Sequence, Tuple
+
+import inspect
 
 import cv2
 import numpy as np
@@ -154,6 +163,122 @@ class LightReading:
 
 #: 灯判据的读取接口。3 号/1 号把它的函数注入进来即可，不需要本模块依赖 3 号的文件。
 LightProbe = Callable[[FramePacket, float], Optional[LightReading]]
+
+#: 3 号 ``VisualDetection.color`` / ``TaskUpdate`` 里的颜色字符串 → 本模块的枚举。
+_LIGHT_COLOR_NAMES = {"green": LightColor.GREEN, "red": LightColor.RED}
+
+
+def _frame_image(frame) -> Optional[np.ndarray]:
+    """``FramePacket`` 或裸图像都接受。"""
+    image = getattr(frame, "image", None)
+    if image is None and isinstance(frame, np.ndarray):
+        return frame
+    return image
+
+
+def _reading_from(
+    value,
+    frame,
+    infer_branch: bool,
+    min_confidence: float,
+) -> Optional[LightReading]:
+    """把"别人给的灯读数"转成 :class:`LightReading`；看不懂就返回 ``None``。"""
+    if value is None:
+        return None
+    if isinstance(value, LightReading):
+        return value
+    # TaskUpdate（traffic_light.TrafficLightTask.step 的返回值）→ 看里面的 detection
+    inner = getattr(value, "detection", None)
+    if inner is not None:
+        return _reading_from(inner, frame, infer_branch, min_confidence)
+
+    color_name = getattr(value, "color", None)
+    if color_name is None and isinstance(value, str):
+        color_name = value
+    if color_name is None:
+        return None
+    if not bool(getattr(value, "valid", True)):
+        return None
+
+    color = _LIGHT_COLOR_NAMES.get(str(color_name).strip().lower(), LightColor.UNKNOWN)
+    confidence = float(getattr(value, "confidence", 0.0) or 0.0)
+    if confidence < min_confidence:
+        return None
+
+    branch: Optional[Branch] = None
+    image = _frame_image(frame)
+    candidate = None if isinstance(value, str) else getattr(value, "center", None)
+    if isinstance(candidate, (tuple, list)) and len(candidate) >= 1:
+        if infer_branch and image is not None:
+            width = float(image.shape[1])
+            if width > 0.0:
+                # 注意：``str`` 也有个 ``.center`` 方法，所以上面要先把字符串排掉。
+                branch = Branch.LEFT if float(candidate[0]) < width / 2.0 else Branch.RIGHT
+    return LightReading(color=color, branch=branch, confidence=confidence)
+
+
+def make_light_probe(
+    source,
+    infer_branch_from_position: bool = True,
+    min_confidence: float = 0.0,
+) -> LightProbe:
+    """把"别人给的灯读法"包成本模块要的探针 ``light_probe(frame, now)``（见 A13）。
+
+    3 号（``traffic_light.py``）**没有** ``reading()`` 这个方法，所以整合层不用等它
+    开新接口，下面两样现有东西都能直接接：
+
+    ```python
+    from green_junction import make_light_probe
+    from traffic_light import TrafficLightDetector, TrafficLightTask
+
+    GreenJunctionTask(light_probe=make_light_probe(TrafficLightDetector()))
+    # 或者（用已经带状态、带确认逻辑的那个任务）
+    GreenJunctionTask(light_probe=make_light_probe(TrafficLightTask()))
+    ```
+
+    支持的 ``source``：
+
+    * 有 ``detect(image)`` 的对象（例如 ``traffic_light.TrafficLightDetector``）；
+    * 有 ``step(frame, now)`` 的对象（例如 ``traffic_light.TrafficLightTask``）；
+    * 可调用对象：按参数个数自动判断是 ``(frame, now)`` 还是 ``(image)``；
+      返回值可以是 :class:`LightReading`、``VisualDetection``、``TaskUpdate``
+      或直接是 ``"green"`` / ``"red"`` 字符串。
+
+    颜色映射：``"green"`` → ``GREEN``，``"red"`` → ``RED``，其余（含 ``None``）→ ``UNKNOWN``。
+    选边（A13）：读数带 ``center``（整幅图像素坐标）且 ``infer_branch_from_position``
+    为真时，灯在画面左半边 → ``LEFT``，右半边 → ``RIGHT``；否则 ``branch=None``，
+    由 ``fallback_rule`` 决定。看不懂的返回值、探针抛异常，一律按"没有判据"处理。
+    """
+    reader = None
+    if hasattr(source, "detect") and callable(getattr(source, "detect")):
+        reader = lambda frame, now: source.detect(_frame_image(frame))  # noqa: E731
+    elif hasattr(source, "step") and callable(getattr(source, "step")):
+        reader = lambda frame, now: source.step(frame, now)  # noqa: E731
+    elif callable(source):
+        try:
+            parameters = inspect.signature(source).parameters
+            single_argument = len(parameters) <= 1
+        except (TypeError, ValueError):
+            single_argument = False
+        if single_argument:
+            # 例如直接传了绑定方法 detector.detect：它收的是图像，不是 FramePacket。
+            reader = lambda frame, now: source(_frame_image(frame))  # noqa: E731
+        else:
+            reader = source
+    else:
+        raise TypeError(
+            "make_light_probe expects a callable, a detector-like or a task-like object"
+        )
+
+    def probe(frame, now) -> Optional[LightReading]:
+        try:
+            value = reader(frame, now)
+        except Exception:
+            # 别人的模块出错不能让车失控；按"没有判据"处理（A14）。
+            return None
+        return _reading_from(value, frame, infer_branch_from_position, min_confidence)
+
+    return probe
 
 
 # --------------------------------------------------------------------------
@@ -1033,14 +1158,33 @@ class GreenJunctionTask:
             return reading
         return None
 
-    def _has_rule_source(self) -> bool:
-        """有没有任何"走哪边"的判据来源（见 A6 / ``require_rule_source``）。"""
+    def _rule_reading(self, frame: FramePacket, now: float) -> Optional[LightReading]:
+        """本帧的灯读法：优先探针，其次 ``fallback_color``（A6）。"""
+        if self.light_probe is not None:
+            return self._read_probe(frame, now)
+        fallback = (self.settings.fallback_color or "none").strip().lower()
+        if fallback == "green":
+            return LightReading(color=LightColor.GREEN)
+        if fallback == "red":
+            return LightReading(color=LightColor.RED)
+        return None
+
+    def _rule_source_available(self, frame: FramePacket, now: float) -> bool:
+        """这一帧到底有没有**能用的**判据（A14）。
+
+        2026-09-16 的实车报告指出：老写法把"接了探针"当成"有判据"，于是只要
+        岔路出现它就会接管；如果那个岔路口没有灯，它就白等 ``decision_timeout``
+        再失败，把岔路从后面注册的 ``free_junction`` 手里抢走。
+        现在改成：**真的拿到读数**（红灯或绿灯）才算有来源；
+        ``None`` / ``UNKNOWN`` / 探针抛异常都不算。
+        """
         if not self.settings.require_rule_source:
             return True
-        if self.light_probe is not None:
-            return True
-        fallback = (self.settings.fallback_color or "none").strip().lower()
-        return fallback in ("green", "red")
+        reading = self._rule_reading(frame, now)
+        self.last_reading = reading
+        if reading is None:
+            return False
+        return reading.color is not LightColor.UNKNOWN
 
     def _line_centered(self, frame: FramePacket, now: float) -> Tuple[bool, str]:
         """线回到画面中央了没有（见 A11）。
@@ -1105,7 +1249,7 @@ class GreenJunctionTask:
         self.mask = detection.mask
 
         if self.state is JunctionState.IDLE:
-            return self._step_idle(detection, now)
+            return self._step_idle(detection, frame, now)
         if self.state is JunctionState.READY:
             return self._step_ready(detection, now)
         if self.state is JunctionState.DECIDE:
@@ -1121,17 +1265,11 @@ class GreenJunctionTask:
             return self._failed("frame image missing while owning control")
         return self._not_triggered("no frame")
 
-    def _step_idle(self, detection: JunctionDetection, now: float) -> TaskUpdate:
+    def _step_idle(
+        self, detection: JunctionDetection, frame: FramePacket, now: float
+    ) -> TaskUpdate:
         if self._idle_since is None:
             self._idle_since = now
-        if not self._has_rule_source():
-            # 一个判据来源都没有（既没有探针，fallback_color 又是 "none"）：
-            # 本模块在这个岔路口**不可能**成功，接管只会白停 6 秒并把岔路
-            # 从后面的模块（例如 free_junction）手里抢走。所以干脆不触发，
-            # 让协调器去问下一个模块。想恢复"接管、停住、再失败"的老行为，
-            # 把 JunctionConfig(require_rule_source=False) 即可。
-            self._confirm_count = 0
-            return self._not_triggered("no light rule source; not applicable")
         if self._rearm_ready_at is not None and now < self._rearm_ready_at:
             # 刚走过一个岔路：冷却期内即使又看到岔路形状也不重复触发（A9）。
             self._confirm_count = 0
@@ -1139,6 +1277,16 @@ class GreenJunctionTask:
         if not detection.valid:
             self._confirm_count = 0
             return self._not_triggered("no junction")
+        # 看到岔路形状了，先确认这一帧到底有没有能用的灯判据（A14）。
+        # 放在"检测到岔路"之后是为了省掉每帧一次的灯检测：只有真有岔路的帧才去问灯。
+        if not self._rule_source_available(frame, now):
+            self._confirm_count = 0
+            message = (
+                "no usable light reading; not applicable"
+                if self.light_probe is not None
+                else "no light rule source; not applicable"
+            )
+            return self._not_triggered(message)
         if self._elapsed(now) > self.settings.total_timeout:
             self._confirm_count = 0
             return self._not_triggered("looked too long without a decision")

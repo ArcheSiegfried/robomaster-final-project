@@ -35,6 +35,7 @@ from green_junction import (  # noqa: E402
     detections_for_log,
     evaluate_branches,
     line_is_centered,
+    make_light_probe,
     near_field_line,
     near_line_is_centered,
 )
@@ -45,6 +46,7 @@ from models import (  # noqa: E402
     LineDetection,
     MotionCommand,
     TaskStatus,
+    VisualDetection,
 )
 
 
@@ -111,6 +113,13 @@ def approach_frame(fork_y=290, far_y=120, reach=110):
     return image
 
 
+def green_lamp_frame(center=(500, 100), radius=22):
+    """实车朝向的岔路 + 画面右上方一盏绿灯（给 3 号的检测器认）。"""
+    image = approach_frame()
+    cv2.circle(image, center, radius, (0, 255, 0), -1)  # BGR 纯绿 ≈ HSV H=60
+    return image
+
+
 def fake_line(error=0.0, valid=True, confidence=0.9):
     """假的巡线结果，只有本模块用到的字段。"""
     mask = np.zeros((HEIGHT, WIDTH), np.uint8)
@@ -132,6 +141,15 @@ def packet(image, sequence, captured_at):
 
 def green(side=None, confidence=1.0):
     return LightReading(color=LightColor.GREEN, branch=side, confidence=confidence)
+
+
+def green_without_side(frame=None, now=None):
+    """"看到绿灯，但不知道是哪一边"。
+
+    配合 ``JunctionConfig(fallback_rule="none")`` 用：模块会接管（因为这一帧真的
+    有读数，见 A14），但永远选不出分支，于是停在 ``DECIDE`` 里等着。
+    """
+    return LightReading(color=LightColor.GREEN, branch=None, confidence=1.0)
 
 
 # --------------------------------------------------------------------------
@@ -495,23 +513,43 @@ class StateMachineTests(unittest.TestCase):
 
     def test_waiting_for_a_rule_keeps_the_car_stopped(self):
         """还没拿到判据时只能保持停车，不能自己往前冲。"""
-        settings = JunctionConfig(decision_timeout=5.0)
-        task = GreenJunctionTask(
-            settings=settings,
-            light_probe=lambda frame, now: LightReading(color=LightColor.UNKNOWN),
-        )
+        settings = JunctionConfig(decision_timeout=5.0, fallback_rule="none")
+        task = GreenJunctionTask(settings=settings, light_probe=green_without_side)
         now = self._advance_until(task, JunctionState.DECIDE)
         update = task.step(packet(junction_frame(), 20, now), now, fake_line(error=0.9))
         self.assertEqual(update.status, TaskStatus.RUNNING)
         self.assertEqual(update.motion, STOP)
         self.assertEqual(update.motion.forward, 0.0)
+        self.assertIn("waiting for rule", update.message)
 
     def test_probe_error_does_not_crash_or_move(self):
+        """别人的模块炸了：既不能让车乱走，也不能让本模块崩。"""
+        settings = JunctionConfig(decision_timeout=5.0, fallback_rule="none")
+
         def broken_probe(frame, now):
             raise RuntimeError("别人的模块炸了")
 
-        task = GreenJunctionTask(light_probe=broken_probe)
+        # 还没接管时探针就炸 → 这一帧没有可用读数 → 根本不接管（A14）。
+        idle = GreenJunctionTask(settings=settings, light_probe=broken_probe)
+        now = 400.0
+        for index in range(6):
+            now += FRAME_DT
+            update = idle.step(packet(junction_frame(), index + 1, now), now, fake_line(error=0.9))
+            self.assertEqual(update.status, TaskStatus.NOT_TRIGGERED)
+            self.assertEqual(update.motion, STOP)
+
+        # 接管之后探针才炸（灯被挡住）→ 保持 RUNNING + 停车，不许乱走。
+        state = {"broken": False}
+
+        def sometimes_broken(frame, now):
+            if state["broken"]:
+                raise RuntimeError("灯被挡住了")
+            return green_without_side()
+
+        task = GreenJunctionTask(settings=settings, light_probe=sometimes_broken)
         now = self._advance_until(task, JunctionState.DECIDE)
+        state["broken"] = True
+        now += FRAME_DT
         update = task.step(packet(junction_frame(), 20, now), now, fake_line(error=0.9))
         self.assertEqual(update.status, TaskStatus.RUNNING)
         self.assertEqual(update.motion, STOP)
@@ -548,6 +586,43 @@ class StateMachineTests(unittest.TestCase):
             self.assertEqual(update.motion, STOP)
         self.assertEqual(task.state, JunctionState.IDLE)
         self.assertIn("no light rule source", update.message)
+
+    def test_probe_without_a_reading_never_takes_over(self):
+        """A14（v3 报告第 4.2 条）："接了探针"不等于"有判据"。
+
+        探针这一帧没看到灯（None / UNKNOWN）时不许接管，否则它会在**任何**岔路
+        都先抢下来，白等 decision_timeout 再失败交回。
+        """
+        for probe in (
+            lambda frame, now: None,
+            lambda frame, now: LightReading(color=LightColor.UNKNOWN),
+        ):
+            task = GreenJunctionTask(
+                settings=JunctionConfig(decision_timeout=0.4), light_probe=probe
+            )
+            now = 600.0
+            for index in range(20):
+                now += FRAME_DT
+                update = task.step(
+                    packet(junction_frame(), index + 1, now), now, fake_line(error=0.9)
+                )
+                self.assertEqual(update.status, TaskStatus.NOT_TRIGGERED)
+                self.assertEqual(update.motion, STOP)
+            self.assertEqual(task.state, JunctionState.IDLE)
+            self.assertIn("no usable light reading", update.message)
+
+    def test_red_reading_is_still_a_real_reading(self):
+        """红灯算"真的拿到读数"：接管 → 原地停 → 超时 FAILED（安全方向，不许走）。"""
+        settings = JunctionConfig(decision_timeout=0.4)
+        task = GreenJunctionTask(
+            settings=settings, light_probe=lambda frame, now: LightReading(color=LightColor.RED)
+        )
+        now = self._advance_until(task, JunctionState.DECIDE)
+        now += settings.decision_timeout + 0.5
+        update = task.step(packet(junction_frame(), 7, now), now, fake_line(error=0.9))
+        self.assertEqual(update.status, TaskStatus.FAILED)
+        self.assertIn("red", update.message)
+        self.assertEqual(update.motion, STOP)
 
     def test_the_fail_safe_path_is_still_available_on_request(self):
         """想要老行为（接管 → 停住 → 超时 FAILED）时，一个参数切回去。"""
@@ -599,11 +674,8 @@ class StateMachineTests(unittest.TestCase):
         self.assertIn("did not return", update.message)
 
     def test_losing_the_junction_before_a_rule_fails_and_stops(self):
-        settings = JunctionConfig(decision_timeout=0.5)
-        task = GreenJunctionTask(
-            settings=settings,
-            light_probe=lambda frame, now: LightReading(color=LightColor.UNKNOWN),
-        )
+        settings = JunctionConfig(decision_timeout=0.5, fallback_rule="none")
+        task = GreenJunctionTask(settings=settings, light_probe=green_without_side)
         now = self._advance_until(task, JunctionState.DECIDE)
         now += 1.0
         update = task.step(packet(blank_frame(), 5, now), now, fake_line())
@@ -612,11 +684,8 @@ class StateMachineTests(unittest.TestCase):
 
     def test_driving_past_the_junction_without_a_rule_fails(self):
         """线已经回到中央、岔路形态还在，连续几帧都这样 → 车其实开过了 → 失败停车。"""
-        settings = JunctionConfig(decision_timeout=5.0)
-        task = GreenJunctionTask(
-            settings=settings,
-            light_probe=lambda frame, now: LightReading(color=LightColor.UNKNOWN),
-        )
+        settings = JunctionConfig(decision_timeout=5.0, fallback_rule="none")
+        task = GreenJunctionTask(settings=settings, light_probe=green_without_side)
         now = self._advance_until(task, JunctionState.DECIDE)
         for index in range(settings.drove_past_frames):
             now += FRAME_DT
@@ -630,11 +699,8 @@ class StateMachineTests(unittest.TestCase):
 
         这里连 ``line`` 都不传——就是协调器的真实调用方式。
         """
-        settings = JunctionConfig(decision_timeout=5.0, confirm_frames=2)
-        task = GreenJunctionTask(
-            settings=settings,
-            light_probe=lambda frame, now: LightReading(color=LightColor.UNKNOWN),
-        )
+        settings = JunctionConfig(decision_timeout=5.0, confirm_frames=2, fallback_rule="none")
+        task = GreenJunctionTask(settings=settings, light_probe=green_without_side)
         now = 50.0
         statuses = []
         for index in range(12):
@@ -666,11 +732,8 @@ class StateMachineTests(unittest.TestCase):
 
     def test_single_contradictory_frame_is_not_enough_to_fail(self):
         """单帧巧合不算：判定"开过了"要连续几帧都矛盾。"""
-        settings = JunctionConfig(decision_timeout=5.0)
-        task = GreenJunctionTask(
-            settings=settings,
-            light_probe=lambda frame, now: LightReading(color=LightColor.UNKNOWN),
-        )
+        settings = JunctionConfig(decision_timeout=5.0, fallback_rule="none")
+        task = GreenJunctionTask(settings=settings, light_probe=green_without_side)
         now = self._advance_until(task, JunctionState.DECIDE)
         now += FRAME_DT
         update = task.step(packet(junction_frame(), 40, now), now, fake_line(error=0.02))
@@ -793,6 +856,149 @@ class StateMachineTests(unittest.TestCase):
             if task.state is state:
                 return now
         raise AssertionError("module never reached %s" % state.value)
+
+
+class LightProbeAdapterTests(unittest.TestCase):
+    """v3 报告第三节那条断掉的链：3 号没有 ``reading()``，本模块给适配器（A13）。
+
+    探针接口是 ``light_probe(frame, now) -> LightReading``；适配器负责把 3 号
+    **现有**的两样东西（``TrafficLightDetector.detect`` / ``TrafficLightTask.step``）
+    转成它，所以整合层不用等公共接口变更。
+    """
+
+    @staticmethod
+    def _packet(image=None):
+        return packet(blank_frame() if image is None else image, 1, 0.0)
+
+    def test_detector_like_source(self):
+        class Detector:
+            def detect(self, image):
+                return VisualDetection(
+                    valid=True,
+                    kind="traffic_light",
+                    center=(500, 100),
+                    color="green",
+                    confidence=0.5,
+                )
+
+        probe = make_light_probe(Detector())
+        reading = probe(self._packet(), 0.0)
+        self.assertIsNotNone(reading)
+        self.assertIs(reading.color, LightColor.GREEN)
+        self.assertIs(reading.branch, Branch.RIGHT, "灯在画面右半边 → 右分支（A13）")
+        self.assertAlmostEqual(reading.confidence, 0.5)
+
+    def test_task_like_source(self):
+        class Task:
+            def step(self, frame, now):
+                return type(
+                    "Update",
+                    (),
+                    {
+                        "detection": VisualDetection(
+                            valid=True, kind="traffic_light", center=(100, 80), color="red"
+                        )
+                    },
+                )()
+
+        reading = make_light_probe(Task())(self._packet(), 0.0)
+        self.assertIs(reading.color, LightColor.RED)
+        self.assertIs(reading.branch, Branch.LEFT)
+
+    def test_callable_readings_pass_through(self):
+        probe = make_light_probe(lambda frame, now: green(Branch.LEFT))
+        reading = probe(self._packet(), 0.0)
+        self.assertIs(reading.color, LightColor.GREEN)
+        self.assertIs(reading.branch, Branch.LEFT)
+
+    def test_callable_that_only_takes_an_image(self):
+        """有人直接把绑定方法 ``detector.detect`` 递进来时也不能静默失效。"""
+        seen = {}
+
+        def reader(image):
+            seen["shape"] = image.shape
+            return "green"
+
+        probe = make_light_probe(reader)
+        reading = probe(self._packet(), 0.0)
+        self.assertEqual(seen["shape"], (HEIGHT, WIDTH, 3))
+        self.assertIs(reading.color, LightColor.GREEN)
+        self.assertIsNone(reading.branch, "没有坐标就没有左右信息")
+
+    def test_branch_inference_can_be_disabled(self):
+        class Detector:
+            def detect(self, image):
+                return VisualDetection(valid=True, kind="traffic_light", center=(500, 100), color="green")
+
+        reading = make_light_probe(Detector(), infer_branch_from_position=False)(
+            self._packet(), 0.0
+        )
+        self.assertIsNone(reading.branch)
+
+    def test_unreadable_or_broken_sources_give_no_reading(self):
+        # 完全读不出东西 → None（既不知道颜色，也不知道位置）。
+        cases = (
+            lambda frame, now: None,
+            lambda frame, now: VisualDetection.no_result("traffic_light"),
+            lambda frame, now: object(),
+        )
+        for reader in cases:
+            self.assertIsNone(make_light_probe(reader)(self._packet(), 0.0))
+
+        # 颜色看不懂 → 明确给 UNKNOWN，而不是 None：调用方两种情况都当"没有判据"，
+        # 但 UNKNOWN 能进日志，排障时看得出"探针说话了，只是没听懂"。
+        reading = make_light_probe(lambda frame, now: "purple")(self._packet(), 0.0)
+        self.assertIsNotNone(reading)
+        self.assertIs(reading.color, LightColor.UNKNOWN)
+
+        def broken(frame, now):
+            raise RuntimeError("3 号炸了")
+
+        self.assertIsNone(make_light_probe(broken)(self._packet(), 0.0))
+
+    def test_min_confidence_filter(self):
+        class Detector:
+            def detect(self, image):
+                return VisualDetection(
+                    valid=True, kind="traffic_light", center=(500, 100), color="green", confidence=0.10
+                )
+
+        self.assertIsNotNone(make_light_probe(Detector(), min_confidence=0.05)(self._packet(), 0.0))
+        self.assertIsNone(make_light_probe(Detector(), min_confidence=0.50)(self._packet(), 0.0))
+
+    def test_non_callable_source_raises(self):
+        with self.assertRaises(TypeError):
+            make_light_probe(42)
+
+    def test_real_traffic_light_detector_drives_the_whole_module(self):
+        """用 3 号**真正的**检测器把整条链跑通：绿灯 → 岔路 → 接管 → 转向 → 交回。
+
+        这就是 v3 报告里"缺的那一段"：不需要 3 号开新接口，也不需要改注册表，
+        只要整合层把探针注入进来。
+        """
+        from traffic_light import TrafficLightDetector  # 只在测试里 import，模块本身不依赖它
+
+        detector = TrafficLightDetector()
+        detection = detector.detect(green_lamp_frame())
+        self.assertTrue(detection.valid, "3 号的检测器应该认出这盏绿灯")
+        self.assertEqual(detection.color, "green")
+
+        task = GreenJunctionTask(light_probe=make_light_probe(detector))
+        harness = TaskHarness(task=task)
+        harness.start_line(now=1.0)
+        now = 1.05
+        for _ in range(60):
+            now += 0.05
+            decision = harness.feed_image(now, green_lamp_frame())
+            if task.finished and decision.owner == "line":
+                break
+        self.assertTrue(
+            any(row.task_name == "green_junction" for row in harness.traces),
+            "绿灯亮着时模块应该接管",
+        )
+        self.assertEqual(task.chosen_branch, Branch.RIGHT)
+        self.assertEqual(task.state, JunctionState.COMPLETED)
+        self.assertEqual(harness.owner, "line")
 
 
 class CoordinatorHarnessTests(unittest.TestCase):
