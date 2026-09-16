@@ -12,11 +12,44 @@
 
 from evidence import EvidenceRecorder
 from free_junction import FreeJunctionTask
-from green_junction import GreenJunctionTask
+from green_junction import GreenJunctionTask, make_light_probe
 from number_marker import NumberMarkerTask
 from obstacle import ObstacleTask
 from route import RouteTask
-from traffic_light import TrafficLightTask
+from traffic_light import TrafficLightDetector, TrafficLightTask
+
+#: 绿岔路模块要的"现在是什么灯"。它自己不认灯（契约禁止它直接读别人的判定），
+#: 只接受一个注入缝 `light_probe(frame, now) -> LightReading`；而本注册表是
+#: **唯一无参构造任务的装配点**，所以这根线必须在这里接（见 PR#45 的 A14）。
+#:
+#: 两个必须注意的点（依据 PR#45 审查）：
+#: 1. 只包**无状态**的 `TrafficLightDetector`。不要包 `TrafficLightTask()`——
+#:    那会养出第二台灯机、自己往证据队列塞红灯截图（实测 state=holding_red）。
+#: 2. `min_confidence` 不取它默认的 0.0（等于来者不拒）；实车真绿灯实测
+#:    conf≈0.62，所以这里要求 0.40。
+LIGHT_PROBE_MIN_CONFIDENCE = 0.40
+
+
+def build_light_probe(detector=None, min_confidence=LIGHT_PROBE_MIN_CONFIDENCE):
+    """把交通灯模块的识别结果转成绿岔路模块要的灯色探针。
+
+    探针只做翻译，不重复判定：红绿灯识别仍由 `traffic_light` 负责。
+    看不见灯或认不出颜色时如实返回 UNKNOWN —— 绿岔路会因此**不接管**
+    （他的 A14：真的拿到红/绿读数才算有判据来源），于是不会再把握不住的
+    岔路从后面的模块手里抢走。构造失败就返回 None（等于没接探针）。
+    """
+    try:
+        detector = TrafficLightDetector() if detector is None else detector
+        return make_light_probe(detector, min_confidence=min_confidence)
+    except Exception:
+        return None
+
+
+def _build_task(cls, light_probe):
+    """按类装配任务；需要外部观测的模块在这里注入。"""
+    if cls is GreenJunctionTask:
+        return cls(light_probe=light_probe)
+    return cls()
 
 # 功能模块：一个文件 = 一个名额 = 一个人。顺序即接管优先级。
 #
@@ -51,9 +84,13 @@ def build_motion_tasks(enabled_names=None):
     task.  A tuple such as ``("route",)`` is intended for an isolated real-car
     test entry: the registry remains complete, while unrelated unfinished
     detectors cannot take over during that test.
+
+    **装配在这里接线**：绿岔路模块自己不认红绿灯，必须由这里注入灯色探针
+    （见 `build_light_probe`），否则它在生产环境下永远不会接管。
     """
+    light_probe = build_light_probe()
     if enabled_names is None:
-        return tuple(cls() for cls in MOTION_TASK_CLASSES)
+        return tuple(_build_task(cls, light_probe) for cls in MOTION_TASK_CLASSES)
 
     requested = tuple(enabled_names)
     if not requested:
@@ -65,7 +102,7 @@ def build_motion_tasks(enabled_names=None):
     unknown = tuple(name for name in requested if name not in by_name)
     if unknown:
         raise ValueError("unknown motion task(s): %s" % ", ".join(unknown))
-    return tuple(by_name[name]() for name in requested)
+    return tuple(_build_task(by_name[name], light_probe) for name in requested)
 
 
 def build_observers(capture_directory=None):
