@@ -1,12 +1,13 @@
 # 模块接口与协作说明
 
-公共接口版本：**v0.1（2026-09-11 核验冻结）**。本轮没有改变字段或运行语义。
+公共接口版本：**v0.2（Issue #15 批准）**。v0.2 只增加可选云台请求，v0.1 的既有字段、单位和调用顺序保持兼容。
 
 骨架版本：**v0.2-task-skeleton**（第 6 节）。骨架只做了**附加**：新增协调层 `coordinator.py`、
-注册表 `task_registry.py`、任务安全参数 `config.TaskConfig` 和模块协议。`models.py` 与
-`MODULE_GUIDE.md` 第 2 节里 v0.1 的任何字段、单位、调用顺序**都没有变化**，老模块不受影响。
+注册表 `task_registry.py`、任务安全参数 `config.TaskConfig` 和模块协议。第 2 节中
+v0.1 已有字段、单位和调用顺序**都没有变化**；v0.2 只在 `TaskUpdate` 末尾追加可选
+`gimbal` 字段，因此老模块不受影响。
 
-`models.py`、`camera_source.py`、`runtime.py`、`motion_output.py` 和 `main.py` 构成公共边界。**普通模块开发者不得自行修改；需要变更时先向项目负责人提出。** v0.1 冻结的是现有字段、单位和调用顺序，不代表巡线参数已经实车验证。
+`models.py`、`camera_source.py`、`runtime.py`、`motion_output.py`、`gimbal_output.py` 和 `main.py` 构成公共边界。**普通模块开发者不得自行修改；需要变更时先向项目负责人提出。** 接口冻结不代表巡线或云台参数已经实车验证。
 
 ## 1. 当前结构与启动
 
@@ -126,6 +127,7 @@ TaskUpdate(
     motion: Optional[MotionCommand] = None,
     detection: Optional[VisualDetection] = None,
     message: str = "",
+    gimbal: Optional[GimbalCommand] = None,
 )
 ```
 
@@ -137,6 +139,17 @@ def step(self, frame: FramePacket, now: float) -> TaskUpdate:
 ```
 
 `NOT_TRIGGERED` 表示当前帧不接管；`RUNNING` 表示继续处理；`COMPLETED` 和 `FAILED` 都应停止该任务的运动请求并交回主流程处理。`step()` 必须快速返回。
+
+### 云台请求（v0.2）
+
+```python
+GimbalCommand(
+    pitch: float,
+    yaw: float = 0.0,
+)
+```
+
+角度单位为度，表示相对机器人上电基准的绝对目标角。任务只把请求放入 `TaskUpdate.gimbal`；`GimbalOutput` 是唯一动态云台出口，并负责限幅、非有限值回退和相同请求去重。正式运行保持 `CHASSIS_LEAD`，因此底盘搜索时云台 yaw 跟随底盘，任务主要请求 pitch。任务完成、失败、超时、异常、人工停止或视频失效后，协调器恢复 `CONFIG.gimbal_pitch/gimbal_yaw`，等待 `gimbal_settle_seconds` 后才尝试恢复巡线。
 
 ### 巡线暂停和恢复
 
@@ -150,7 +163,7 @@ LineFollower.resume(timestamp: Optional[float] = None) -> bool
 
 接管顺序：`follower.pause()`，随后 `output.claim("external")`。交回顺序：任务零运动、`output.claim("line")`、`follower.reset_fault()`、处理一张新帧确认路线、`follower.resume()`。`resume()` 只有在停止状态且最近 `0.15 s` 内存在有效路线时返回 `True`，并重置控制历史。
 
-普通短时漏检由 `LineFollower` 在 `0.28 s` 内降速容错；超时锁定停车。长断线巡回属于未来外部任务，不能延长此时间冒充实现。
+普通短时漏检由 `LineFollower` 在 `0.28 s` 内降速容错；超时锁定停车。`RouteTask` 是独立的长断线恢复任务，必须在此后才接管，不能延长短时容错时间冒充实现。第二版仍只完成离线验证，专用视觉辅助在 `route_detector.py`，详见 `ROUTE_RECOVERY.md`。
 
 ## 3. 最小模块示例
 
@@ -209,6 +222,7 @@ python -m unittest discover -s tests -v
 | `traffic_light.py` | `TrafficLightTask` | 接管型 |
 | `obstacle.py` | `ObstacleTask` | 接管型 |
 | `route.py` | `RouteTask` | 接管型 |
+| `route_detector.py` | `RouteVision` | 长断线纯视觉辅助（不登记为任务） |
 | `green_junction.py` | `GreenJunctionTask` | 接管型 |
 | `free_junction.py` | `FreeJunctionTask` | 接管型 |
 | `evidence.py` | `EvidenceRecorder` | 观察型（基础设施，由整合负责人维护，不占名额） |
@@ -216,7 +230,7 @@ python -m unittest discover -s tests -v
 每个文件已在 `task_registry.py` 里登记好，组员**只替换文件内容**即可：
 
 ```python
-MOTION_TASK_CLASSES = (TrafficLightTask, NumberMarkerTask, ...)  # 可接管运动，顺序即优先级
+MOTION_TASK_CLASSES = (GreenJunctionTask, ObstacleTask, ...)  # 可接管运动，顺序即优先级
 OBSERVER_CLASSES = (EvidenceRecorder,)                            # 每帧可见，永不接管
 ```
 

@@ -24,6 +24,7 @@ from coordinator import (
 )
 from models import (
     FramePacket,
+    GimbalCommand,
     MotionCommand,
     TaskStatus,
     TaskUpdate,
@@ -49,6 +50,17 @@ class ScriptedTask:
         self.calls += 1
         index = min(self.calls - 1, len(self._updates) - 1)
         return self._updates[index]
+
+
+class ResettableScriptedTask(ScriptedTask):
+    """Stateful task double used to verify optional lifecycle cleanup."""
+
+    def __init__(self, updates, name="resettable"):
+        super().__init__(updates, name=name)
+        self.reset_calls = 0
+
+    def reset(self):
+        self.reset_calls += 1
 
 
 class NeverTask:
@@ -81,6 +93,23 @@ class ExplodingAfterTakeover:
         if self.calls == 1:
             return TaskUpdate(TaskStatus.RUNNING, motion=MotionCommand(forward=0.1))
         raise RuntimeError("task blew up while owning motion")
+
+
+class GimbalThenExplodes:
+    name = "gimbal_then_explodes"
+
+    def __init__(self):
+        self.calls = 0
+
+    def step(self, frame, now):
+        self.calls += 1
+        if self.calls == 1:
+            return TaskUpdate(
+                TaskStatus.RUNNING,
+                motion=MotionCommand(),
+                gimbal=GimbalCommand(pitch=CONFIG.gimbal_search_pitch),
+            )
+        raise RuntimeError("task failed after changing the view")
 
 
 class SlowTask:
@@ -234,6 +263,15 @@ class CoordinatorTests(unittest.TestCase):
         self.assertEqual(harness.owner, "line")
         self.assertTrue(decision.force_stop)
 
+    def test_normal_completion_does_not_erase_task_cooldown_state(self):
+        task = ResettableScriptedTask(
+            [running(MotionCommand(forward=0.1)), TaskUpdate(TaskStatus.COMPLETED)]
+        )
+        harness = TaskHarness(task=task)
+        harness.start_line(now=1.0)
+        harness.feed_line(1.10)
+        self.assertEqual(task.reset_calls, 0)
+
     def test_not_triggered_while_active_is_treated_as_failure(self):
         task = ScriptedTask(
             [running(MotionCommand(forward=0.1)), TaskUpdate(TaskStatus.NOT_TRIGGERED)]
@@ -266,13 +304,14 @@ class CoordinatorTests(unittest.TestCase):
         self.assertTrue(any("exception" in error for error in decision.errors))
 
     def test_task_running_too_long_is_released(self):
-        task = ScriptedTask([running(MotionCommand(forward=0.1))])
+        task = ResettableScriptedTask([running(MotionCommand(forward=0.1))])
         harness = TaskHarness(task=task, config=config_with(max_task_seconds=0.05))
         harness.start_line(now=1.0)
         decision = harness.feed_line(1.10)
         self.assertEqual(harness.owner, "line")
         self.assertTrue(decision.force_stop)
         self.assertTrue(any("max_task_seconds" in error for error in decision.errors))
+        self.assertEqual(task.reset_calls, 1)
 
     # -- release to resume ---------------------------------------------
     def test_release_waits_for_a_fresh_valid_frame_before_resuming(self):
@@ -427,6 +466,42 @@ class CoordinatorTests(unittest.TestCase):
         self.assertTrue(harness.coordinator.human_resume(1.25))
         self.assertTrue(harness.follower.motion_enabled)
 
+    def test_human_stop_resets_a_stateful_task(self):
+        task = ResettableScriptedTask([running(MotionCommand(forward=0.1))])
+        harness = TaskHarness(task=task)
+        harness.start_line(now=1.0)
+        harness.coordinator.human_stop(1.15)
+        self.assertEqual(task.reset_calls, 1)
+
+    def test_video_gap_resets_a_stateful_task(self):
+        task = ResettableScriptedTask([running(MotionCommand(forward=0.1))])
+        harness = TaskHarness(task=task)
+        harness.start_line(now=1.0)
+        harness.coordinator.video_gap(CONFIG.video_gap_stop_seconds, 1.30)
+        self.assertEqual(task.reset_calls, 1)
+
+    def test_short_video_gap_preserves_active_task(self):
+        task = ResettableScriptedTask(
+            [
+                running(MotionCommand(forward=0.1)),
+                running(MotionCommand(forward=0.1)),
+            ]
+        )
+        harness = TaskHarness(task=task)
+        harness.start_line(now=1.0)
+
+        decision = harness.coordinator.video_gap(0.02, 1.12)
+
+        self.assertEqual(harness.task_name, task.name)
+        self.assertEqual(harness.owner, "external")
+        self.assertEqual(task.reset_calls, 0)
+        self.assertEqual(decision.state, TASK_ACTIVE)
+        self.assertEqual(decision.task_name, task.name)
+        self.assertFalse(decision.force_stop)
+
+        harness.feed_line(1.14)
+        self.assertEqual(harness.task_name, task.name)
+
     def test_human_reset_ends_takeover(self):
         task = ScriptedTask([running(MotionCommand(forward=0.1))])
         harness = TaskHarness(task=task)
@@ -455,6 +530,51 @@ class CoordinatorTests(unittest.TestCase):
         )
         self.assertEqual(after.state, LINE_FOLLOWING)
         self.assertFalse(harness.follower.motion_enabled)
+
+    def test_video_gap_restores_a_task_changed_view(self):
+        task = ScriptedTask(
+            [
+                TaskUpdate(
+                    TaskStatus.RUNNING,
+                    motion=MotionCommand(),
+                    gimbal=GimbalCommand(pitch=CONFIG.gimbal_search_pitch),
+                )
+            ]
+        )
+        harness = TaskHarness(task=task)
+        harness.start_line(now=1.0)
+        self.assertEqual(
+            harness.gimbal.last_move()["pitch"], CONFIG.gimbal_search_pitch
+        )
+        harness.coordinator.video_gap(CONFIG.video_gap_stop_seconds, 1.30)
+        self.assertEqual(harness.gimbal.last_move()["pitch"], CONFIG.gimbal_pitch)
+
+    def test_gimbal_request_without_an_outlet_fails_safe(self):
+        task = ScriptedTask(
+            [TaskUpdate(TaskStatus.RUNNING, gimbal=GimbalCommand(pitch=-5.0))]
+        )
+        harness = TaskHarness()
+        harness.coordinator = TaskCoordinator(
+            CONFIG,
+            harness.follower,
+            harness.output,
+            motion_tasks=(task,),
+            observers=(),
+            gimbal_output=None,
+        )
+        decision = harness.start_line(now=1.0)
+        self.assertEqual(decision.state, RELEASING)
+        self.assertTrue(decision.force_stop)
+        self.assertTrue(any("gimbal" in error for error in decision.errors))
+
+    def test_task_exception_after_view_change_restores_line_view(self):
+        harness = TaskHarness(task=GimbalThenExplodes())
+        harness.start_line(now=1.0)
+        decision = harness.feed_line(1.10)
+        self.assertEqual(decision.state, RELEASING)
+        self.assertTrue(decision.force_stop)
+        self.assertEqual(harness.gimbal.last_move()["pitch"], CONFIG.gimbal_pitch)
+        self.assertTrue(any("exception" in error for error in decision.errors))
 
 
 if __name__ == "__main__":

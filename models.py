@@ -36,6 +36,14 @@ STOP_COMMAND = MotionCommand()
 
 
 @dataclass(frozen=True)
+class GimbalCommand:
+    """Absolute gimbal view request in degrees."""
+
+    pitch: float
+    yaw: float = 0.0
+
+
+@dataclass(frozen=True)
 class VisualDetection:
     """Common result for task detectors; coordinates are full-frame pixels."""
 
@@ -67,6 +75,7 @@ class TaskUpdate:
     motion: Optional[MotionCommand] = None
     detection: Optional[VisualDetection] = None
     message: str = ""
+    gimbal: Optional[GimbalCommand] = None
 
 @dataclass(frozen=True)
 class RuntimeDecision:

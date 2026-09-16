@@ -1,84 +1,1017 @@
-"""长断线巡回（WP6a / Issue #6）。
+"""Bounded long-gap recovery task (WP6a / Issue #6).
 
-状态：**空实现**。骨架已经把这个文件登记进 task_registry，你只要替换下面的
-`RouteTask.step()`，就自动接入主流程，不需要改 main.py 或协调器。
+Brief image misses remain the base follower's responsibility.  This task also
+recognises the intermediate case where the far sample has vanished but the old
+route is still under the bottom of the camera: it crawls to the physical end
+before raising the shared view and crossing a bounded blank area.
 
-职责边界（违反会被 tests/test_task_contract.py 直接拦下）：
-  * 只接收主流程给的 FramePacket，绝不自己开相机或视频流。
-  * 只返回 VisualDetection / TaskUpdate / MotionCommand，绝不直接调用 SDK，
-    也不接触底盘的唯一运动出口。
-  * step() 必须立刻返回：巡逻和扫线都必须是"每帧一小步"，不许阻塞。
-
-**最重要的一条**：长断线是外部任务，**不许**通过延长基础底座的
-lost_grace_seconds（0.28 秒）来冒充。基础底座的短时容错归巡线管，
-本模块只处理线真的断了以后的情况。
-
-允许接管的时机（骨架已经强制）：基础巡线处于 TRACKING / COASTING / LINE_LOST。
-也就是说线刚断、lock 之前你能接管，lock 之后（LINE_LOST）你也能接管；
-但 VIDEO_LOST 和人工暂停（STOPPED）时你绝不能接管，模块不可能自己启动车。
-
-必须实现的接口（签名已冻结，不要改）：
-    class RouteTask:
-        name = "route"
-        def step(self, frame: FramePacket, now: float) -> TaskUpdate
-
-返回约定：
-  * 线还在     -> TaskUpdate(TaskStatus.NOT_TRIGGERED)，把活留给巡线
-  * 正在巡逻   -> TaskUpdate(TaskStatus.RUNNING, motion=MotionCommand(...))
-  * 找回线     -> TaskUpdate(TaskStatus.COMPLETED)
-  * 找不到/超时 -> TaskUpdate(TaskStatus.FAILED)
-  一旦返回 RUNNING，就必须持续返回 RUNNING，直到 COMPLETED 或 FAILED。
-
-骨架已经替你实现的安全护栏（你不用自己写）：
-  * 前进 <= 0.30 m/s、横移 <= 0.25 m/s、yaw <= 90 deg/s，超出会被裁掉并记录；
-  * 单个任务连续接管超过 20 秒会被强制释放并硬停车——**你自己也要有硬超时**，
-    不许无限扫描、无限转圈；
-  * 完成后骨架会硬停车、清巡线历史、等一张新鲜有效路线再恢复。
-
-参考蓝本（全场最赚的一个名额，竞速工程有现成实现，照着改）：
-  * blue_line_following/line_following_core.py:81-131 `_search_decision()`
-      —— 用最后看到的线路方向决定首扫方向、扫线期间前进强制为 0、
-         超过搜索预算硬停、按 sweep_index 奇偶左右交替扫
-  * blue_line_following/race_v32_config.py:186-201
-      —— MAX_SEARCH_TIME=1.80 / 首扫 0.28s / 全扫 0.56s / 扫线 340 deg/s /
-         REACQUIRE_STABLE_FRAMES=3 / REACQUIRE_MAX_ERROR_JUMP=0.45
-  * blue_line_following/race_v32_config.py:58-63
-      —— 断口两侧真实线段按几何关系续连的参数（GAP_FRAGMENT_*）
-
-先看 tests/test_route.py 的用例区再动手。
-单独自测：python scripts/check_module.py route
+The module consumes only ``FramePacket`` and returns typed motion/gimbal
+requests.  It never connects hardware and every call is non-blocking.
 """
 
-from typing import Optional
+from math import atan2, cos, degrees, radians, sin
+from typing import List, Optional, Tuple
 
-from models import FramePacket, TaskStatus, TaskUpdate, VisualDetection
+from config import CONFIG
+from line_detector import LineDetector
+from models import (
+    FramePacket,
+    GimbalCommand,
+    MotionCommand,
+    STOP_COMMAND,
+    TaskStatus,
+    TaskUpdate,
+    VisualDetection,
+)
+from route_detector import (
+    BottomLineObservation,
+    RouteCandidate,
+    RoutePathObservation,
+    RouteVision,
+)
+
 
 KIND = "route"
+MONITORING = "monitoring"
+END_APPROACH = "end_approach"
+CORNERING = "cornering"
+RAISING_VIEW = "raising_view"
+BRIDGING = "bridging"
 SEARCHING = "searching"
+ALIGNING = "aligning"
+CENTERING = "centering"
+DOCKING = "docking"
 REACQUIRING = "reacquiring"
+
+# Initial values only.  None has been validated on the real course.
+TRIGGER_MARGIN_SECONDS = 0.05
+END_PENDING_SECONDS = 0.08
+END_MISSING_SECONDS = 0.14
+# At 0.08 m/s the previous 2.5 s budget covered only about 0.20 m.  On the
+# real camera the far sample can disappear earlier than that, so the task was
+# failing at the physical endpoint before it could raise the view.  Keep this
+# phase bounded, but allow roughly 0.40 m of bottom-line following.
+END_APPROACH_MAX_SECONDS = 5.0
+END_APPROACH_SPEED = 0.10
+END_APPROACH_YAW_GAIN = 32.0
+END_APPROACH_MAX_YAW = 16.0
+
+VIEW_SETTLE_MARGIN_SECONDS = 0.12
+TOTAL_RECOVERY_SECONDS = 19.0
+BRIDGE_MAX_SECONDS = 3.0
+# Real-car feedback showed that the previous 0.12 m/s request could fail to
+# overcome the stopped chassis' static friction.  Keep this well inside the
+# external-task envelope, but give the bounded crossing a usable start speed.
+BRIDGE_MIN_SECONDS = 0.80
+BRIDGE_FORWARD_SPEED = 0.18
+FRAGMENT_LOSS_SECONDS = 0.20
+
+SEARCH_YAW_SPEED = 45.0
+SEARCH_CONFIRM_YAW_SPEED = 30.0
+SEARCH_SOFT_LIMIT_DEG = 95.0
+SEARCH_HARD_LIMIT_DEG = 100.0
+SEARCH_TARGETS_DEG = (30.0, 60.0, 95.0, -30.0, -60.0, -95.0)
+SEARCH_TARGET_TOLERANCE_DEG = 2.5
+
+CANDIDATE_CONFIRM_FRAMES = 3
+REACQUIRE_STABLE_FRAMES = 3
+REACQUIRE_MAX_CENTER_JUMP = 0.24
+REACQUIRE_MAX_ANGLE_JUMP = 42.0
+NEAR_ENTER_RATIO = 0.78
+NEAR_EXIT_RATIO = 0.70
+OLD_LINE_CLEAR_DISTANCE = 0.07
+MIN_ENDPOINT_GAP_DISTANCE = 0.08
+MAX_ENDPOINT_GAP_DISTANCE = 1.40
+ALIGN_ANGLE_DEG = 18.0
+ALIGN_YAW_GAIN = 0.55
+ALIGN_MIN_YAW = 8.0
+DOCK_FORWARD_SPEED = 0.08
+DOCK_TARGET_ERROR = 0.13
+DOCK_ANGLE_DEG = 25.0
+DOCK_MAX_YAW = 22.0
+CORNER_FORWARD_SPEED = 0.07
+CORNER_MAX_YAW = 38.0
+CENTER_TARGET_ERROR = 0.11
+CENTER_LATERAL_GAIN = 0.16
+CENTER_MAX_LATERAL = 0.12
+DOCK_LATERAL_GAIN = 0.12
+DOCK_MAX_LATERAL = 0.09
+RIGHT_ANGLE_MIN_DEG = 50.0
+RIGHT_ANGLE_MAX_DEG = 130.0
+HANDOFF_VIEW_TIMEOUT_SECONDS = 2.0
+MAX_INTEGRATION_STEP_SECONDS = 0.20
 
 
 class RouteTask:
-    """TODO(WP6a)：把 detect() 换成真实线路判断，再补 step() 的巡逻/重获状态机。"""
+    """Find and join a disconnected route with bounded camera-only motion."""
 
     name = "route"
 
     def __init__(self, settings: Optional[object] = None) -> None:
-        self.settings = settings
-        self.last_detection = VisualDetection.no_result(KIND)
-        self.state = SEARCHING
-        self.started_at = None
-        self.sweep_direction = 1.0
-        self.stable_frames = 0
+        self.settings = CONFIG if settings is None else settings
+        self._vision_settings = getattr(self.settings, "vision", CONFIG.vision)
+        control = getattr(self.settings, "control", CONFIG.control)
+        self._line_detector = LineDetector(self._vision_settings)
+        self._route_vision = RouteVision(self._vision_settings)
+        self._lost_grace = float(control.lost_grace_seconds)
+        self._line_pitch = float(
+            getattr(self.settings, "gimbal_pitch", CONFIG.gimbal_pitch)
+        )
+        self._search_pitch = float(
+            getattr(self.settings, "gimbal_search_pitch", CONFIG.gimbal_search_pitch)
+        )
+        self._search_yaw = float(
+            getattr(self.settings, "gimbal_yaw", CONFIG.gimbal_yaw)
+        )
+        pitch_speed = max(
+            float(getattr(self.settings, "gimbal_pitch_speed", 30.0)), 1.0
+        )
+        configured_settle = float(
+            getattr(self.settings, "gimbal_settle_seconds", 0.45)
+        )
+        physical_travel = abs(self._search_pitch - self._line_pitch) / pitch_speed
+        self._view_settle_seconds = max(
+            configured_settle, physical_travel + VIEW_SETTLE_MARGIN_SECONDS
+        )
 
-    def detect(self, frame) -> VisualDetection:
-        """TODO(WP6a)：返回线路的存在性与位置；线清楚时返回 no_result 交给巡线。"""
-        return VisualDetection.no_result(KIND)
+        self.last_detection = VisualDetection.no_result(KIND)
+        self.state = MONITORING
+        self.started_at: Optional[float] = None
+        self._phase_started_at: Optional[float] = None
+        self._last_clear_at: Optional[float] = None
+        self._possible_end_at: Optional[float] = None
+        self._bottom_missing_at: Optional[float] = None
+        self._last_line_x: Optional[float] = None
+        self._last_line_tangent: Optional[float] = None
+        self._last_tracking_direction = 1.0
+        self._search_direction = 1.0
+
+        self._bottom = BottomLineObservation(False)
+        self._path = RoutePathObservation(False)
+        self._candidate: Optional[RouteCandidate] = None
+        self._candidate_frames = 0
+        self._candidate_seen_far = False
+        self._candidate_near = False
+        self._candidate_center: Optional[Tuple[int, int]] = None
+        self._candidate_angle: Optional[float] = None
+        self._candidate_last_at: Optional[float] = None
+        self._candidate_last_sequence: Optional[int] = None
+        self._stable_last_sequence: Optional[int] = None
+        self._stable_frames = 0
+
+        # Conservative command integration provides a bounded fallback when
+        # the integration layer has not yet supplied chassis odometry.
+        self._pose_forward = 0.0
+        self._pose_lateral = 0.0
+        self._heading_offset = 0.0
+        self._last_motion_at: Optional[float] = None
+        self._last_motion = STOP_COMMAND
+        self._search_targets: List[float] = []
+        self._search_target_index = 0
+        self._old_tangent_world: Optional[float] = None
+        self._corner_missing_at: Optional[float] = None
+
+    @property
+    def active(self) -> bool:
+        return self.state != MONITORING
+
+    @property
+    def estimated_forward_progress(self) -> float:
+        """Command-integrated departure progress, for diagnostics/tests."""
+        return self._pose_forward
+
+    @property
+    def estimated_heading_offset(self) -> float:
+        return self._heading_offset
+
+    @property
+    def candidate_near(self) -> bool:
+        """Hysteresis-filtered near/far classification for diagnostics."""
+        return self._candidate_near
+
+    def reset(self) -> None:
+        """Cancel all recovery history after a human/video/fault stop."""
+        self.state = MONITORING
+        self.started_at = None
+        self._phase_started_at = None
+        self._last_clear_at = None
+        self._possible_end_at = None
+        self._bottom_missing_at = None
+        self._last_line_x = None
+        self._last_line_tangent = None
+        self._bottom = BottomLineObservation(False)
+        self._path = RoutePathObservation(False)
+        self._candidate = None
+        self._candidate_frames = 0
+        self._candidate_seen_far = False
+        self._candidate_near = False
+        self._candidate_center = None
+        self._candidate_angle = None
+        self._candidate_last_at = None
+        self._candidate_last_sequence = None
+        self._stable_last_sequence = None
+        self._stable_frames = 0
+        self._pose_forward = 0.0
+        self._pose_lateral = 0.0
+        self._heading_offset = 0.0
+        self._last_motion_at = None
+        self._last_motion = STOP_COMMAND
+        self._search_targets = []
+        self._search_target_index = 0
+        self._old_tangent_world = None
+        self._corner_missing_at = None
+        self.last_detection = VisualDetection.no_result(KIND)
+        self._line_detector.reset()
+
+    def _integrate_previous_command(self, now: float) -> None:
+        if self._last_motion_at is None:
+            self._last_motion_at = now
+            return
+        elapsed = max(
+            0.0,
+            min(now - self._last_motion_at, MAX_INTEGRATION_STEP_SECONDS),
+        )
+        heading = radians(self._heading_offset)
+        forward = self._last_motion.forward * elapsed
+        lateral = self._last_motion.lateral * elapsed
+        self._pose_forward += forward * cos(heading) - lateral * sin(heading)
+        self._pose_lateral += forward * sin(heading) + lateral * cos(heading)
+        self._heading_offset += self._last_motion.yaw * elapsed
+        self._heading_offset = max(
+            -SEARCH_HARD_LIMIT_DEG,
+            min(self._heading_offset, SEARCH_HARD_LIMIT_DEG),
+        )
+        self._last_motion_at = now
+
+    def _record_motion(self, motion: MotionCommand, now: float) -> None:
+        self._last_motion = motion
+        self._last_motion_at = now
+
+    @staticmethod
+    def _normal_update(detection=None) -> TaskUpdate:
+        return TaskUpdate(
+            TaskStatus.NOT_TRIGGERED,
+            detection=VisualDetection.no_result(KIND)
+            if detection is None
+            else detection,
+        )
+
+    def _gimbal_request(self) -> GimbalCommand:
+        return GimbalCommand(pitch=self._search_pitch, yaw=self._search_yaw)
+
+    def _running(
+        self,
+        now: float,
+        motion: MotionCommand,
+        message: str,
+        detection: Optional[VisualDetection] = None,
+        search_view: bool = True,
+    ) -> TaskUpdate:
+        self._record_motion(motion, now)
+        return TaskUpdate(
+            TaskStatus.RUNNING,
+            motion=motion,
+            detection=self.last_detection if detection is None else detection,
+            message=message,
+            gimbal=self._gimbal_request() if search_view else None,
+        )
+
+    def _finish(self, status: TaskStatus, message: str) -> TaskUpdate:
+        detection = (
+            self._candidate.detection
+            if self._candidate is not None
+            else self.last_detection
+        )
+        self.reset()
+        return TaskUpdate(
+            status,
+            motion=STOP_COMMAND,
+            detection=detection,
+            message=message,
+        )
+
+    def _remember_clear_line(self, line, now: float) -> None:
+        self._last_clear_at = now
+        self._possible_end_at = None
+        if line.near_point is not None:
+            self._last_line_x = float(line.near_point[0])
+        if line.near_point is not None and line.far_point is not None:
+            dx = float(line.far_point[0] - line.near_point[0])
+            dy = float(line.far_point[1] - line.near_point[1])
+            self._last_line_tangent = degrees(atan2(dx, max(-dy, 1e-6)))
+        if abs(line.error) >= 0.04:
+            self._last_tracking_direction = 1.0 if line.error > 0.0 else -1.0
+
+    @staticmethod
+    def _center_continuous(
+        current: Tuple[int, int],
+        previous: Optional[Tuple[int, int]],
+        frame_width: int,
+    ) -> bool:
+        if previous is None:
+            return True
+        return (
+            abs(current[0] - previous[0]) / max(frame_width, 1)
+            <= REACQUIRE_MAX_CENTER_JUMP
+        )
+
+    @staticmethod
+    def _angle_difference(first: float, second: float) -> float:
+        """Smallest difference between two undirected line angles."""
+        difference = abs(float(first) - float(second)) % 180.0
+        return min(difference, 180.0 - difference)
+
+    def _select_candidate(
+        self, candidates: List[RouteCandidate], frame_width: int
+    ) -> Optional[RouteCandidate]:
+        candidates = [item for item in candidates if self._candidate_geometry_ok(item)]
+        if not candidates:
+            return None
+        if self._candidate_center is None:
+            return candidates[0]
+
+        ranked = []
+        for candidate in candidates:
+            center = candidate.detection.center
+            if center is None:
+                continue
+            distance = abs(center[0] - self._candidate_center[0]) / max(
+                frame_width, 1
+            )
+            angle_jump = (
+                0.0
+                if self._candidate_angle is None
+                else self._angle_difference(
+                    candidate.angle_deg, self._candidate_angle
+                )
+            )
+            # Do not jump to an unrelated blue fragment merely because its
+            # independent score is high.  A genuinely new candidate may be
+            # selected after FRAGMENT_LOSS_SECONDS clears this history.
+            if (
+                distance > REACQUIRE_MAX_CENTER_JUMP
+                or angle_jump > REACQUIRE_MAX_ANGLE_JUMP
+            ):
+                continue
+            continuity = max(0.0, 1.0 - distance / 0.35)
+            angle_score = max(0.0, 1.0 - angle_jump / 70.0)
+            ranked.append(
+                (candidate.score + 0.30 * continuity + 0.15 * angle_score, candidate)
+            )
+        return max(ranked, key=lambda item: item[0])[1] if ranked else None
+
+    def _candidate_geometry_ok(self, candidate: RouteCandidate) -> bool:
+        """Cheap gate applied before temporal tracking can lock onto old tape."""
+        endpoint = candidate.entry_endpoint
+        if endpoint is None:
+            return False
+        # A new target must first present a physical internal endpoint.  Once
+        # that same target has been tracked, its endpoint may legitimately
+        # leave through the bottom edge while the chassis docks onto it.
+        if not endpoint.internal and self._candidate_center is None:
+            return False
+        if self._old_tangent_world is None:
+            return True
+        # 集成侧注释（2026-09-16，一次争议的定案）：
+        # 相机固连车体，车体转过 ψ 之后，**同一个世界里的特征在图像里的切向会跟着变**
+        # （世界角 90° 的直角新线，在车体系里表现为 90° − ψ）。`_old_tangent_world` 是
+        # 丢线那一刻（ψ≈0）记下的角度，等于世界角，所以
+        #     世界角 = 图像切向 + ψ
+        # **这里的"加"是对的，不要改成减。** 审查曾把它判成"多算两倍"并建议改成
+        # `tangent − heading_offset`；实测那样会让真正的直角新线在扫到 ±30°/±45°/±60°
+        # 时被拒绝（车就再也找不到线）。证据与回归测试：
+        #   tools/probe_route_frame_formula.py、tests/test_route_endpoint_frame.py
+        world_tangent = self._heading_offset + endpoint.tangent_deg
+        turn = self._angle_difference(world_tangent, self._old_tangent_world)
+        return RIGHT_ANGLE_MIN_DEG <= turn <= RIGHT_ANGLE_MAX_DEG
+
+    def _observe_candidate(self, frame: FramePacket, now: float) -> None:
+        candidates = self._route_vision.candidates(frame.image)
+        selected = self._select_candidate(candidates, frame.image.shape[1])
+        self._candidate = selected
+        if selected is None or selected.detection.center is None:
+            if (
+                self._candidate_last_at is None
+                or now - self._candidate_last_at >= FRAGMENT_LOSS_SECONDS
+            ):
+                self._candidate_frames = 0
+                self._candidate_seen_far = False
+                self._candidate_near = False
+                self._candidate_center = None
+                self._candidate_angle = None
+                self._candidate_last_sequence = None
+            self.last_detection = VisualDetection.no_result(KIND)
+            return
+
+        self.last_detection = selected.detection
+        center = selected.detection.center
+        continuous = self._center_continuous(
+            center, self._candidate_center, frame.image.shape[1]
+        ) and (
+            self._candidate_angle is None
+            or self._angle_difference(selected.angle_deg, self._candidate_angle)
+            <= REACQUIRE_MAX_ANGLE_JUMP
+        )
+        if self._candidate_near:
+            self._candidate_near = selected.bottom_ratio > NEAR_EXIT_RATIO
+        else:
+            self._candidate_near = selected.bottom_ratio >= NEAR_ENTER_RATIO
+        if frame.sequence != self._candidate_last_sequence:
+            self._candidate_frames = self._candidate_frames + 1 if continuous else 1
+            self._candidate_seen_far = (
+                self._candidate_seen_far or not self._candidate_near
+            ) if continuous else not self._candidate_near
+            self._candidate_last_sequence = frame.sequence
+        self._candidate_center = center
+        self._candidate_angle = selected.angle_deg
+        self._candidate_last_at = now
+
+    def _candidate_world_position(
+        self, candidate: RouteCandidate, frame: FramePacket
+    ) -> Tuple[float, float]:
+        """Approximate candidate endpoint relative to the saved old endpoint.
+
+        This is deliberately a conservative image/command estimate until a
+        calibrated image-to-ground transform or chassis pose is wired by the
+        integration owner.  It is still useful as a bounded endpoint-pairing
+        gate and is not presented as odometry.
+        """
+        height, width = frame.image.shape[:2]
+        point = (
+            candidate.entry_endpoint.point
+            if candidate.entry_endpoint is not None
+            else candidate.lower_point
+        )
+        y_ratio = point[1] / max(height, 1)
+        x_error = (
+            point[0] - width / 2.0
+        ) / max(width / 2.0, 1.0)
+        local_forward = 0.06 + max(0.0, 1.0 - y_ratio) * 0.80
+        local_lateral = x_error * local_forward * 0.85
+        heading = radians(self._heading_offset)
+        return (
+            self._pose_forward
+            + local_forward * cos(heading)
+            - local_lateral * sin(heading),
+            self._pose_lateral
+            + local_forward * sin(heading)
+            + local_lateral * cos(heading),
+        )
+
+    def _candidate_ready(self, frame: FramePacket) -> Tuple[bool, str]:
+        if self._candidate is None:
+            return False, "no route fragment"
+        if self._candidate_frames < CANDIDATE_CONFIRM_FRAMES:
+            return False, (
+                f"confirming candidate {self._candidate_frames}/"
+                f"{CANDIDATE_CONFIRM_FRAMES}"
+            )
+        endpoint = self._candidate.entry_endpoint
+        if endpoint is None or not endpoint.internal:
+            return False, "candidate has no internal gap-facing endpoint"
+        height = frame.image.shape[0]
+        endpoint_ratio = endpoint.point[1] / max(height, 1)
+        if endpoint_ratio < 0.18:
+            return False, "candidate endpoint is too close to the upper image edge"
+        if self._old_tangent_world is not None:
+            world_tangent = self._heading_offset + endpoint.tangent_deg
+            turn = self._angle_difference(world_tangent, self._old_tangent_world)
+            if not RIGHT_ANGLE_MIN_DEG <= turn <= RIGHT_ANGLE_MAX_DEG:
+                return False, (
+                    f"candidate rejected as old/non-right-angle route ({turn:.0f}deg)"
+                )
+        endpoint_x, endpoint_y = self._candidate_world_position(
+            self._candidate, frame
+        )
+        gap_distance = (endpoint_x * endpoint_x + endpoint_y * endpoint_y) ** 0.5
+        if endpoint_x <= 0.02:
+            return False, "candidate rejected behind old-route departure gate"
+        if not MIN_ENDPOINT_GAP_DISTANCE <= gap_distance <= MAX_ENDPOINT_GAP_DISTANCE:
+            return False, (
+                f"candidate endpoint gap {gap_distance:.2f}m outside bounded gate"
+            )
+        if (
+            self._candidate_near
+            and self._pose_forward < OLD_LINE_CLEAR_DISTANCE
+            and not self._candidate_seen_far
+        ):
+            return False, "near candidate rejected before clearing old route"
+        return True, "candidate confirmed ahead of old-route gate"
+
+    def _begin_end_approach(self, now: float) -> None:
+        self.state = END_APPROACH
+        self.started_at = now
+        self._phase_started_at = now
+        self._bottom_missing_at = None
+        self._pose_forward = 0.0
+        self._pose_lateral = 0.0
+        self._heading_offset = 0.0
+        self._last_motion_at = now
+        self._last_motion = STOP_COMMAND
+        if self._path.endpoint is not None:
+            self._old_tangent_world = self._path.endpoint.tangent_deg
+
+    def _begin_raise(self, now: float) -> None:
+        if self.started_at is None:
+            self.started_at = now
+        # The departure gate is the physical endpoint, not the beginning of
+        # END_APPROACH.  Reset the local pose when the bottom route vanishes.
+        self._pose_forward = 0.0
+        self._pose_lateral = 0.0
+        self._heading_offset = 0.0
+        self._last_motion_at = now
+        self._last_motion = STOP_COMMAND
+        if self._old_tangent_world is None:
+            self._old_tangent_world = self._last_line_tangent
+        self.state = RAISING_VIEW
+        self._phase_started_at = now
+        self._search_direction = self._last_tracking_direction
+        self._candidate_frames = 0
+        self._candidate_seen_far = False
+        self._candidate_near = False
+        self._candidate_center = None
+        self._candidate_angle = None
+        self._candidate_last_sequence = None
+        self._stable_last_sequence = None
+        self._line_detector.reset()
+
+    def _begin_search(self, now: float) -> None:
+        self.state = SEARCHING
+        self._phase_started_at = now
+        self._search_targets = [
+            self._search_direction * target for target in SEARCH_TARGETS_DEG
+        ]
+        self._search_target_index = 0
+
+    def _start_align(self, now: float) -> None:
+        self.state = ALIGNING
+        self._phase_started_at = now
+        self._stable_frames = 0
+        self._stable_last_sequence = None
+
+    def _start_centering(self, now: float) -> None:
+        self.state = CENTERING
+        self._phase_started_at = now
+        self._stable_frames = 0
+        self._stable_last_sequence = None
+
+    def _start_docking(self, now: float) -> None:
+        self.state = DOCKING
+        self._phase_started_at = now
+        self._stable_frames = 0
+        self._stable_last_sequence = None
+
+    def _start_reacquiring(self, now: float) -> None:
+        self.state = REACQUIRING
+        self._phase_started_at = now
+        self._stable_frames = 0
+        self._stable_last_sequence = None
+        self._line_detector.reset()
+
+    @staticmethod
+    def _candidate_target_error(
+        candidate: RouteCandidate, frame: FramePacket
+    ) -> float:
+        width = frame.image.shape[1]
+        # The contour centroid moves sideways as a long oblique segment enters
+        # the image.  Its lower endpoint is the actual place the chassis must
+        # reach, so steer to that instead.
+        point = (
+            candidate.entry_endpoint.point
+            if candidate.entry_endpoint is not None
+            else candidate.lower_point
+        )
+        return float(
+            (point[0] - width / 2.0)
+            / max(width / 2.0, 1.0)
+        )
+
+    @staticmethod
+    def _alignment_yaw(angle_deg: float) -> float:
+        if abs(angle_deg) <= ALIGN_ANGLE_DEG:
+            return 0.0
+        yaw = max(
+            -SEARCH_CONFIRM_YAW_SPEED,
+            min(angle_deg * ALIGN_YAW_GAIN, SEARCH_CONFIRM_YAW_SPEED),
+        )
+        if abs(yaw) < ALIGN_MIN_YAW:
+            yaw = ALIGN_MIN_YAW if yaw > 0.0 else -ALIGN_MIN_YAW
+        return float(yaw)
+
+    def _line_view_running(self, now: float, message: str) -> TaskUpdate:
+        self._record_motion(STOP_COMMAND, now)
+        return TaskUpdate(
+            TaskStatus.RUNNING,
+            motion=STOP_COMMAND,
+            detection=self.last_detection,
+            message=message,
+            gimbal=GimbalCommand(pitch=self._line_pitch, yaw=self._search_yaw),
+        )
+
+    def _step_end_approach(self, line, now: float) -> TaskUpdate:
+        if line.valid:
+            return self._finish(
+                TaskStatus.COMPLETED,
+                "complete line returned before physical endpoint",
+            )
+        if now - float(self._phase_started_at) >= END_APPROACH_MAX_SECONDS:
+            return self._finish(
+                TaskStatus.FAILED,
+                "old route endpoint approach timed out",
+            )
+        if not self._bottom.present:
+            if self._bottom_missing_at is None:
+                self._bottom_missing_at = now
+            if now - self._bottom_missing_at >= END_MISSING_SECONDS:
+                self._begin_raise(now)
+                return self._running(
+                    now,
+                    STOP_COMMAND,
+                    "old route endpoint confirmed; raising view",
+                )
+            return self._running(
+                now,
+                STOP_COMMAND,
+                "bottom route missing; confirming endpoint while stopped",
+                search_view=False,
+            )
+
+        self._bottom_missing_at = None
+        yaw = max(
+            -END_APPROACH_MAX_YAW,
+            min(
+                self._bottom.error * END_APPROACH_YAW_GAIN,
+                END_APPROACH_MAX_YAW,
+            ),
+        )
+        return self._running(
+            now,
+            MotionCommand(forward=END_APPROACH_SPEED, yaw=yaw),
+            "following bottom route to its physical endpoint",
+            self._bottom.detection,
+            search_view=False,
+        )
+
+    def _step_search(self, frame: FramePacket, now: float) -> TaskUpdate:
+        ready, reason = self._candidate_ready(frame)
+        if ready:
+            self._start_align(now)
+            return self._running(now, STOP_COMMAND, reason, self._candidate.detection)
+
+        if self._search_target_index >= len(self._search_targets):
+            return self._finish(TaskStatus.FAILED, "bounded route search exhausted")
+        target = self._search_targets[self._search_target_index]
+        target = max(-SEARCH_SOFT_LIMIT_DEG, min(target, SEARCH_SOFT_LIMIT_DEG))
+        error = target - self._heading_offset
+        if abs(error) <= SEARCH_TARGET_TOLERANCE_DEG:
+            self._search_target_index += 1
+            return self._running(
+                now,
+                STOP_COMMAND,
+                f"search heading {target:.0f}deg inspected; advancing sweep",
+            )
+        speed = (
+            SEARCH_CONFIRM_YAW_SPEED
+            if abs(error) < 12.0 or self._candidate is not None
+            else SEARCH_YAW_SPEED
+        )
+        yaw = speed if error > 0.0 else -speed
+        message = f"searching toward {target:.0f}deg"
+        if self._candidate is not None:
+            message = f"{message}; {reason}"
+        return self._running(
+            now,
+            MotionCommand(yaw=yaw),
+            message,
+            self._candidate.detection if self._candidate is not None else None,
+        )
+
+    def _step_align(self, frame: FramePacket, now: float) -> TaskUpdate:
+        if self._candidate is None:
+            if (
+                self._candidate_last_at is not None
+                and now - self._candidate_last_at < FRAGMENT_LOSS_SECONDS
+            ):
+                return self._running(
+                    now, STOP_COMMAND, "route heading briefly missing; stopped"
+                )
+            self._begin_search(now)
+            return self._running(
+                now, STOP_COMMAND, "route heading lost; returning to search"
+            )
+        aligned = abs(self._candidate.angle_deg) <= ALIGN_ANGLE_DEG
+        if frame.sequence != self._stable_last_sequence:
+            self._stable_frames = self._stable_frames + 1 if aligned else 0
+            self._stable_last_sequence = frame.sequence
+        if self._stable_frames >= REACQUIRE_STABLE_FRAMES:
+            self._start_centering(now)
+            return self._running(
+                now,
+                STOP_COMMAND,
+                "route heading aligned; centering gap endpoint",
+                self._candidate.detection,
+            )
+        yaw = self._alignment_yaw(self._candidate.angle_deg)
+        return self._running(
+            now,
+            MotionCommand(yaw=yaw),
+            f"aligning route heading {self._stable_frames}/"
+            f"{REACQUIRE_STABLE_FRAMES}",
+            self._candidate.detection,
+        )
+
+    def _step_centering(self, frame: FramePacket, now: float) -> TaskUpdate:
+        if self._candidate is None:
+            if (
+                self._candidate_last_at is not None
+                and now - self._candidate_last_at < FRAGMENT_LOSS_SECONDS
+            ):
+                return self._running(
+                    now, STOP_COMMAND, "route endpoint briefly missing; stopped"
+                )
+            self._begin_search(now)
+            return self._running(
+                now, STOP_COMMAND, "route endpoint lost; returning to search"
+            )
+        if abs(self._candidate.angle_deg) > ALIGN_ANGLE_DEG:
+            self._start_align(now)
+            return self._running(
+                now, STOP_COMMAND, "heading drifted while centering; realigning"
+            )
+        error = self._candidate_target_error(self._candidate, frame)
+        centered = abs(error) <= CENTER_TARGET_ERROR
+        if frame.sequence != self._stable_last_sequence:
+            self._stable_frames = self._stable_frames + 1 if centered else 0
+            self._stable_last_sequence = frame.sequence
+        if self._stable_frames >= REACQUIRE_STABLE_FRAMES:
+            self._start_docking(now)
+            return self._running(
+                now, STOP_COMMAND, "gap endpoint centered; docking"
+            )
+        lateral = max(
+            -CENTER_MAX_LATERAL,
+            min(error * CENTER_LATERAL_GAIN, CENTER_MAX_LATERAL),
+        )
+        return self._running(
+            now,
+            MotionCommand(lateral=lateral),
+            f"centering gap endpoint {self._stable_frames}/"
+            f"{REACQUIRE_STABLE_FRAMES}",
+            self._candidate.detection,
+        )
+
+    def _step_docking(self, frame: FramePacket, now: float) -> TaskUpdate:
+        if self._candidate is None:
+            if (
+                self._candidate_last_at is not None
+                and now - self._candidate_last_at < FRAGMENT_LOSS_SECONDS
+            ):
+                return self._running(
+                    now, STOP_COMMAND, "final-approach route briefly missing; stopped"
+                )
+            self._begin_search(now)
+            return self._running(
+                now, STOP_COMMAND, "final-approach route lost; returning to search"
+            )
+        if abs(self._candidate.angle_deg) > DOCK_ANGLE_DEG:
+            self._start_align(now)
+            return self._running(
+                now,
+                STOP_COMMAND,
+                "route heading drifted; realigning before final approach",
+                self._candidate.detection,
+            )
+        target_error = self._candidate_target_error(self._candidate, frame)
+        ready = self._candidate_near and abs(target_error) <= DOCK_TARGET_ERROR
+        if frame.sequence != self._stable_last_sequence:
+            self._stable_frames = self._stable_frames + 1 if ready else 0
+            self._stable_last_sequence = frame.sequence
+        if self._stable_frames >= REACQUIRE_STABLE_FRAMES:
+            self._start_reacquiring(now)
+            return self._line_view_running(
+                now, "route entry reached; lowering view for line verification"
+            )
+        yaw = max(
+            -DOCK_MAX_YAW,
+            min(self._candidate.angle_deg * ALIGN_YAW_GAIN, DOCK_MAX_YAW),
+        )
+        lateral = max(
+            -DOCK_MAX_LATERAL,
+            min(target_error * DOCK_LATERAL_GAIN, DOCK_MAX_LATERAL),
+        )
+        return self._running(
+            now,
+            MotionCommand(
+                forward=DOCK_FORWARD_SPEED,
+                lateral=lateral,
+                yaw=yaw,
+            ),
+            f"docking onto route {self._stable_frames}/"
+            f"{REACQUIRE_STABLE_FRAMES}",
+            self._candidate.detection,
+        )
+
+    def _step_corner(self, line, now: float) -> TaskUpdate:
+        """Follow a connected path that left the base detector's far band."""
+        if line.valid:
+            return self._finish(
+                TaskStatus.COMPLETED,
+                "connected corner returned to the base line detector",
+            )
+        endpoint = self._path.endpoint
+        if not self._path.present or endpoint is None:
+            if self._corner_missing_at is None:
+                self._corner_missing_at = now
+            if now - self._corner_missing_at >= END_MISSING_SECONDS:
+                self._begin_raise(now)
+                return self._running(
+                    now, STOP_COMMAND, "connected path ended; raising search view"
+                )
+            return self._running(
+                now, STOP_COMMAND, "connected path briefly missing; stopped",
+                search_view=False,
+            )
+        self._corner_missing_at = None
+        if endpoint.internal:
+            self._begin_end_approach(now)
+            return self._running(
+                now,
+                MotionCommand(forward=END_APPROACH_SPEED),
+                "internal route endpoint confirmed after connected corner",
+                self._path.detection,
+                search_view=False,
+            )
+        yaw = max(
+            -CORNER_MAX_YAW,
+            min(self._path.error * 52.0, CORNER_MAX_YAW),
+        )
+        return self._running(
+            now,
+            MotionCommand(forward=CORNER_FORWARD_SPEED, yaw=yaw),
+            "following connected sharp corner; not treating it as a gap",
+            self._path.detection,
+            search_view=False,
+        )
+
+    def _step_reacquiring(self, line, frame: FramePacket, now: float) -> TaskUpdate:
+        elapsed = now - float(self._phase_started_at)
+        if elapsed < self._view_settle_seconds:
+            return self._line_view_running(
+                now, "lowering to line view; chassis stopped"
+            )
+        if frame.sequence != self._stable_last_sequence:
+            self._stable_frames = self._stable_frames + 1 if line.valid else 0
+            self._stable_last_sequence = frame.sequence
+        if self._stable_frames >= REACQUIRE_STABLE_FRAMES:
+            return self._finish(
+                TaskStatus.COMPLETED,
+                "base line detector confirmed new route",
+            )
+        if elapsed >= HANDOFF_VIEW_TIMEOUT_SECONDS:
+            return self._finish(
+                TaskStatus.FAILED,
+                "new route was not valid after lowering to line view",
+            )
+        return self._line_view_running(
+            now,
+            f"verifying base line {self._stable_frames}/"
+            f"{REACQUIRE_STABLE_FRAMES}",
+        )
 
     def step(self, frame: FramePacket, now: float) -> TaskUpdate:
-        detection = self.detect(frame.image)
-        self.last_detection = detection
-        # 空实现：永远不接管，正常巡线完全不受影响。
-        # TODO(WP6a)：线断到需要外部搜索时从这里开始接管，
-        #   左右交替扫线，扫到线后连续确认若干帧才算重获，再返回 COMPLETED。
-        return TaskUpdate(TaskStatus.NOT_TRIGGERED, detection=detection)
+        self._integrate_previous_command(now)
+        line = self._line_detector.detect(frame.image)
+        needs_low_view_geometry = (
+            not line.valid
+            and self.state in (MONITORING, END_APPROACH, CORNERING)
+        )
+        if needs_low_view_geometry:
+            self._bottom = self._route_vision.bottom_line(
+                frame.image, self._last_line_x
+            )
+            self._path = self._route_vision.connected_path(
+                frame.image, self._last_line_x
+            )
+        else:
+            self._bottom = BottomLineObservation(False)
+            self._path = RoutePathObservation(False)
+
+        if self.state == MONITORING:
+            self._record_motion(STOP_COMMAND, now)
+            if line.valid:
+                self._remember_clear_line(line, now)
+                self.last_detection = VisualDetection.no_result(KIND)
+                return self._normal_update()
+
+            if self._path.present and self._last_clear_at is not None:
+                if self._possible_end_at is None:
+                    self._possible_end_at = now
+                self.last_detection = self._path.detection
+                if now - self._possible_end_at >= END_PENDING_SECONDS:
+                    if self._path.endpoint is not None and not self._path.endpoint.internal:
+                        self.state = CORNERING
+                        self.started_at = now
+                        self._phase_started_at = now
+                        return self._step_corner(line, now)
+                    self._begin_end_approach(now)
+                    return self._running(
+                        now,
+                        MotionCommand(forward=END_APPROACH_SPEED),
+                        "physical route endpoint found; approaching it",
+                        self._path.detection,
+                        search_view=False,
+                    )
+                return self._normal_update(self._path.detection)
+
+            self._possible_end_at = None
+            self.last_detection = VisualDetection.no_result(KIND)
+            if self._last_clear_at is None:
+                return self._normal_update()
+            trigger_delay = self._lost_grace + TRIGGER_MARGIN_SECONDS
+            if now - self._last_clear_at <= trigger_delay:
+                return self._normal_update()
+            self._begin_raise(now)
+            return self._running(
+                now, STOP_COMMAND, "long blank confirmed; raising search view"
+            )
+
+        if self.started_at is None or now - self.started_at >= TOTAL_RECOVERY_SECONDS:
+            return self._finish(TaskStatus.FAILED, "route recovery timed out")
+
+        if self.state == END_APPROACH:
+            self.last_detection = (
+                self._bottom.detection
+                if self._bottom.present
+                else VisualDetection.no_result(KIND)
+            )
+            return self._step_end_approach(line, now)
+
+        if self.state == CORNERING:
+            self.last_detection = (
+                self._path.detection
+                if self._path.present
+                else VisualDetection.no_result(KIND)
+            )
+            return self._step_corner(line, now)
+
+        if self.state == RAISING_VIEW:
+            if now - float(self._phase_started_at) < self._view_settle_seconds:
+                self.last_detection = VisualDetection.no_result(KIND)
+                return self._running(
+                    now, STOP_COMMAND, "raising view; chassis stopped"
+                )
+            self.state = BRIDGING
+            self._phase_started_at = now
+            self._candidate_frames = 0
+            self._candidate_seen_far = False
+            self._candidate_near = False
+            self._candidate_center = None
+            self._candidate_angle = None
+            self._candidate_last_sequence = None
+
+        self._observe_candidate(frame, now)
+
+        if self.state == BRIDGING:
+            ready, reason = self._candidate_ready(frame)
+            bridge_elapsed = now - float(self._phase_started_at)
+            # The raised camera can still see the route just left behind.
+            # Never stop the first crossing merely because that old fragment
+            # survives the generic candidate filter for three frames.
+            if ready and bridge_elapsed >= BRIDGE_MIN_SECONDS:
+                self._start_align(now)
+                return self._running(
+                    now, STOP_COMMAND, reason, self._candidate.detection
+                )
+            if bridge_elapsed >= BRIDGE_MAX_SECONDS:
+                self._begin_search(now)
+                return self._running(
+                    now, STOP_COMMAND, "blank bridge budget ended; starting fan search"
+                )
+            message = "crossing bounded blank along old-route tangent"
+            if self._candidate is not None:
+                if bridge_elapsed < BRIDGE_MIN_SECONDS:
+                    reason = "ignoring candidate during initial old-line clearance"
+                message = f"{message}; {reason}"
+            return self._running(
+                now,
+                MotionCommand(forward=BRIDGE_FORWARD_SPEED),
+                message,
+                self._candidate.detection if self._candidate is not None else None,
+            )
+
+        if self.state == SEARCHING:
+            return self._step_search(frame, now)
+
+        if self.state == ALIGNING:
+            return self._step_align(frame, now)
+
+        if self.state == CENTERING:
+            return self._step_centering(frame, now)
+
+        if self.state == DOCKING:
+            return self._step_docking(frame, now)
+
+        if self.state == REACQUIRING:
+            return self._step_reacquiring(line, frame, now)
+
+        return self._finish(TaskStatus.FAILED, "invalid route recovery state")

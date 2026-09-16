@@ -33,7 +33,6 @@ from runtime import LineFollower
 # evidence.py is infrastructure owned by the integration person, not a slot.
 EXPECTED_MODULE_FILES = {
     "number_marker.py": "step",
-    "traffic_light.py": "step",
     "obstacle.py": "step",
     "route.py": "step",
     "green_junction.py": "step",
@@ -108,6 +107,16 @@ class RegistryTests(unittest.TestCase):
         self.assertEqual(len(tasks), len(task_registry.MOTION_TASK_CLASSES))
         self.assertEqual(len(observers), len(task_registry.OBSERVER_CLASSES))
 
+    def test_builder_can_isolate_route_for_real_car_testing(self):
+        tasks = task_registry.build_motion_tasks(("route",))
+        self.assertEqual([task.name for task in tasks], ["route"])
+
+    def test_builder_rejects_unknown_or_empty_selection(self):
+        with self.assertRaises(ValueError):
+            task_registry.build_motion_tasks(())
+        with self.assertRaises(ValueError):
+            task_registry.build_motion_tasks(("not-a-task",))
+
 
 class ModuleContractTests(unittest.TestCase):
     def test_motion_tasks_return_a_task_update(self):
@@ -170,7 +179,8 @@ class MainWiringTests(unittest.TestCase):
     def test_build_coordinator_wires_every_registered_module(self):
         follower = LineFollower(CONFIG)
         output = MotionOutput(FakeChassis(), CONFIG)
-        coordinator = main.build_coordinator(follower, output)
+        # capture_directory=None：测试不许在仓库里留 captures/。
+        coordinator = main.build_coordinator(follower, output, capture_directory=None)
         self.assertEqual(
             len(coordinator.motion_tasks), len(task_registry.MOTION_TASK_CLASSES)
         )
@@ -179,15 +189,35 @@ class MainWiringTests(unittest.TestCase):
         )
         self.assertIs(coordinator.follower, follower)
         self.assertIs(coordinator.output, output)
+        coordinator.close()
+
+    def test_build_coordinator_can_wire_only_route(self):
+        follower = LineFollower(CONFIG)
+        output = MotionOutput(FakeChassis(), CONFIG)
+        coordinator = main.build_coordinator(
+            follower,
+            output,
+            capture_directory=None,
+            motion_task_names=("route",),
+        )
+        self.assertEqual([task.name for task in coordinator.motion_tasks], ["route"])
+        coordinator.close()
 
     def test_built_coordinator_keeps_the_robot_stopped_on_a_blank_frame(self):
         chassis = FakeChassis()
         follower = LineFollower(CONFIG)
         output = MotionOutput(chassis, CONFIG)
-        coordinator = main.build_coordinator(follower, output)
+        coordinator = main.build_coordinator(follower, output, capture_directory=None)
         coordinator.step(FramePacket(line_frame(), 1, 1.0), 1.0)
         self.assertFalse(chassis.motion_calls)
         self.assertEqual(coordinator.step(FramePacket(line_frame(), 2, 1.05), 1.05).owner, "line")
+        coordinator.close()
+
+    def test_evidence_recording_is_off_unless_a_directory_is_given(self):
+        """默认不写盘：observer 构造时零副作用，测试不会污染仓库。"""
+        for observer in task_registry.build_observers():
+            with self.subTest(observer=observer.name):
+                self.assertFalse(getattr(observer, "enabled", False))
 
 
 if __name__ == "__main__":

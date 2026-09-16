@@ -13,9 +13,9 @@
 |---|---|---|---|---|
 | 基础底座 | `config.py` + 实车验证记录（不新增文件） | — | 基础巡线实车验证与参数 | — |
 | 功能 1 | `number_marker.py` | `NumberMarkerTask` | 数字标识 1~5 | 难 |
-| 功能 2 | `traffic_light.py` | `TrafficLightTask` | 红绿灯 | 易 |
+| 功能 2 | `traffic_light.py` | `TrafficLightTask` | 红绿灯 | 易 |　（2026-09-16 已删除：实车上反复把红色物体判成红灯并锁停，赛题没有这一项）
 | 功能 3 | `obstacle.py` | `ObstacleTask` | 障碍检测与绕行 | 难 |
-| 功能 4 | `route.py` | `RouteTask` | 长断线巡回 | 难 |
+| 功能 4 | `route.py`、`route_detector.py` | `RouteTask` | 长断线巡回 | 难 |
 | 功能 5 | `green_junction.py` | `GreenJunctionTask` | 绿灯岔路 | 难 |
 | 功能 6 | `free_junction.py` | `FreeJunctionTask` | 无拥堵岔路 | 难 |
 | 整合 | `main.py`、`coordinator.py`、`task_registry.py` | — | 把已验收模块接进主流程 + 集成测试；`evidence.py`（截图记录）属于基础设施，挂在整合负责人名下，**不单独占名额** | 中 |
@@ -63,7 +63,7 @@ python scripts/check_module.py number_marker
 - 尚待确认：字体/颜色/尺寸/摆放、视距、遮挡、去重规则、截图时机、是否兼容官方 marker。
 - 降级方案：只在固定 ROI 和固定距离识别；取消自动居中改为停车截图；只保留可靠数字集合并明确报告。
 
-## WP3 红绿灯识别与停车/放行
+## WP3 红绿灯识别与停车/放行　（2026-09-16 已删除：实车上反复把红色物体判成红灯并锁停，赛题没有这一项）
 
 - 目标：可靠区分红、绿、无结果；红灯保持停车，满足连续确认的绿灯才完成放行。
 - 优先级：**P0**，规则/灯具未知时先收集样本。
@@ -120,7 +120,7 @@ python scripts/check_module.py number_marker
 - 优先级：**P1**，高度依赖场地；规则迟迟不明时降为 P2。
 - 输入：共享 `FramePacket`、`LineDetection`、底层 `LINE_LOST`、灯/机器人检测和已确认场地规则。
 - 输出：有触发条件、硬超时和失败停车的 `TaskUpdate` / `MotionCommand`。
-- 负责文件：**三个名额、三个人、三个文件**——`route.py`（长断线巡回）、`green_junction.py`（绿灯岔路）、`free_junction.py`（无拥堵岔路）。骨架已各建一个空文件，不要塞进同一个分支；优先先写一个明确场景。绿灯岔路与 `traffic_light.py` 的灯色接口由这两个人自己约定。
+- 负责文件：长断线使用 `route.py` 与其纯视觉辅助 `route_detector.py`；绿灯岔路使用 `green_junction.py`；无拥堵岔路使用 `free_junction.py`。不要把三类场景塞进同一个分支；优先先写一个明确场景。绿灯岔路与 `traffic_light.py` 的灯色接口需要先协调。
 - 允许修改：外部任务模块、场景配置、假数据/回放测试。
 - 禁止自行修改：公共高冲突文件；不得延长 `lost_grace_seconds` 冒充长断线，不得无限扫描。
 - 依赖项：WP1；绿灯岔路依赖 WP3；拥堵岔路依赖已确认的检测来源；接入依赖 WP7。
