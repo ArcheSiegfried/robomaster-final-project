@@ -338,6 +338,47 @@ class TaskTests(unittest.TestCase):
         self.assertIsNotNone(failed)
         self.assertEqual(failed.status, TaskStatus.FAILED)
 
+    def test_red_confirmation_queues_evidence(self):
+        """A red-light screenshot request is queued when the stop starts."""
+        task, updates = self.run_sequence(["red", "red"])
+        request = task.take_evidence_request()
+        self.assertIsNotNone(request)
+        self.assertIn("Team 03 detects a red light", request.annotation)
+        self.assertTrue(request.detection.valid)
+        self.assertEqual(request.detection.color, "red")
+        self.assertIsNotNone(request.detection.box)
+        self.assertEqual(request.marker_id, "traffic_light_red")
+
+    def test_evidence_acknowledged_does_not_requeue(self):
+        task = TrafficLightTask()
+        task.step(packet(light_frame("red"), 0, 1.0), 1.0)
+        task.step(packet(light_frame("red"), 1, 1.05), 1.05)
+        request = task.take_evidence_request()
+        self.assertIsNotNone(request)
+        self.assertTrue(task.acknowledge_evidence(request.request_id, True))
+        # Same stop cycle: no second screenshot request.
+        task.step(packet(light_frame("red"), 2, 1.10), 1.10)
+        self.assertIsNone(task.take_evidence_request())
+
+    def test_evidence_failure_retries_then_gives_up(self):
+        task = TrafficLightTask()
+        task.step(packet(light_frame("red"), 0, 1.0), 1.0)
+        task.step(packet(light_frame("red"), 1, 1.05), 1.05)
+        request = task.take_evidence_request()
+        self.assertTrue(task.acknowledge_evidence(request.request_id, False))
+        retry = task.take_evidence_request()
+        self.assertIsNotNone(retry)
+        self.assertEqual(retry.attempt, 2)
+        self.assertTrue(task.acknowledge_evidence(retry.request_id, False))
+        self.assertIsNone(task.take_evidence_request())
+
+    def test_evidence_does_not_block_release(self):
+        """Screenshot bookkeeping never delays the green release."""
+        task, updates = self.run_sequence(
+            ["red", "red", "green", "green", "green", "green", "green"]
+        )
+        self.assertEqual(updates[-1].status, TaskStatus.COMPLETED)
+
 
 # --------------------------------------------------------------------------
 # Integration: task plugged into the real framework with a fake chassis
@@ -388,6 +429,28 @@ class IntegrationTests(unittest.TestCase):
         follower.process_frame(fresh.image, fresh.captured_at)
         self.assertTrue(follower.resume(fresh.captured_at))
         self.assertEqual(follower.state, TRACKING)
+
+    def test_evidence_protocol_end_to_end(self):
+        """Red confirmation -> request -> recorder writes a real JPG -> ack."""
+        from pathlib import Path
+        import tempfile
+
+        from evidence import EvidenceRecorder
+
+        task = TrafficLightTask()
+        t = 40.0
+        task.step(packet(light_frame("red"), 0, t), t)
+        task.step(packet(light_frame("red"), 1, t + 0.05), t + 0.05)
+        with tempfile.TemporaryDirectory() as d:
+            recorder = EvidenceRecorder(directory=d)
+            request = task.take_evidence_request()
+            self.assertIsNotNone(request)
+            saved = recorder.save_task_evidence(request)
+            self.assertTrue(saved)
+            self.assertTrue(task.acknowledge_evidence(request.request_id, saved))
+            recorder.close()
+            images = list(Path(d).rglob("task_*.jpg"))
+            self.assertEqual(len(images), 1)
 
 
 
