@@ -190,7 +190,9 @@ class FreeJunctionConfig:
 
     # ---- ROI：只在画面下半部这块里干活，整张图不做重算法 ----
     roi_left: float = 0.06
-    roi_top: float = 0.54
+    #: 岔路检测 ROI 的上沿。0.54 -> 0.42 是**为了更早看到岔路**：
+    #: 车离岔路还远时，分叉点在画面上方，压到 0.54 就看不见了 → 等到很近才触发。
+    roi_top: float = 0.42
     roi_right: float = 0.94
     roi_bottom: float = 0.96
 
@@ -218,10 +220,10 @@ class FreeJunctionConfig:
     min_gap_over_tape: float = 0.40      # 空隙 ≥ 带宽的 40% 才算真分开
     merge_gap_px: int = 6                # 同一行里隔得比它近的蓝色像素算同一段
     min_run_px: int = 5                  # 短于它的碎块丢掉
-    min_fork_rows: int = 3               # 最少要有几行满足分叉形态
+    min_fork_rows: int = 2               # 最少要有几行满足分叉形态（更早触发）
     min_divergence_ratio: float = 0.25   # 最上面一行间距要比分叉行大这么多（A3）
-    confirm_frames: int = 4              # 连续几帧看到岔路才算数
-    blockage_confirm_frames: int = 2     # 同一个拥堵读数连续几帧才算数
+    confirm_frames: int = 2              # 连续几帧看到岔路才算数（求快：4 -> 2）
+    blockage_confirm_frames: int = 1     # 同一个拥堵读数连续几帧才算数（求快：2 -> 1）
     decide_confirm_frames: int = 1       # 接管后再稳定几帧就落子
     rearm_clear_frames: int = 8          # 岔路消失几帧后才允许再次触发
 
@@ -237,12 +239,34 @@ class FreeJunctionConfig:
     corridor_bottom_margin: float = 0.05
     corridor_side_margin: float = 0.0
 
-    # ---- 判据一（默认）：大尺度局部对比度 ----
-    # 车 = "比周围地面暗一大块（或亮一大块）"；地砖的黑点、反光是**小尺度**纹理，
-    # 会被大核平均掉。2026-09-16 真车实测（4 帧结果一致）：
-    #   停着车那条 → 宽0.39 高0.36 面积0.14 下沿0.44（每帧都是同一个框）
-    #   空着那条   → 宽0.15~0.28 高0.06~0.16 面积0.02~0.03 下沿0.14~0.21
-    use_local_contrast: bool = True
+    # ---- 判据一（默认）：按 **RoboMaster S1 / EP 小车的特征**认车 ----
+    # 真车画面实测（2026-09-16，两帧一致，车框 124x124）：
+    #   停着的小车：深色像素(V<=90)占 0.61~0.70、高饱和彩色(S>=100)占 0.25~0.34
+    #               （其中蓝 0.10、绿 0.07~0.14 —— 装甲灯/彩色贴纸）
+    #   空地：      深色占 0.04~0.08、高饱和彩色占 **0.000**（花岗岩地砖没有鲜艳色）
+    # 所以"**深色车体 + 高饱和彩色装甲/灯**"这两条合起来就是 S1/EP 的特征：
+    #   * 地砖、影子、反光、白墙 → 没有鲜艳色 → 不会误判；
+    #   * 两个比例都是**尺度无关**的 → 车离 1 米、2 米照样认得出，
+    #     所以尺寸闸门可以放得很松（robot_min_*）。
+    use_robot_signature: bool = True
+    robot_dark_v_max: int = 90            # "车体深色"的亮度上限（空地中位数 137~144）
+    robot_dark_min_ratio: float = 0.35    # 候选块里深色像素至少占这么多（车 0.61~0.70）
+    robot_accent_s_min: int = 100         # "装甲/灯/贴纸"的饱和度下限
+    robot_accent_min_ratio: float = 0.06  # 高饱和彩色至少占这么多（车 0.25~0.34，空地 0）
+    robot_min_aspect: float = 0.5         # 外接框 宽/高 的允许范围（车约 0.75~1.2）
+    robot_max_aspect: float = 2.5
+    robot_min_width_ratio: float = 0.10   # 尺寸闸门放得很松：远一点的车也要能过
+    robot_min_height_ratio: float = 0.10
+    robot_min_area_ratio: float = 0.015
+    robot_max_area_ratio: float = 0.90
+    #: **"深色块附近有没有彩色"** 的邻域大小（像素）：装甲/灯就长在车身上，
+    #: 所以只需要很小的邻域。现场实测：暗墙、门框、踢脚线也是"深色"，
+    #: 光看深色会把背景一起圈进来；而彩色只有小车和胶带有（空地和墙是 0.000）。
+    robot_accent_grow_px: int = 9
+    robot_close_px: int = 5               # 深色块的闭运算（别太大，免得又粘背景）
+
+    # ---- 判据二（默认关）：大尺度局部对比度（不看颜色，当兜底用）----
+    use_local_contrast: bool = False
     contrast_kernel_ratio: float = 0.15   # "周围地面"的大核 = 走廊高度 × 它
     contrast_threshold: int = 45          # |周围 − 自己| 超过它才算"一块东西"
     contrast_blur_sigma: float = 1.0      # 先抹掉 1 像素级的噪点
@@ -278,25 +302,34 @@ class FreeJunctionConfig:
     )
 
     # ---- 动作（A7 / A8，全部远低于骨架限幅）----
-    decide_timeout: float = 0.6       # 原地稳定判据的最长时间
-    approach_forward: float = 0.10
+    # 要求 3：判完哪条堵之后**只做微调** —— 微微转、微微前进，一路看着胶带，
+    # 直到岔路标志离开视野、且视野里重新有可用的蓝线，再交回巡线。
+    # 所以下面所有速度/角速度都比骨架限幅小一个量级。
+    decide_timeout: float = 0.25      # 原地稳定判据的最长时间（求快：0.6 -> 0.25）
+    approach_forward: float = 0.08
     approach_yaw_gain: float = 45.0
-    max_approach_yaw: float = 25.0
-    approach_seconds_max: float = 1.5
-    turn_forward: float = 0.06
-    turn_yaw: float = 45.0
-    turn_seconds: float = 1.2
-    turn_timeout: float = 2.5
+    max_approach_yaw: float = 18.0
+    approach_seconds_max: float = 2.0
+    turn_forward: float = 0.04        # 微前进
+    turn_yaw: float = 20.0            # 微转（最大角速度，原来是 45）
+    turn_seconds: float = 2.5         # 只是**上限**：正常会提前收工
+    turn_timeout: float = 3.5
     #: 转向至少要转这么久，才允许"看到线回到中央就收工"。
-    #: 真车实测：只按时间转固定角度会出现"原地多转几十度"；而线一旦回到车头
-    #: 正前方，就说明已经拐进分支了，不必把剩下的角度转满。
-    turn_min_seconds: float = 0.5
+    turn_min_seconds: float = 0.3
+    #: 闭环转向的增益：yaw = 增益 × 偏角（-1..1），再限幅到 `turn_yaw`。
+    #: 看得到岔路就朝"选中那条分支"转；岔路没了就朝车头前那条胶带转。
+    #: 越接近正前方转得越慢 —— 这样不会转过头（真车 2026-09-16 17:26 的教训）。
+    turn_steer_gain: float = 30.0
     #: "线回到画面中央"的容差（相对画面宽度）与需要的连续帧数。
     center_tolerance_ratio: float = 0.18
     center_confirm_frames: int = 2
-    exit_forward: float = 0.15
+    exit_forward: float = 0.10        # 交回前也走得很慢
     exit_seconds: float = 1.0
-    exit_timeout: float = 2.0
+    exit_timeout: float = 2.5
+    #: EXIT 阶段顺线修正的增益（比转向更温柔）：交回巡线时车头尽量正对着线。
+    exit_steer_gain: float = 25.0
+    #: 交回条件：岔路标志已经离开视野、而且视野里重新有蓝线，连续这么多帧 → COMPLETED。
+    handback_confirm_frames: int = 3
 
     # ---- 自己先裁一遍限幅（骨架还会再裁一次）----
     max_forward: float = 0.30
@@ -640,39 +673,128 @@ class VehicleDetector:
             )
         return mask
 
-    def detect(
-        self, region: Optional[np.ndarray], line: Optional[np.ndarray] = None
-    ) -> Tuple[bool, float, Optional[Tuple[int, int, int, int]]]:
-        """返回 (这段走廊里有没有车, 证据强度 0~1, 外接框或 None)。"""
+    def mask_kind(self) -> str:
+        """当前用哪套判据（决定闸门用哪一组）。"""
+        return "robot" if self.settings.use_robot_signature else "contrast"
+
+    def robot_mask(self, region: np.ndarray, line: Optional[np.ndarray]) -> np.ndarray:
+        """按 **RoboMaster S1 / EP 小车**的特征做掩码：深色车体 ∪ 高饱和彩色装甲/灯。
+
+        真车画面实测（2026-09-16，车框 124x124，两帧一致）：
+
+        ==================  ==================  ==========
+        特征                 停着的小车           空地
+        ==================  ==================  ==========
+        深色 V<=90 占比       0.61 ~ 0.70         0.04 ~ 0.08
+        高饱和 S>=100 占比    0.25 ~ 0.34         **0.000**
+        其中蓝 / 绿           0.10 / 0.07~0.14    0
+        ==================  ==================  ==========
+
+        所以"深色车体 + 鲜艳的装甲/灯"这两条一合，S1/EP 就出来了；而花岗岩地砖、
+        影子、反光、白墙都**没有鲜艳色**，进不来。这两个比例还是**尺度无关**的，
+        车离得远（1 米、2 米）一样成立 —— 这是"1 米间距也能认出来"的关键。
+        """
+        settings = self.settings
+        hsv = cv2.cvtColor(region, cv2.COLOR_BGR2HSV)
+        value, sat = hsv[:, :, 2], hsv[:, :, 1]
+        dark = value <= int(settings.robot_dark_v_max)
+        accent = sat >= int(settings.robot_accent_s_min)
+        if line is not None and bool(np.any(line)):
+            # 胶带自己也是高饱和的（蓝色），而且它旁边常有一条暗影子：
+            # 把胶带（含边缘）抠掉，免得"胶带+影子"被凑成一辆车。
+            tape = np.zeros(dark.shape, dtype=np.uint8)
+            tape[line] = 255
+            grow = int(settings.tape_clear_px)
+            if grow >= 3:
+                tape = cv2.dilate(tape, _odd_kernel(grow))
+            inside_tape = tape > 0
+            accent = np.logical_and(accent, np.logical_not(inside_tape))
+            dark = np.logical_and(dark, np.logical_not(inside_tape))
+        # **"深色车体" + "它身上/旁边有彩色装甲"** —— 注意是**连通块**层面的判断：
+        # 暗墙、门框、踢脚线也是深色，光看深色会把背景一起圈进来；而彩色（装甲灯、
+        # 彩色件）在场地上只有小车有（空地和墙的高饱和像素实测是 0.000）。
+        # 所以：**被彩色碰到的那一整块深色**才算一辆车 —— 只保留彩色旁边几行像素
+        # 是不行的（那会把车体切成两条细边，长宽比直接出界）。
+        dark_u8 = (dark.astype(np.uint8)) * 255
+        dark_u8 = cv2.morphologyEx(dark_u8, cv2.MORPH_OPEN, _odd_kernel(3))
+        close = int(settings.robot_close_px)
+        if close >= 3:
+            dark_u8 = cv2.morphologyEx(dark_u8, cv2.MORPH_CLOSE, _odd_kernel(close))
+        accent_u8 = (accent.astype(np.uint8)) * 255
+        accent_core = cv2.morphologyEx(accent_u8, cv2.MORPH_OPEN, _odd_kernel(3))
+        grow = int(settings.robot_accent_grow_px)
+        accent_near = accent_core
+        if grow >= 3:
+            accent_near = cv2.dilate(accent_core, _odd_kernel(grow))
+        if not bool(np.any(accent_core)) or not bool(np.any(dark_u8)):
+            return np.zeros(dark.shape, np.uint8)
+        count, labels, _stats, _centroids = cv2.connectedComponentsWithStats(dark_u8, 8)
+        if count <= 1:
+            return np.zeros(dark.shape, np.uint8)
+        touched = np.unique(labels[accent_near > 0])
+        hit = np.zeros(count, dtype=bool)
+        hit[touched] = True
+        hit[0] = False                     # 0 号是背景
+        if not bool(np.any(hit)):
+            return np.zeros(dark.shape, np.uint8)
+        # 车体整块留下，再把**长在它身上的彩色装甲/灯**一起并进来
+        # （装甲在图上盖住车体，所以它们是"深色连通块"之外的像素，不并进来
+        #  外接框就会比车小一圈，彩色占比也就量不准了）。
+        kept = (hit[labels].astype(np.uint8)) * 255
+        grown = kept
+        if grow >= 3:
+            grown = cv2.dilate(kept, _odd_kernel(grow))
+        return cv2.bitwise_or(kept, cv2.bitwise_and(accent_core, grown))
+
+    def build_mask(
+        self, region: np.ndarray, line: Optional[np.ndarray] = None
+    ) -> np.ndarray:
+        """把一块区域算成"可能是车"的掩码（判据按开关组合；整块只算一次）。"""
         settings = self.settings
         if region is None or region.size == 0:
-            return False, 0.0, None
+            return np.zeros((0, 0), np.uint8)
         height, width = region.shape[:2]
-        if height < 8 or width < 8:
-            return False, 0.0, None
-
-        if line is None:
-            # 调用方没给蓝带掩码时自己算一遍（用的还是同一套 HSV，见 _blue_mask）。
-            line = _blue_mask(region, settings)
-
         mask = np.zeros((height, width), np.uint8)
-        # 判据一（默认）：大尺度局部对比度。判据二（默认关）：Canny 结构。
+        if height < 8 or width < 8:
+            return mask
+        if line is None:
+            line = _blue_mask(region, settings)
+        if settings.use_robot_signature:
+            mask = cv2.bitwise_or(mask, self.robot_mask(region, line))
         if settings.use_local_contrast:
             mask = cv2.bitwise_or(mask, self.contrast_mask(region, line))
         if settings.use_structure:
             mask = cv2.bitwise_or(mask, self.structure_mask(region, line))
         if settings.use_color_ranges:
             mask = cv2.bitwise_or(mask, self.color_mask(region))
-        if not bool(np.any(mask)):
-            return False, 0.0, None
+        return mask
 
+    def pick(
+        self, mask: np.ndarray, region: np.ndarray, line: Optional[np.ndarray] = None
+    ) -> Tuple[bool, float, Optional[Tuple[int, int, int, int]]]:
+        """在掩码里挑一个"像车"的外接框（按当前判据过闸门）。"""
+        settings = self.settings
+        if mask is None or mask.size == 0 or region is None:
+            return False, 0.0, None
+        height, width = mask.shape[:2]
+        if height < 8 or width < 8 or not bool(np.any(mask)):
+            return False, 0.0, None
+        if line is None:
+            line = _blue_mask(region, settings)
+
+        kind = self.mask_kind()
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         region_area = float(max(1, height * width))
         skin = self._skin_mask(region) if settings.reject_skin_like else None
         best: Optional[Tuple[float, Tuple[int, int, int, int]]] = None
         for contour in contours:
             box = cv2.boundingRect(contour)
-            score = self._score_box(mask, skin, box, height, width, region_area)
+            if kind == "robot":
+                score = self._robot_box_ok(
+                    region, line, skin, mask, box, height, width, region_area
+                )
+            else:
+                score = self._score_box(mask, skin, box, height, width, region_area)
             if score is None:
                 continue
             if best is None or score > best[0]:
@@ -682,8 +804,19 @@ class VehicleDetector:
             return False, 0.0, None
         score, box = best
         x, y, box_width, box_height = box
-        absolute = (int(x), int(y), int(x + box_width), int(y + box_height))
-        return True, round(float(score), 3), absolute
+        return True, round(float(score), 3), (
+            int(x), int(y), int(x + box_width), int(y + box_height)
+        )
+
+    def detect(
+        self, region: Optional[np.ndarray], line: Optional[np.ndarray] = None
+    ) -> Tuple[bool, float, Optional[Tuple[int, int, int, int]]]:
+        """返回 (这块区域里有没有车, 证据强度, 外接框或 None)。"""
+        if region is None or region.size == 0:
+            return False, 0.0, None
+        if line is None:
+            line = _blue_mask(region, self.settings)
+        return self.pick(self.build_mask(region, line), region, line)
 
     def _skin_mask(self, region: np.ndarray) -> np.ndarray:
         hsv = cv2.cvtColor(region, cv2.COLOR_BGR2HSV)
@@ -730,6 +863,72 @@ class VehicleDetector:
                 if skin_ratio > settings.skin_reject_ratio:
                     return None
         return area_ratio
+
+    def _robot_box_ok(
+        self, region: np.ndarray, line: Optional[np.ndarray], skin: Optional[np.ndarray],
+        mask: np.ndarray, box: Tuple[int, int, int, int], height: int, width: int,
+        region_area: float,
+    ) -> Optional[float]:
+        """**S1/EP 专用闸门**：尺寸（松）+ 长宽比 + 不肤色 + 深色车体 + 高饱和彩色装甲。
+
+        和"局部对比度"那套的区别：这里判的是**颜色构成**，不是"比周围暗一块"。
+        因为深色占比和高饱和占比都是**尺度无关**的（而且只统计候选块自己），
+        所以尺寸闸门可以放得很松（`robot_min_*` 只要 0.10/0.015），
+        车远到 1~2 米也照样能过。
+        """
+        settings = self.settings
+        x, y, box_width, box_height = box
+        if box_width <= 0 or box_height <= 0:
+            return None
+        # 尺寸：只挡掉明显不是车的小碎块（远距离的车很小，所以门槛很低）。
+        if box_width < settings.robot_min_width_ratio * width:
+            return None
+        if box_height < settings.robot_min_height_ratio * height:
+            return None
+        area_ratio = (box_width * box_height) / region_area
+        if area_ratio < settings.robot_min_area_ratio:
+            return None
+        if area_ratio > settings.robot_max_area_ratio:
+            return None
+        # 长宽比：S1/EP 俯视/斜视大致 0.5~2.5，太细长的一定不是车。
+        aspect = box_width / float(box_height)
+        if aspect < settings.robot_min_aspect or aspect > settings.robot_max_aspect:
+            return None
+        # 手：肤色占比过半直接丢。
+        if skin is not None:
+            skin_patch = skin[y:y + box_height, x:x + box_width]
+            if skin_patch.size:
+                skin_ratio = float(np.count_nonzero(skin_patch)) / float(skin_patch.size)
+                if skin_ratio > settings.skin_reject_ratio:
+                    return None
+        # 颜色构成 —— 这才是"是不是 S1/EP"的依据。
+        # **只统计候选块自己**（mask 里的像素 = 深色车体 + 长在它身上的彩色装甲），
+        # 不按整框算：现场里车常和暗墙/踢脚线连成一块（框能大到 271x273），
+        # 按整框算比例会被背景稀释，车稍微暗一点就掉出闸门。
+        patch_hsv = cv2.cvtColor(
+            region[y:y + box_height, x:x + box_width], cv2.COLOR_BGR2HSV
+        )
+        value = patch_hsv[:, :, 2]
+        sat = patch_hsv[:, :, 1]
+        inside = mask[y:y + box_height, x:x + box_width] > 0
+        if line is not None:
+            tape_patch = line[y:y + box_height, x:x + box_width]
+            valid = np.logical_and(np.logical_not(tape_patch), inside)
+        else:
+            valid = inside
+        total = float(max(1, int(np.count_nonzero(valid))))
+        dark_ratio = float(
+            np.count_nonzero(np.logical_and(value <= settings.robot_dark_v_max, valid))
+        ) / total
+        accent_ratio = float(
+            np.count_nonzero(np.logical_and(sat >= settings.robot_accent_s_min, valid))
+        ) / total
+        if dark_ratio < settings.robot_dark_min_ratio:
+            return None
+        if accent_ratio < settings.robot_accent_min_ratio:
+            return None
+        # 分数：越"又黑又有鲜艳装甲"越像（0~2）。
+        return dark_ratio + accent_ratio
 
 
 # ---------------------------------------------------------------------------
@@ -783,6 +982,7 @@ class FreeJunctionTask:
         self._clear_count = 0
         self._lost_count = 0
         self._center_count = 0
+        self._handback_count = 0
         self._last_blue_ratio = 0.0
         self._last_line_mask = None
         self._state_since: Optional[float] = None
@@ -828,6 +1028,7 @@ class FreeJunctionTask:
         self.last_outcome = None
         self._decide_count = 0
         self._center_count = 0
+        self._handback_count = 0
         self._last_line_mask = None
         self._state_since = None
         self._run_started_at = None
@@ -903,10 +1104,16 @@ class FreeJunctionTask:
         left_region = region[:, :divider]
         right_region = region[:, divider:]
 
-        # 蓝带掩码由 VehicleDetector 在这个区域里自己算（同一套 HSV），
-        # 这样"抹掉胶带"用的是本区域的掩码，不会张冠李戴。
-        left_blocked, left_score, left_box = self.vehicle.detect(left_region)
-        right_blocked, right_score, right_box = self.vehicle.detect(right_region)
+        # 蓝带掩码在这块区域里算**一次**，左右两侧共用（省一半时间，真车日志里
+        # step() 曾经因为每侧各算一遍而超预算）。判据本身在 VehicleDetector 里。
+        line_region = _blue_mask(region, self.settings)
+        mask = self.vehicle.build_mask(region, line_region)
+        left_blocked, left_score, left_box = self.vehicle.pick(
+            mask[:, :divider], left_region, line_region[:, :divider]
+        )
+        right_blocked, right_score, right_box = self.vehicle.pick(
+            mask[:, divider:], right_region, line_region[:, divider:]
+        )
 
         if left_blocked and right_blocked:
             reading = BLOCKAGE_BOTH
@@ -1079,9 +1286,14 @@ class FreeJunctionTask:
         if self.state is JunctionState.TURN:
             if self._elapsed(now) >= settings.turn_timeout:
                 return self._fail(now, "turn timed out")
-            # 线已经回到车头正前方 → 说明已经拐进分支了，不必把剩下的角度转满。
-            # （真车实测：只按时间转，会把车在原地多拧几十度，然后停住。）
-            self._center_count = self._center_count + 1 if self._tape_centered() else 0
+            # **闭环微转**：盯住"选中那条分支"，朝它转；偏得越多转得越快（限幅很小）。
+            offset = self._turn_offset(fork)
+            if offset is None:
+                self._center_count = 0
+            elif abs(offset) <= float(settings.center_tolerance_ratio):
+                self._center_count += 1
+            else:
+                self._center_count = 0
             centered = self._center_count >= max(1, int(settings.center_confirm_frames))
             if self._elapsed(now) >= settings.turn_seconds:
                 self._enter(JunctionState.EXIT, now)
@@ -1092,13 +1304,28 @@ class FreeJunctionTask:
                     now, "turning into the %s branch" % self._branch_name()
                 )
 
-        return self._finish_exit(now)
+        return self._finish_exit(now, fork)
 
-    def _finish_exit(self, now: float) -> TaskUpdate:
-        """EXIT 阶段：直行一小段，走完就算完成，走太久就失败。"""
-        if self._elapsed(now) >= self.settings.exit_timeout:
+    def _finish_exit(self, now: float, fork: Optional[ForkDetection] = None) -> TaskUpdate:
+        """EXIT 阶段：**微微前进 + 顺线**，直到可以安全交回巡线。
+
+        交回条件（要求 3）：**岔路标志已经离开视野**，而且**视野里重新有蓝线**
+        （巡线要的条件回来了），连续 `handback_confirm_frames` 帧 → COMPLETED。
+        时间到了但条件还没满足 → 也交回（COMPLETED），把控制权还给巡线；
+        拖过 `exit_timeout` → FAILED 停车。
+        """
+        settings = self.settings
+        fork_gone = fork is None or not fork.valid
+        line_back = self._last_blue_ratio >= settings.min_blue_ratio
+        if fork_gone and line_back:
+            self._handback_count += 1
+        else:
+            self._handback_count = 0
+        if self._handback_count >= max(1, int(settings.handback_confirm_frames)):
+            return self._complete(now, "junction left the view and the line is back")
+        if self._elapsed(now) >= settings.exit_timeout:
             return self._fail(now, "exit timed out")
-        if self._elapsed(now) >= self.settings.exit_seconds:
+        if self._elapsed(now) >= settings.exit_seconds:
             return self._complete(now, "junction cleared")
         return self._running(now, "leaving the junction")
 
@@ -1113,6 +1340,7 @@ class FreeJunctionTask:
         self._lost_count = 0
         self._clear_count = 0
         self._center_count = 0
+        self._handback_count = 0
 
     # -- 运动请求 ---------------------------------------------------------
 
@@ -1131,16 +1359,35 @@ class FreeJunctionTask:
                 ),
             )
         if self.state is JunctionState.TURN:
-            yaw = settings.turn_yaw * self._branch_sign()
+            # 闭环微转：看得到岔路就朝"选中那条分支"转，岔路没了就朝车头前的胶带转；
+            # 越接近正前方转得越慢（turn_yaw 本身也已经压到 20 deg/s）。
+            offset = self._turn_offset(self.last_detection)
+            if offset is None:
+                yaw = settings.turn_yaw * self._branch_sign()
+            else:
+                yaw = _clamp(
+                    settings.turn_steer_gain * offset,
+                    -settings.turn_yaw,
+                    settings.turn_yaw,
+                )
             return MotionCommand(
                 forward=_clamp(settings.turn_forward, 0.0, settings.max_forward),
                 lateral=0.0,
                 yaw=_clamp(yaw, -settings.max_yaw, settings.max_yaw),
             )
+        # EXIT：微微前进 + 顺线（很温柔），保证交回巡线时车头正对着线。
+        offset = self._tape_offset()
+        yaw = 0.0
+        if offset is not None:
+            yaw = _clamp(
+                settings.exit_steer_gain * offset,
+                -settings.max_approach_yaw,
+                settings.max_approach_yaw,
+            )
         return MotionCommand(
             forward=_clamp(settings.exit_forward, 0.0, settings.max_forward),
             lateral=0.0,
-            yaw=0.0,
+            yaw=_clamp(yaw, -settings.max_yaw, settings.max_yaw),
         )
 
     def _approach_yaw(self) -> float:
@@ -1175,34 +1422,44 @@ class FreeJunctionTask:
             return True
         return self._last_blue_ratio >= self.settings.min_blue_ratio
 
-    def _tape_centered(self) -> bool:
-        """车头正前方（画面中央、ROI 底部那一条）是不是又只有一条线了？
+    def _tape_offset(self) -> Optional[float]:
+        """车头正前方那条胶带偏了多少：-1 = 最左，0 = 正中，+1 = 最右。
 
-        用来判断"已经拐进分支"，好让 TURN 提前收工 —— 只在**已经转够
-        `turn_min_seconds`** 并且连续 `center_confirm_frames` 帧满足时才算。
-        要求三件事：
-
-        * ROI 底部那一小条里有蓝线；
-        * 那一条上**只有一段**线（出现两段说明车还压在岔路口上）；
-        * 这一段的中心离画面中线不超过 `center_tolerance_ratio` × 画面宽度。
+        只算 ROI 底部那一小条，而且必须**只有一段**（出现两段说明车还压在岔路口上）。
+        看不到、或不止一段 → 返回 None。
         """
         line = self._last_line_mask
         if line is None:
-            return False
+            return None
         height, width = line.shape[:2]
         if height <= 0 or width <= 0:
-            return False
-        band_top = int(height * 0.75)
-        band = line[band_top:, :]
+            return None
+        band = line[int(height * 0.75):, :]
         if band.size == 0:
-            return False
-        row = band[band.shape[0] // 2]
-        runs = _row_runs(row, self.settings.merge_gap_px, self.settings.min_run_px)
+            return None
+        runs = _row_runs(
+            band[band.shape[0] // 2], self.settings.merge_gap_px, self.settings.min_run_px
+        )
         if len(runs) != 1:
-            return False
+            return None
         center = (runs[0][0] + runs[0][1]) / 2.0
-        tolerance = float(self.settings.center_tolerance_ratio) * width
-        return abs(center - width / 2.0) <= tolerance
+        half = max(1.0, width / 2.0)
+        return (center - width / 2.0) / half
+
+    def _turn_offset(self, fork: Optional[ForkDetection]) -> Optional[float]:
+        """转弯阶段"还要往哪边转多少"（-1..1）。
+
+        * 还看得见岔路 → 用**选中那条分支**的偏角（分支还没摆到正前方就继续转）；
+        * 岔路已经从画面里消失 → 用**车头前方那条胶带**的偏移（这时它就是分支的胶带）。
+
+        为什么不能只看胶带：刚进转弯时车头前面那条是**主干**，正的、就在中央，
+        只按它判会得出"已经对齐"→ 根本不转（2026-09-16 本地测试踩出来过）。
+        """
+        if fork is not None and fork.valid and fork.frame_width > 0:
+            target = fork.left_x if self.chosen_branch is Branch.LEFT else fork.right_x
+            half = max(1.0, fork.frame_width / 2.0)
+            return (float(target) - fork.frame_width / 2.0) / half
+        return self._tape_offset()
 
     def _fork_gone(self, fork: ForkDetection) -> bool:
         """分叉是否已经消失（说明车已经开进分支里了）。"""

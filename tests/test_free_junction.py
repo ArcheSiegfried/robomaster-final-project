@@ -55,9 +55,11 @@ class FreeJunctionContractTests(unittest.TestCase):
 # 合成帧与真机同坐标系：360x640 BGR，蓝色胶带 HSV 约 (120,255,255)。
 # 默认 ROI 是 x 6%~94%、y 54%~96% → x 38~601、y 194~345。
 #
-# v2 的判据换了（见 free_junction.py 的 A5/A6）：
-#   "拥堵" = 那条分支的走廊里停着一辆同型小车（结构判据，不看颜色）。
-# 所以下面的"车"都画成**硬边缘的深色车体 + 亮顶盖**，而不是 v1 那种一片暗色块。
+# v2/v3 的判据（见 free_junction.py 的 A5/A6）：
+#   "拥堵" = 那条分支的走廊里停着一辆**大疆 RoboMaster S1 / EP 小车**。
+#   判据就是这辆车的样貌：**深色车体 + 高饱和彩色装甲/灯**（真车实测：
+#   车 深色 0.61~0.70 / 彩色 0.25~0.34，空地彩色 0.000）。
+# 所以下面的"车"都画成**深色车体 + 两侧彩色装甲**，而不是 v1 那种一片暗色块。
 #
 # 覆盖（对应 TASKS.md 的"三类场景各自触发/完成/失败可说明"）：
 #   [x] 岔路判据：与"只有一条线"、与"被竖直噪声切开的粗带"区分；远的/偏的岔路也要能认出来
@@ -71,7 +73,9 @@ class FreeJunctionContractTests(unittest.TestCase):
 BLUE = (255, 0, 0)          # BGR 里的纯蓝
 FLOOR = 210                 # 浅色地面
 CAR_BODY = (55, 55, 55)     # 车体：深色、硬边缘
-CAR_TOP = (150, 150, 150)   # 顶盖亮条：让候选框内部也有结构
+CAR_TOP = (150, 150, 150)   # 顶盖亮条
+CAR_ARMOR_RED = (0, 0, 255)    # 装甲/灯：高饱和彩色（S1/EP 的特征之一）
+CAR_ARMOR_GREEN = (0, 255, 0)  # 另一种装甲色（故意不用蓝：蓝是胶带的颜色）
 
 #: 停在左/右分支上的"车"（画面坐标）。尺寸**按真车比例**来：
 #: 2026-09-16 真车画面里那辆车在检测区域里约占 宽0.39 / 高0.36，这里取 120x100
@@ -81,10 +85,16 @@ CAR_RIGHT_BOX = (370, 150, 490, 250)
 
 
 def draw_car(image, box):
-    """画一辆"停着的同型小车"：深色车体 + 亮顶盖，边缘很硬。"""
+    """画一辆"停着的同型小车"：**深色车体 + 两侧高饱和彩色装甲**。
+
+    这两条正是 2026-09-16 从真车画面上量出来的 S1/EP 特征
+    （车：深色 0.61~0.70、高饱和彩色 0.25~0.34；空地：0.000）。
+    装甲故意用**红/绿**（不用蓝）：蓝色是胶带的颜色，会被判据当成胶带抠掉。
+    """
     x0, y0, x1, y1 = box
     cv2.rectangle(image, (x0, y0), (x1, y1), CAR_BODY, -1)
-    cv2.rectangle(image, (x0 + 5, y0 + 5), (x1 - 5, y0 + 15), CAR_TOP, -1)
+    cv2.rectangle(image, (x0 + 2, y0 + 2), (x0 + 14, y1 - 2), CAR_ARMOR_RED, -1)      # 左装甲
+    cv2.rectangle(image, (x1 - 14, y0 + 2), (x1 - 2, y1 - 2), CAR_ARMOR_GREEN, -1)    # 右装甲
 
 
 def fork_frame(car_left=False, car_right=False, stem_top=300, tips=(200, 440), x=320):
@@ -251,6 +261,25 @@ class VehicleDetectorTests(unittest.TestCase):
             "干净的蓝带自己就被判成车了（真车上会因此选错边）：证据=%.3f 框=%s"
             % (score, box),
         )
+
+    def test_a_plain_dark_block_is_not_a_robot(self):
+        """**要求 2 的回归测试**：光"深色一大块"不算堵，必须是 S1/EP 那种
+        "深色车体 + 高饱和彩色装甲/灯"。
+
+        真车实测：空地的高饱和像素占比是 **0.000**，花岗岩地砖、影子、暗墙都进不来。
+        """
+        settings = FreeJunctionConfig()
+        detector = FreeJunctionDetector(settings)
+        vehicle = VehicleDetector(settings)
+        region = np.full((150, 280, 3), FLOOR, np.uint8)
+        cv2.rectangle(region, (70, 40), (210, 120), CAR_BODY, -1)     # 只有深色，没有彩色
+        blocked, score, box = vehicle.detect(region, detector.blue_mask(region))
+        self.assertFalse(blocked, "只有深色、没有彩色装甲，不该判成车: %s %s" % (score, box))
+
+        # 同一块地方，加上两条高饱和彩色装甲 → 应该判成车
+        draw_car(region, (70, 40, 210, 120))
+        blocked2, score2, box2 = vehicle.detect(region, detector.blue_mask(region))
+        self.assertTrue(blocked2, "深色车体 + 彩色装甲应该判成车，实际 %s %s" % (score2, box2))
 
     def test_skin_like_blob_is_rejected(self):
         """手/皮肤色占比过半的候选丢掉（同 obstacle.py 的现场教训）。"""
