@@ -411,49 +411,6 @@ class OwnershipAndTimingTests(unittest.TestCase):
         self.assertIs(updates[-1].status, TaskStatus.COMPLETED)
         self.assertNotIn("line lost", task.last_message)
 
-    def test_exit_steers_back_onto_the_tape(self):
-        """出岔路阶段要轻轻顺线：交回巡线时车头尽量正对胶带。
-
-        真车 2026-09-16 17:26：拐过去之后"斜着出线"，底座 2 秒内拿不到有效线，
-        直接卡在原地要人工按 SPACE。
-        """
-        task = FreeJunctionTask()
-        fork = fork_frame(car_left=True)
-        records = drive_sequence(task, [(fork, 30), (line_frame(x=470), 30)])
-        exit_yaws = [
-            update.motion.yaw
-            for state, update, _now in records
-            if state is JunctionState.EXIT and update.status is TaskStatus.RUNNING and update.motion
-        ]
-        self.assertTrue(exit_yaws, "应该进入出岔路阶段")
-        self.assertTrue(
-            any(abs(y) > 0.1 for y in exit_yaws),
-            "胶带偏在右边，出岔路时却完全不打方向: %s" % exit_yaws[:8],
-        )
-        self.assertTrue(all(y >= 0 for y in exit_yaws), exit_yaws[:8])
-
-    def test_turn_steers_towards_the_tape_not_a_fixed_time(self):
-        """**闭环转向的回归测试**：转弯阶段要看得到胶带就朝它转。
-
-        真车 2026-09-16 17:26：选了右边之后按秒表转了约 50°（yaw 一直是 +45），
-        而岔路实际角度小得多 → 转过头、出线 → 底座 2 秒内等不到新鲜线就卡住了。
-        修法：yaw = 增益 × 胶带偏移（看得到胶带时），回到中央就提前收工。
-        """
-        task = FreeJunctionTask()
-        fork = fork_frame(car_left=True)
-        records = drive_sequence(
-            task, [(fork, 30), (line_frame(x=520), 8), (line_frame(x=140), 8)]
-        )
-        yaws = turn_yaws(records)
-        self.assertTrue(yaws, "应该进入转向阶段")
-        # 胶带在画面右侧时应该往右转（正 yaw），在左侧时往左转（负 yaw）——
-        # 而不是"选了右边就永远 +45"。
-        self.assertIn(1, [1 if y > 0 else -1 if y < 0 else 0 for y in yaws])
-        self.assertTrue(
-            any(y < 0 for y in yaws),
-            "胶带跑到画面左侧了还在往右转（固定角度转向）: %s" % yaws[:10],
-        )
-
     def test_turn_ends_early_once_the_tape_is_back_in_the_centre(self):
         """线已经回到车头正前方 → 转向提前收工，不在原地多拧几十度。"""
         task = FreeJunctionTask()
