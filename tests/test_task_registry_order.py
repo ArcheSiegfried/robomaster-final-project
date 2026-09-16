@@ -15,7 +15,6 @@ if str(ROOT) not in sys.path:
 import task_registry  # noqa: E402
 
 EXPECTED_ORDER = (
-    "traffic_light",    # 1 红绿灯
     "green_junction",   # 2 红绿灯岔路
     "obstacle",         # 3 障碍物绕行
     "route",            # 4 短线巡回
