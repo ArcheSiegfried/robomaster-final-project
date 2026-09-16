@@ -31,24 +31,40 @@ class VisionConfig:
 
 @dataclass(frozen=True)
 class ControlConfig:
-    # Conservative starting values only; tune with wheels raised, then on course.
+    """巡线控制参数。
+
+    2026-09-15 按"偏了纠不回来 / 看到弯就冲出去"的实车反馈重标了一轮。取值依据：
+    我们的巡线与 race-v4 参考实现同源（见 `VisionConfig` 注释），而参考的 KP=310 /
+    KD=4.5 / heading 前馈=260 是在 1.50 m/s 下标定的；它还按速度把转向增益乘
+    0.75~2.20 倍（以 0.60 m/s 为 1.0 倍）。我们的运行速度 0.32 m/s 低于它的最低档，
+    所以取它 ×0.75 这一档：KP 232 / KD 3.4 / heading 195。
+
+    转向上限不能直接抄它的 550：我们速度只有它的 1/5，同样转弯半径需要的 yaw 更小。
+    但原来的 135 会先于比例项卡住（误差 0.5 时比例项只要 57.5，连上限一半都不到），
+    所以提到 300；变化率 500 提到 1200（它用 2600）。
+
+    速度不追：`forward_speed` 保持 0.32 不变，只把入弯减速做扎实一点。
+    这些仍是**实车必须复验**的起点，不是定标结果。底线由
+    `tests/test_line_tuning.py` 守住（谁要调回软档，必须先看见它变红）。
+    """
+
     forward_speed: float = 0.32
-    curve_speed: float = 0.22
-    kp: float = 115.0
-    kd: float = 3.0
-    heading_gain: float = 70.0
+    curve_speed: float = 0.20
+    kp: float = 232.0
+    kd: float = 3.4
+    heading_gain: float = 195.0
     derivative_alpha: float = 0.30
-    error_deadband: float = 0.015
+    error_deadband: float = 0.012
     max_error: float = 1.2
-    max_derivative: float = 2.5
-    max_yaw_speed: float = 135.0
-    max_yaw_rate: float = 500.0
-    max_forward_acceleration: float = 0.45
-    max_forward_deceleration: float = 1.20
-    curve_threshold: float = 0.20
-    lost_grace_seconds: float = 0.28
+    max_derivative: float = 3.5
+    max_yaw_speed: float = 300.0
+    max_yaw_rate: float = 1200.0
+    max_forward_acceleration: float = 0.80
+    max_forward_deceleration: float = 2.00
+    curve_threshold: float = 0.15
+    lost_grace_seconds: float = 0.30
     lost_forward_speed: float = 0.14
-    lost_max_yaw: float = 65.0
+    lost_max_yaw: float = 90.0
     recovery_ramp_seconds: float = 0.20
 
 @dataclass(frozen=True)
@@ -84,16 +100,18 @@ class RuntimeConfig:
     # 都在 0.1 秒内被视频间隔误判踢掉（见 coordinator.video_gap）。
     consumer_wait_timeout: float = 0.05
     # AP 模式日志还出现过 0.41s 和 0.50s 后自行恢复的孤立传输间隙。
-    # 旧运动命令仍会在 0.15s 后失效，因此 0.60s 的视频锁停阈值不会让底盘
-    # 带着旧命令穿过长间隙。
+    # 旧运动命令仍会在 0.15s 后失效（见下面 command_timeout），因此 0.60s 的
+    # 视频锁停阈值不会让底盘带着旧命令穿过长间隙。
+    # 来源：王炜嘉在 fix/route-only-realtest 的实车测试（2026-09-15）——
+    # 原来的 0.22s 会把这类能自恢复的孤立间隙当成视频丢失，任务被误杀。
     video_gap_stop_seconds: float = 0.60
     command_timeout: float = 0.15
     resume_detection_max_age: float = 0.15
     gimbal_pitch: int = -25
     gimbal_yaw: int = 0
-    # -5 deg showed too much wall/ceiling and compressed the route against the
-    # bottom edge in the first real recovery runs.  Keep a wider view than the
-    # -25 deg line-following pose without losing most of the useful floor.
+    # -5 度在最早的实车恢复跑里画面里墙/天花板太多，路线被压到画面下沿。
+    # 取 -12：比巡线视角（-25）看得宽，又不丢掉大部分地面。
+    # 来源：王炜嘉在 fix/route-only-realtest 的实车测试（2026-09-15）。
     gimbal_search_pitch: int = -12
     gimbal_pitch_min: int = -25
     gimbal_pitch_max: int = 10

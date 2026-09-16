@@ -51,6 +51,9 @@ RELEASING = "RELEASING"
 OWNER_LINE = "line"
 OWNER_EXTERNAL = "external"
 
+#: 红绿灯模块的注册名。有任务在接管时，协调器仍然每帧单独问它一次（红灯否决）。
+LIGHT_TASK_NAME = "traffic_light"
+
 # The base line must be armed before any module may claim motion from it.
 TAKEOVER_ALLOWED_STATES = (TRACKING, COASTING, LINE_LOST)
 
@@ -114,6 +117,17 @@ class TaskCoordinator:
         self.active_task_name: Optional[str] = None
         self._active_started: Optional[float] = None
         self._release_started: Optional[float] = None
+        # 红灯否决（见 _light_veto）：即使有任务在接管，也要每帧问一次红绿灯。
+        # 没有它，"一帧定生死、赢家通吃"就意味着任何模块先接管之后，红灯再亮也
+        # 没人问（实测：障碍接管期间红灯亮着，车仍以 forward=0.2 在走）。
+        self.light_task = next(
+            (task for task in self.motion_tasks
+             if getattr(task, "name", None) == LIGHT_TASK_NAME),
+            None,
+        )
+        #: 被红灯暂停掉的累计时间：等红灯不该算进任务的 max_task_seconds。
+        self._paused_seconds = 0.0
+        self._previous_frame_time: Optional[float] = None
         self._view_changed = False
         self._view_ready_at: Optional[float] = None
         self._view_restore_failed = False
@@ -230,10 +244,13 @@ class TaskCoordinator:
     # -- per-cycle entry point -----------------------------------------
     def step(self, frame: FramePacket, now: float) -> CoordinatorDecision:
         errors = []
+        delta = 0.0 if self._previous_frame_time is None else max(
+            0.0, now - self._previous_frame_time)
+        self._previous_frame_time = now
         self._observe(frame, now, errors)
 
         if self.active_task is not None:
-            return self._step_active(frame, now, errors)
+            return self._step_active(frame, now, errors, delta)
         if self.state == RELEASING:
             return self._step_releasing(frame, now, errors)
         return self._step_line(frame, now, errors)
@@ -270,6 +287,7 @@ class TaskCoordinator:
         self.active_task = task
         self.active_task_name = task.name
         self._active_started = now
+        self._paused_seconds = 0.0
         self.state = TASK_ACTIVE
         if not self._apply_task_gimbal(update, errors):
             return self._release(
@@ -287,14 +305,33 @@ class TaskCoordinator:
             errors=tuple(errors),
         )
 
-    def _step_active(self, frame, now, errors) -> CoordinatorDecision:
+    def _step_active(self, frame, now, errors, delta: float = 0.0) -> CoordinatorDecision:
         task = self.active_task
-        if now - self._active_started > self.settings.tasks.max_task_seconds:
+        elapsed = now - self._active_started - self._paused_seconds
+        if elapsed > self.settings.tasks.max_task_seconds:
             errors.append(
                 f"{task.name} exceeded max_task_seconds "
                 f"({self.settings.tasks.max_task_seconds:.1f}s)"
             )
             return self._release(now, errors, "task timeout", reset_task=True)
+
+        veto = self._light_veto(frame, now, errors)
+        if veto is not None:
+            # 红灯：暂停当前任务（这一帧不调它的 step），只下发停车指令。
+            # 不做释放握手 —— 红灯不是故障，不需要人来按 SPACE；
+            # 等灯的时间也不计入任务的超时预算。
+            self._paused_seconds += delta
+            self.output.send(OWNER_EXTERNAL, STOP_COMMAND)
+            return CoordinatorDecision(
+                state=TASK_ACTIVE,
+                owner=self.output.owner,
+                line=self.last_line_decision,
+                task_name=task.name,
+                task_update=veto,
+                command=STOP_COMMAND,
+                message=f"red light veto: {task.name} paused",
+                errors=tuple(errors),
+            )
 
         update = self._call(task.step, task.name, frame, now, errors)
         if update is None:
@@ -332,6 +369,24 @@ class TaskCoordinator:
             now, errors, f"task {update.status.value}", update=update
         )
 
+    def _light_veto(self, frame, now, errors):
+        """红灯否决：有任务正在开车时，也每帧问一次红绿灯。
+
+        正常情况下红绿灯模块排在最前面，自己就能接管；但它只能"从巡线手里"接管。
+        一旦别的模块先拿走运动出口，协调器整帧只调那一个模块，红绿灯模块再也
+        没机会说话 —— 于是红灯亮着车照样走。
+
+        这里只做两件事：问一次、以及把结果交回给调用方去执行停车。
+        **不结束任务、不做释放握手**：红灯结束（或它自己超时）之后原任务继续干。
+        """
+        light = self.light_task
+        if light is None or light is self.active_task:
+            return None
+        update = self._call(light.step, light.name, frame, now, errors)
+        if update is None or update.status is not TaskStatus.RUNNING:
+            return None
+        return update
+
     def _release(
         self,
         now,
@@ -352,6 +407,7 @@ class TaskCoordinator:
         self.active_task = None
         self.active_task_name = None
         self._active_started = None
+        self._paused_seconds = 0.0
         self._release_started = now
         self._restore_line_view(now, errors)
         self.state = RELEASING
@@ -484,6 +540,7 @@ class TaskCoordinator:
         self.active_task = None
         self.active_task_name = None
         self._active_started = None
+        self._paused_seconds = 0.0
         self._release_started = None
         self.state = LINE_FOLLOWING
         self._restore_line_view(now, [] if errors is None else errors)
