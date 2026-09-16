@@ -127,6 +127,10 @@ class TaskCoordinator:
         )
         #: 被红灯暂停掉的累计时间：等红灯不该算进任务的 max_task_seconds。
         self._paused_seconds = 0.0
+        #: 最近一次"竞争探测"的结果（只有探测帧非空）。给终端显示用：
+        #: 那一刻**每个**模块各自想不想接管，以及最后判给了谁。
+        self.last_claims: tuple = ()
+        self._last_claim_probe_at: Optional[float] = None
         self._previous_frame_time: Optional[float] = None
         self._view_changed = False
         self._view_ready_at: Optional[float] = None
@@ -162,14 +166,31 @@ class TaskCoordinator:
         for observer in self.observers:
             self._call(observer.observe, observer.name, frame, now, errors)
 
-    def _find_takeover(self, frame, now, errors):
+    def _find_takeover(self, frame, now, errors, probe_all: bool = False):
+        """按顺序问模块，返回第一个"想接管"的。
+
+        `probe_all=True` 时**问完所有模块**（胜负规则不变，仍是第一个 RUNNING 赢），
+        并把各自的想法记进 `self.last_claims` 供终端显示"竞争实况"。
+        """
+        winner = None
+        claims = []
         for task in self.motion_tasks:
             update = self._call(task.step, task.name, frame, now, errors)
-            if update is None:
-                continue
-            if update.status is TaskStatus.RUNNING:
-                return task, update
-        return None
+            if update is not None and update.status is TaskStatus.RUNNING:
+                if winner is None:
+                    winner = (task, update)
+                if not probe_all:
+                    # 正常帧：遇到第一个 RUNNING 就停（保持既有开销与状态推进）。
+                    self.last_claims = ()
+                    return winner
+            if probe_all:
+                claims.append({
+                    "name": task.name,
+                    "status": "ERROR" if update is None else update.status.name,
+                    "message": "" if update is None else str(update.message or ""),
+                })
+        self.last_claims = tuple(claims) if probe_all else ()
+        return winner
 
     def _apply_task_motion(self, update: TaskUpdate, errors) -> MotionCommand:
         if update.motion is None:
@@ -253,16 +274,38 @@ class TaskCoordinator:
             return self._step_active(frame, now, errors, delta)
         if self.state == RELEASING:
             return self._step_releasing(frame, now, errors)
-        return self._step_line(frame, now, errors)
+        probe = self._claim_probe_due(now)
+        if probe:
+            self._last_claim_probe_at = now
+        return self._step_line(frame, now, errors, probe=probe)
 
-    def _step_line(self, frame, now, errors) -> CoordinatorDecision:
+    def _claim_probe_due(self, now: float) -> bool:
+        """该不该做一次"竞争探测"（把所有模块都问一遍并记录各自的想法）。
+
+        正常情况下协调器遇到第一个 RUNNING 就停，后面的模块**根本不会被问**，
+        操作员看不到"还有谁想接管、为什么判给它"。这个探测帧就是为调优先级准备的：
+        每 `claim_probe_seconds` 秒一次（默认 3 秒，设 0 关闭），**胜负规则不变**
+        （仍是顺序里第一个 RUNNING）；代价只是那一帧会让未接管的模块多推进一次
+        内部计数，所以频率低、并且可以关。
+        """
+        interval = float(getattr(self.settings.tasks, "claim_probe_seconds", 0.0) or 0.0)
+        if interval <= 0.0:
+            return False
+        if self._last_claim_probe_at is None:
+            # 第一帧只记时、不探测：保持"正常帧只问到自己为止"的既有契约，
+            # 第一次竞争实况在 interval 秒之后出现。
+            self._last_claim_probe_at = now
+            return False
+        return now - self._last_claim_probe_at >= interval
+
+    def _step_line(self, frame, now, errors, probe: bool = False) -> CoordinatorDecision:
         # Process the frame first so the base state machine stays current, but
         # hold its command until we know no task is taking over this cycle.
         decision = self.follower.process_frame(frame.image, frame.captured_at)
         self.last_line_decision = decision
 
         if self.takeover_allowed:
-            takeover = self._find_takeover(frame, now, errors)
+            takeover = self._find_takeover(frame, now, errors, probe_all=probe)
             if takeover is not None:
                 task, update = takeover
                 return self._begin_takeover(task, update, now, errors)
@@ -307,6 +350,8 @@ class TaskCoordinator:
 
     def _step_active(self, frame, now, errors, delta: float = 0.0) -> CoordinatorDecision:
         task = self.active_task
+        # 有人在开车时不再报"竞争"（这一帧只有它被问，报出来会误导操作员）。
+        self.last_claims = ()
         elapsed = now - self._active_started - self._paused_seconds
         if elapsed > self.settings.tasks.max_task_seconds:
             errors.append(

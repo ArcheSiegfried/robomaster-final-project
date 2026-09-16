@@ -218,12 +218,17 @@ class ConsoleStatus:
         except Exception:
             pass
 
-    def update(self, decision, now: float, saved_evidence: int = 0) -> None:
-        """每帧调用一次。只在这里判断"要不要打"，绝不抛异常。"""
+    def update(self, decision, now: float, saved_evidence: int = 0,
+               claims=()) -> None:
+        """每帧调用一次。
+
+        `claims` 是协调器"竞争探测帧"的结果（那一刻每个模块各自想不想接管）。
+        只在这里判断"要不要打"，绝不抛异常。
+        """
         if not self.enabled:
             return
         try:
-            self._update(decision, now, saved_evidence)
+            self._update(decision, now, saved_evidence, claims)
         except Exception:
             pass
 
@@ -249,7 +254,7 @@ class ConsoleStatus:
         except Exception:
             pass
 
-    def _update(self, decision, now: float, saved_evidence: int) -> None:
+    def _update(self, decision, now: float, saved_evidence: int, claims=()) -> None:
         if self.started_at is None:
             self.started_at = now
         self.frames += 1
@@ -267,7 +272,7 @@ class ConsoleStatus:
                 self._task_started_at = now
                 self._say(
                     now,
-                    ">> %s 接管：%s" % (name or self._task_name or "?", message),
+                    ">>> 模块开始运行：%s ｜ %s" % (name or self._task_name or "?", message),
                 )
                 not_asked = self._modules_after(name or self._task_name)
                 if not_asked:
@@ -275,7 +280,7 @@ class ConsoleStatus:
                     # 这些模块这一帧根本没被问过。这就是"优先级被截断"的位置。
                     self._say(
                         now,
-                        "   优先级截断：排在它后面、这一帧没被问到的模块 → %s"
+                        "    优先级截断：排在它后面、这一帧没被问到的模块 → %s"
                         % ", ".join(not_asked),
                     )
             elif state == RELEASING and previous == TASK_ACTIVE:
@@ -283,7 +288,7 @@ class ConsoleStatus:
                 status = getattr(getattr(update, "status", None), "name", None)
                 self._say(
                     now,
-                    "<< %s 结束（%s，共 %.1fs）：%s"
+                    "<<< 模块结束运行：%s（%s，共 %.1fs）｜ %s"
                     % (
                         self._task_name or "?",
                         status or "-",
@@ -319,6 +324,9 @@ class ConsoleStatus:
                 ">>> 得分截图已保存（本次第 %d 张）" % self.saved_evidence,
             )
 
+        if claims:
+            self._say(now, self._competition_text(claims))
+
         if self._last_heartbeat is None:
             # 第一帧不打心跳：启动横幅已经说明"还活着"，再打一行是噪音。
             self._last_heartbeat = now
@@ -332,6 +340,26 @@ class ConsoleStatus:
             if now - self._last_heartbeat >= interval:
                 self._last_heartbeat = now
                 self._say(now, self._heartbeat_text(decision, now))
+
+    def _competition_text(self, claims) -> str:
+        """把"谁在竞争、最后判给谁"写成一行（只在协调器的探测帧出现）。
+
+        正常帧协调器遇到第一个 RUNNING 就停，后面的模块**根本不会被问**；
+        探测帧（默认每 3 秒一次）会把所有模块都问一遍，这里就把它如实打出来。
+        """
+        wanted = [c for c in claims if c.get("status") == "RUNNING"]
+        quiet = [c for c in claims if c.get("status") != "RUNNING"]
+        parts = ["竞争探测：本帧问了 %d 个模块" % len(claims)]
+        if wanted:
+            parts.append("想接管 → %s" % "、".join(
+                "%s(%s)" % (c.get("name"), (c.get("message") or "—")[:28]) for c in wanted))
+        else:
+            parts.append("无人想接管 → 继续巡线")
+        if quiet:
+            parts.append("不想 → %s" % "、".join(str(c.get("name")) for c in quiet))
+        if wanted:
+            parts.append("判给 %s（顺序里第一个想接管的）" % wanted[0].get("name"))
+        return "?? " + " ｜ ".join(parts)
 
     def _heartbeat_text(self, decision, now: float) -> str:
         bits = [
@@ -567,7 +595,8 @@ def main(
                 # 运行记录：把这一帧的接管/释放/限幅/异常写进本次运行的 report.md。
                 record_run_events(coordinator, decision, now)
                 # 终端反馈：状态变化 + 心跳。丢线、接管、异常都会打出来。
-                console.update(decision, now, saved)
+                # claims = 协调器"竞争探测帧"的结果（谁想接管、判给了谁）。
+                console.update(decision, now, saved, coordinator.last_claims)
                 if CONFIG.display:
                     cv2.imshow(
                         "Low-speed line base",

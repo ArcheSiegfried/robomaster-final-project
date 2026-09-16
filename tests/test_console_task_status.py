@@ -105,7 +105,7 @@ class PriorityCutTests(unittest.TestCase):
         status, stream = build()
         status.update(FakeDecision(TASK_ACTIVE, "traffic_light", "holding red"), 1.0)
         text = stream.getvalue()
-        self.assertIn("traffic_light 接管", text)
+        self.assertIn("模块开始运行：traffic_light", text)
         for name in ("number_marker", "green_junction", "free_junction",
                      "route", "obstacle"):
             self.assertIn(name, text, "被截断的模块要列出来：%s" % name)
@@ -114,13 +114,13 @@ class PriorityCutTests(unittest.TestCase):
         status, stream = build()
         status.update(FakeDecision(TASK_ACTIVE, "obstacle", "stepping aside"), 1.0)
         text = stream.getvalue()
-        self.assertIn("obstacle 接管", text)
+        self.assertIn("模块开始运行：obstacle", text)
         self.assertNotIn("number_marker", text, "障碍物是最后一个，后面没人")
 
     def test_missing_task_order_is_harmless(self):
         status, stream = build(task_order=())
         status.update(FakeDecision(TASK_ACTIVE, "obstacle", "stepping aside"), 1.0)
-        self.assertIn("obstacle 接管", stream.getvalue())
+        self.assertIn("模块开始运行：obstacle", stream.getvalue())
 
     def test_release_still_reports_the_end(self):
         status, stream = build()
@@ -128,7 +128,7 @@ class PriorityCutTests(unittest.TestCase):
         status.update(FakeDecision(RELEASING, "obstacle", "task completed",
                                    task_status=TaskStatus.COMPLETED), 2.0)
         text = stream.getvalue()
-        self.assertIn("<< obstacle 结束", text)
+        self.assertIn("模块结束运行：obstacle", text)
         self.assertIn("COMPLETED", text)
 
 
