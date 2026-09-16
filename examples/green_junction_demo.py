@@ -110,8 +110,15 @@ def run_demo(light_probe=green_right) -> List[str]:
     trace.append("task:running")
 
     # 3) 转向：请求被送到唯一运动出口
-    now += FRAME_DT
-    update = task.step(FramePacket(junction_frame(), 5, now), now, tracking.detection)
+    #    "哪边是绿灯"要连续 light_confirm_frames 帧都成立才转身（A15），
+    #    所以这里最多走三帧等它确认完。
+    sequence = 5
+    for _ in range(3):
+        now += FRAME_DT
+        update = task.step(FramePacket(junction_frame(), sequence, now), now, tracking.detection)
+        sequence += 1
+        if task.chosen_branch is not None:
+            break
     if task.chosen_branch is None:
         # 没有灯判据时模块只能停着等，最后必然失败；这是设计好的保守行为。
         trace.append("task:waiting:%s" % update.message)
@@ -122,7 +129,6 @@ def run_demo(light_probe=green_right) -> List[str]:
 
     # 4) 继续转够 turn_min_duration：车的相机在转向时仍能看到岔路，
     #    同时巡线模块已经在左/右分支上重新找到线并居中 → 完成
-    sequence = 6
     update = None
     for _ in range(6):
         now += FRAME_DT
