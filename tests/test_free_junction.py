@@ -26,6 +26,7 @@ from free_junction import (  # noqa: E402
     BLOCKAGE_BOTH,
     BLOCKAGE_LEFT,
     BLOCKAGE_NONE,
+    BLOCKAGE_RIGHT,
     Branch,
     FreeJunctionConfig,
     FreeJunctionDetector,
@@ -570,6 +571,180 @@ class ReArmTests(unittest.TestCase):
             now += 0.05
             again.append(task.step(FramePacket(image, 700 + index, now), now).status)
         self.assertIn(TaskStatus.RUNNING, again, "下一个岔路应该还能接管")
+
+
+class _FakeCandidate(object):
+    """模仿 `number_marker.MarkerCandidate` 的鸭子类型对象（只带本模块要用的字段）。"""
+
+    def __init__(self, center, width, height, observed_at=None, target_id=""):
+        self.center = center
+        self.width = width
+        self.height = height
+        self.observed_at = observed_at
+        self.target_id = target_id
+
+
+class OfficialSdkCriterionTests(unittest.TestCase):
+    """**官方 SDK 识别结果当判据**（`blockage_source="sdk"`）。
+
+    官方读数走的是 `main.py` 的 `feed_marker_observations()` → 任务上的
+    `update_candidates()`（和 6 号 `number_marker` 同一条通路），
+    本模块只消费纯数据、不碰 SDK。所以这里全部用假读数离线验证。
+
+    重点证明一件事：**这条路上判据只有官方读数** ——
+    画面里没有车（`fork_frame()`）也能判对，画面里画了车也不作数。
+    """
+
+    def _task(self, **overrides):
+        settings = FreeJunctionConfig(blockage_source="sdk", **overrides)
+        return FreeJunctionTask(settings)
+
+    def _replay(self, task, image, sightings, frames=200, dt=0.05, start=1.0):
+        """和 main.py 同序：**每帧先把官方读数推给任务，再 step**。"""
+        records = []
+        now = start
+        for index in range(frames):
+            task.update_candidates(sightings, now=now)
+            update = task.step(FramePacket(image, index + 1, now), now)
+            records.append((task.state, update, now))
+            now += dt
+            if update.status in (TaskStatus.COMPLETED, TaskStatus.FAILED):
+                break
+        return records
+
+    def test_official_reading_on_the_left_takes_the_right_branch(self):
+        """官方在左分支报出一辆车 —— 画面里**没有**画车，照样走右边。"""
+        task = self._task()
+        records = self._replay(task, fork_frame(), [(0.20, 0.40, 0.18, 0.26)])
+        updates = [update for _state, update, _now in records]
+        self.assertIs(updates[-1].status, TaskStatus.COMPLETED)
+        self.assertIs(task.chosen_branch, Branch.RIGHT)
+        self.assertEqual(task.last_blockage.source, "sdk")
+        self.assertIn("official detector", task.last_reason)
+        self.assertTrue(all(yaw > 0 for yaw in turn_yaws(records)), turn_yaws(records))
+
+    def test_official_reading_on_the_right_takes_the_left_branch(self):
+        task = self._task()
+        records = self._replay(task, fork_frame(), [(320.0, 180.0, 120.0, 90.0)])
+        updates = [update for _state, update, _now in records]
+        self.assertIs(updates[-1].status, TaskStatus.COMPLETED)
+        self.assertIs(task.chosen_branch, Branch.LEFT)
+        self.assertTrue(all(yaw < 0 for yaw in turn_yaws(records)), turn_yaws(records))
+
+    def test_the_picture_is_not_a_criterion_in_this_mode(self):
+        """画面上有车（画面判据会判"堵"），但官方没读数 → **不接管**。
+
+        这就是要求里"不要拿长宽高/颜色/形状当判据"的回归测试。
+        """
+        task = self._task()
+        for _state, update, _now in self._replay(task, fork_frame(car_left=True), (), frames=60):
+            self.assertIs(update.status, TaskStatus.NOT_TRIGGERED)
+
+    def test_snapshot_expiry_does_not_revive_the_criterion(self):
+        """过期的官方读数不能被当成判据（宁可没有判据，也不拿旧读数选路）。"""
+        task = self._task()
+        now = 1.0
+        stale = [(0.20, 0.40, 0.18, 0.26)]
+        for index in range(40):
+            task.update_candidates(stale, now=now - 1.0)      # 时间戳整整旧了 1 秒
+            update = task.step(FramePacket(fork_frame(), index + 1, now), now)
+            self.assertIs(update.status, TaskStatus.NOT_TRIGGERED)
+            now += 0.05
+        # 换成新鲜读数 → 立刻恢复正常
+        records = self._replay(task, fork_frame(), stale, start=now, frames=200)
+        self.assertIs(records[-1][1].status, TaskStatus.COMPLETED)
+
+    def test_reading_outside_the_corridor_band_is_ignored(self):
+        """带外（画面最下方的自家车头 / 最上方的背景 / ROI 之外）的读数不算数。"""
+        outside = [
+            (0.20, 0.95, 0.18, 0.10),     # 太靠下：自家车头那一带
+            (0.20, 0.02, 0.18, 0.06),     # 太靠上：背景
+            (0.01, 0.40, 0.02, 0.10),     # 落在岔路 ROI 横向范围之外
+        ]
+        for sighting in outside:
+            task = self._task()
+            records = self._replay(task, fork_frame(), [sighting], frames=40)
+            self.assertIs(
+                records[-1][1].status, TaskStatus.NOT_TRIGGERED,
+                "带外的读数不该成为判据: %s" % (sighting,),
+            )
+
+    def test_readings_on_both_sides_fail_instead_of_guessing(self):
+        task = self._task()
+        records = self._replay(
+            task, fork_frame(), [(0.20, 0.40, 0.18, 0.26), (0.80, 0.40, 0.18, 0.26)]
+        )
+        self.assertIs(records[-1][1].status, TaskStatus.FAILED)
+        self.assertIn("both branches", task.last_reason)
+
+    def test_normalized_and_pixel_readings_agree(self):
+        """归一化坐标和像素坐标说的是同一件事（SDK 文档没写用哪种，两种都要认）。"""
+        pixel = self._task()
+        pixel_records = self._replay(pixel, fork_frame(), [(128.0, 144.0, 115.0, 94.0)])
+        normalized = self._task()
+        normalized_records = self._replay(
+            normalized, fork_frame(), [(0.20, 0.40, 0.18, 0.26)]
+        )
+        for records in (pixel_records, normalized_records):
+            self.assertIs(records[-1][1].status, TaskStatus.COMPLETED)
+        self.assertIs(pixel.chosen_branch, Branch.RIGHT)
+        self.assertIs(normalized.chosen_branch, Branch.RIGHT)
+        self.assertEqual(pixel.last_sdk_mode, "pixels")
+        self.assertEqual(normalized.last_sdk_mode, "normalized")
+
+    def test_pushed_shapes_are_all_understood(self):
+        """三种推送写法都认：`(x,y,w,h)`、`(x,y,w,h,标签)`、`MarkerCandidate` 那样的对象。"""
+        for label, sighting in (
+            ("4 元组（机器人识别）", (0.20, 0.40, 0.18, 0.26)),
+            ("5 元组（视觉标签）", (0.20, 0.40, 0.18, 0.26, "3")),
+            ("对象（number_marker 的候选）", _FakeCandidate((0.20, 0.40), 0.18, 0.26, 1.0, "3")),
+        ):
+            task = self._task()
+            records = self._replay(task, fork_frame(), [sighting])
+            self.assertIs(
+                records[-1][1].status, TaskStatus.COMPLETED,
+                "这种推送写法没被认出来: %s" % label,
+            )
+            self.assertIs(task.chosen_branch, Branch.RIGHT, label)
+
+    def test_default_source_still_uses_the_picture(self):
+        """默认配置下官方读数**不参与判定**（行为与本改动前完全一致）。"""
+        task = FreeJunctionTask()                    # 默认 blockage_source="vision"
+        # 画面：左分支有车；官方读数故意说右边有车 —— 应该听画面的（走右边）
+        records = self._replay(task, fork_frame(car_left=True), [(0.80, 0.40, 0.18, 0.26)])
+        self.assertIs(records[-1][1].status, TaskStatus.COMPLETED)
+        self.assertIs(task.chosen_branch, Branch.RIGHT)
+        self.assertEqual(task.last_blockage.source, "vision")
+
+    def test_or_vision_mode_falls_back_when_the_official_source_is_silent(self):
+        """"sdk_or_vision"：官方没读数时退回画面判据，不会因此错过岔路。"""
+        task = FreeJunctionTask(FreeJunctionConfig(blockage_source="sdk_or_vision"))
+        records = self._replay(task, fork_frame(car_left=True), ())
+        self.assertIs(records[-1][1].status, TaskStatus.COMPLETED)
+        self.assertIs(task.chosen_branch, Branch.RIGHT)
+        self.assertEqual(task.last_blockage.source, "vision")
+
+        # 官方有读数时以官方为准（即使画面里根本没车）
+        official = FreeJunctionTask(FreeJunctionConfig(blockage_source="sdk_or_vision"))
+        records = self._replay(official, fork_frame(), [(0.20, 0.40, 0.18, 0.26)])
+        self.assertIs(records[-1][1].status, TaskStatus.COMPLETED)
+        self.assertEqual(official.last_blockage.source, "sdk")
+
+    def test_snapshot_is_replaced_not_merged(self):
+        """快照是"整体替换"：官方改口说"什么也没看到"，读数就得跟着变。"""
+        task = self._task()
+        image = fork_frame()
+        task.update_candidates([(0.20, 0.40, 0.18, 0.26)], now=1.0)
+        task.step(FramePacket(image, 1, 1.0), 1.0)
+        self.assertEqual(task.last_blockage.reading, BLOCKAGE_LEFT)
+
+        task.update_candidates([], now=1.05)          # 官方这一帧什么也没看到
+        task.step(FramePacket(image, 2, 1.05), 1.05)
+        self.assertEqual(task.last_blockage.reading, BLOCKAGE_NONE)
+
+        task.update_candidates([(0.80, 0.40, 0.18, 0.26)], now=1.10)   # 换成右边
+        task.step(FramePacket(image, 3, 1.10), 1.10)
+        self.assertEqual(task.last_blockage.reading, BLOCKAGE_RIGHT)
 
 
 class HarnessIntegrationTests(unittest.TestCase):

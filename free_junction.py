@@ -77,14 +77,19 @@ A3            真岔路的两条分支是**越往上越张开**的：分叉行�
               不会满足这一条，普通弯道也不会。
 A4            岔路连续出现 `confirm_frames` 帧、同一个拥堵读数连续出现
               `blockage_confirm_frames` 帧，才考虑触发；只闪一帧不算。
-A5            **"拥堵"= 那条分支的走廊里停着一辆同型小车**（官方定义）。判据看
-              **“比周围地面暗/亮一大块”**（大尺度局部对比度，v3 起），**不看颜色** ——
-              理由和 4 号 `obstacle.py` 一样：颜色判据在现场没有分离度；
-              而"任何够暗的像素都算障碍"会把影子和车自己的阴影全算进去。
-              形状判据全部相对**检测区域**尺寸：外接框宽 ≥ `min_vehicle_width_ratio`、
-              高 ≥ `min_vehicle_height_ratio`、面积 ≥ `min_vehicle_area_ratio`、
-              框内有东西的像素 ≥ `min_vehicle_density`，再要求框的下沿不低于
-              `vehicle_min_bottom_ratio`（不然"远处一整面墙"也会算进来）。
+A5            **"拥堵"= 那条分支的走廊里停着一辆大疆 RoboMaster S1/EP 小车**
+              （官方定义）。判据有两种来源，由 `blockage_source` 选：
+
+              * `"vision"`（默认）：**按这辆车的样貌认** —— 深色车体
+                （V<=`robot_dark_v_max`）+ 高饱和彩色装甲/灯（S>=`robot_accent_s_min`）。
+                两个比例都**尺度无关**（真车实测：车 深色 0.61~0.70、彩色 0.25~0.34；
+                空地/暗墙彩色 **0.000**），所以车远到 1~2 米也认得出。
+                胶带连同边缘先抹掉，免得"胶带+影子"被凑成一辆车。
+              * `"sdk"`：**只用官方 SDK 的识别结果**（机器人识别 / 视觉标签），
+                由集成层订阅、`main.py` 每帧推给本模块（见 `update_candidates()`）。
+                这条路上本模块**不看长宽高、不看颜色、不看形状**，只信官方读数。
+              * `"sdk_or_vision"`：有新鲜官方读数就用它，没有就退回画面判据。
+
               检测区域是整帧高度的一条带（`blockage_top_ratio` ~
               `blockage_bottom_ratio`），**不是**岔路 ROI：真车实测那辆车在
               y≈36~159，而 ROI 只有 y 0.54~0.96，"只按 ROI 找"会看不见真堵的那条。
@@ -112,9 +117,12 @@ A12           所有阈值都是在合成画面上定的，**必须在正式场�
     python -m unittest tests.test_free_junction -v
 """
 
+import math
+import threading
+import time
 from dataclasses import dataclass
 from enum import Enum
-from typing import List, Optional, Tuple
+from typing import Iterable, List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -136,6 +144,125 @@ BRANCH_RIGHT = "right"
 
 #: 零速度。未触发、等待判据、完成、失败都返回它。
 STOP = MotionCommand()
+
+#: 官方 SDK 报来的坐标是**归一化**还是**像素**，文档没写。归一化坐标不会超过它
+#: —— 与集成层 `marker_source.py` 用的是同一条规则（NORMALIZED_MAX）。
+NORMALIZED_MAX = 1.5
+
+
+@dataclass(frozen=True)
+class SdkSighting:
+    """官方识别（机器人识别 / 视觉标签）报来的一条观测，坐标已换算成**整帧像素**。
+
+    为什么要有这个类
+    ----------------
+    任务模块**不许碰 SDK**（红线 8；`tests/task_harness.py` 的
+    `FORBIDDEN_PATTERNS` 里有 ``\\brobomaster\\b``，`scripts/check_module.py`
+    会把它查出来）。所以官方读数由**集成层**订阅，再由 `main.py` 的
+    `feed_marker_observations()` 每帧推给实现了 `update_candidates()` 的任务
+    —— 和 6 号 `number_marker` 走的是同一条通路，
+    **不需要改 `main.py` / `task_registry.py`**。本模块只消费这个纯数据。
+    """
+
+    center: Tuple[float, float]
+    width: float
+    height: float
+    #: 回调接收时刻（单调钟，和协调器的 `now` 同一个钟）。None = 没有时间戳。
+    observed_at: Optional[float] = None
+    #: 视觉标签识别到的标签（机器人识别时为空）。
+    label: str = ""
+
+    def box(self) -> Tuple[int, int, int, int]:
+        """换算成整帧像素的外接框（x0, y0, x1, y1），只用于日志和证据。"""
+        half_w = max(0.0, float(self.width) / 2.0)
+        half_h = max(0.0, float(self.height) / 2.0)
+        return (
+            int(round(self.center[0] - half_w)),
+            int(round(self.center[1] - half_h)),
+            int(round(self.center[0] + half_w)),
+            int(round(self.center[1] + half_h)),
+        )
+
+    def width_ratio(self, frame_width: int) -> float:
+        """它占画面宽多少（只用来写日志：判定**不看尺寸**）。"""
+        if frame_width <= 0:
+            return 0.0
+        return float(self.width) / float(frame_width)
+
+
+def _observation_parts(item):
+    """外部推来的一条观测 → ``(x, y, w, h, observed_at, label)``；看不懂返回 None。
+
+    认两种既有写法（都是为了对接不同层的约定，且绝不抛异常）：
+
+    * 对象式（`number_marker.MarkerCandidate`）：``center`` + ``width`` +
+      ``height``（+ ``observed_at`` / ``target_id``）；
+    * SDK 原始行：``(x, y, w, h)``（机器人识别）或 ``(x, y, w, h, 标签)``（视觉标签）。
+
+    注意 SDK 回调里的 x/y 是**中心点**（已对 `robomaster/vision.py` 核实）。
+    """
+    if item is None:
+        return None
+    center = getattr(item, "center", None)
+    width = getattr(item, "width", None)
+    height = getattr(item, "height", None)
+    label = getattr(item, "target_id", "")
+    observed_at = getattr(item, "observed_at", None)
+    if center is None or width is None or height is None:
+        try:
+            row = tuple(item)
+        except TypeError:
+            return None
+        if len(row) < 4:
+            return None
+        center = (row[0], row[1])
+        width, height = row[2], row[3]
+        label = row[4] if len(row) > 4 else ""
+        observed_at = None
+    try:
+        x = float(center[0])
+        y = float(center[1])
+        w = float(width)
+        h = float(height)
+    except (TypeError, ValueError, IndexError):
+        return None
+    stamp: Optional[float] = None
+    if observed_at is not None:
+        try:
+            stamp = float(observed_at)
+        except (TypeError, ValueError):
+            stamp = None
+        if stamp is not None and not math.isfinite(stamp):
+            stamp = None
+    if not all(math.isfinite(value) for value in (x, y, w, h)):
+        return None
+    return x, y, w, h, stamp, ("" if label is None else str(label))
+
+
+def observation_is_normalized(item) -> bool:
+    """这条观测用的是归一化坐标吗（四个数都不超过 `NORMALIZED_MAX`）。"""
+    parts = _observation_parts(item)
+    if parts is None:
+        return False
+    return max(abs(value) for value in parts[:4]) <= NORMALIZED_MAX
+
+
+def sighting_from_observation(
+    item, frame_width: int, frame_height: int
+) -> Optional[SdkSighting]:
+    """外部观测 → `SdkSighting`（归一化坐标按整帧尺寸换算；看不懂返回 None）。"""
+    parts = _observation_parts(item)
+    if parts is None:
+        return None
+    x, y, w, h, stamp, label = parts
+    if frame_width > 0 and frame_height > 0 and observation_is_normalized(item):
+        x *= float(frame_width)
+        y *= float(frame_height)
+        w *= float(frame_width)
+        h *= float(frame_height)
+    return SdkSighting(
+        center=(x, y), width=w, height=h, observed_at=stamp, label=label
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -232,6 +359,17 @@ class FreeJunctionConfig:
     fixed_branch: Optional[str] = None      # decision_rule="fixed" 时走哪边
     fallback_branch: Optional[str] = None   # 两条都有车时走哪边；None = 停车报失败
     require_blockage_to_trigger: bool = True  # 两条都没车就不接管（A6）
+
+    # ---- 拥堵判据的**来源**（A5）----
+    #: ``"vision"``（默认）= 本模块自己的画面判据（深色车体 + 高饱和彩色装甲）；
+    #: ``"sdk"`` = **只用官方 SDK 的识别结果**（机器人识别 / 视觉标签），
+    #: 由集成层订阅、`main.py` 每帧推给 `update_candidates()`；
+    #: ``"sdk_or_vision"`` = 有新鲜官方读数就用它，没有就退回画面判据。
+    #: 默认值保持 "vision"：没人在集成层订阅官方识别时，行为与本改动前**完全一致**。
+    blockage_source: str = "vision"
+    #: 官方读数的保鲜窗口（秒）：回调比这还旧就当作"这一帧没看到"。
+    #: 宁可退回"没有判据"（不接管），也不拿一条过期读数决定往哪边拐。
+    sdk_observation_hold_seconds: float = 0.35
 
     # 旧的"走廊"参数（v2 用来把 ROI 下部切块）。v3 改成整帧高度的检测带之后不再使用，
     # 保留名字只为兼容，值不影响任何行为。
@@ -377,10 +515,12 @@ class BlockageReading:
     """两条分支上"有没有车"的读数。`reading` 取 BLOCKAGE_* 四个值之一。"""
 
     reading: str
-    left_evidence: float = 0.0     # 左侧候车框面积占走廊的比例（0 表示没找到）
+    left_evidence: float = 0.0     # 左侧证据：画面判据=面积占比；官方读数=宽占比
     right_evidence: float = 0.0
     left_box: Optional[Tuple[int, int, int, int]] = None
     right_box: Optional[Tuple[int, int, int, int]] = None
+    #: 这条读数是谁给的：``"vision"``（本模块画面判据）或 ``"sdk"``（官方识别）。
+    source: str = "vision"
 
     @property
     def blocked(self) -> bool:
@@ -390,8 +530,11 @@ class BlockageReading:
         """一行短描述，直接塞进 message —— 实车运行记录里就能看见判据读数。"""
         left = "yes" if self.reading in (BLOCKAGE_LEFT, BLOCKAGE_BOTH) else "no"
         right = "yes" if self.reading in (BLOCKAGE_RIGHT, BLOCKAGE_BOTH) else "no"
-        return "vehicle L=%s(%.2f) R=%s(%.2f)" % (
-            left, self.left_evidence, right, self.right_evidence
+        # 画面判据的措辞保持不变（历史运行记录/测试都按它比对）；
+        # 官方读数单独标出来，复盘时一眼能看出这条判据是谁给的。
+        label = "official sighting" if self.source == "sdk" else "vehicle"
+        return "%s L=%s(%.2f) R=%s(%.2f)" % (
+            label, left, self.left_evidence, right, self.right_evidence
         )
 
 
@@ -966,6 +1109,13 @@ class FreeJunctionTask:
         )
         self.state = JunctionState.IDLE
         self.last_detection: Optional[ForkDetection] = None
+        #: 官方 SDK 观测的快照（由 `main.py` 每帧推送，见 `update_candidates()`）。
+        #: 回调可能来自 SDK 自己的线程，所以读写都要过这把锁。
+        self._sdk_lock = threading.Lock()
+        self._sdk_rows: Tuple = ()
+        self._sdk_pushed_at: Optional[float] = None
+        #: 最近一次官方读数被判成哪种坐标（"normalized"/"pixels"/""）——实车排查用。
+        self.last_sdk_mode = ""
         self.last_blockage = BlockageReading(BLOCKAGE_NONE)
         self.last_visual = VisualDetection.no_result(KIND)
         self.chosen_branch: Optional[Branch] = None
@@ -1032,6 +1182,11 @@ class FreeJunctionTask:
         self._last_line_mask = None
         self._state_since = None
         self._run_started_at = None
+        with self._sdk_lock:
+            # 被迫结束后把官方读数也丢掉：那是上一次接管时的画面，不能接着用。
+            self._sdk_rows = ()
+            self._sdk_pushed_at = None
+        self.last_sdk_mode = ""
         self._arm_rearm()
 
     def detect(self, image: Optional[np.ndarray]) -> VisualDetection:
@@ -1063,7 +1218,7 @@ class FreeJunctionTask:
         self.last_detection = fork if fork.valid else None
         self._last_blue_ratio = fork.blue_ratio
         self._last_line_mask = line
-        reading = self._read_blockage(fork, frame.image, rect)
+        reading = self._read_blockage(fork, frame.image, rect, moment)
         self.last_blockage = reading
         self.last_visual = self._visual(fork, self.chosen_branch)
 
@@ -1071,13 +1226,83 @@ class FreeJunctionTask:
             return self._step_idle(fork, reading, moment)
         return self._step_active(fork, reading, moment)
 
+    # -- 官方 SDK 观测（集成层推来的纯数据）--------------------------------
+
+    def update_candidates(self, candidates: Iterable, now: Optional[float] = None) -> None:
+        """主循环推来的**官方 SDK 观测快照**（与 6 号 `number_marker` 同一套接口）。
+
+        接这条通路**不需要改 `main.py` / `task_registry.py`**：`main.py` 的
+        `feed_marker_observations()` 每帧对任何实现了本方法的名字调一次
+        （``push(candidates)``，喂在 `coordinator.step()` 之前）。
+
+        本模块只**存快照**：不订阅、不碰 SDK、不做判定 —— 判定在
+        `_read_blockage()` 里，而且只在 `blockage_source` 选了官方读数时才用。
+
+        :param candidates: 可迭代，元素可以是 `MarkerCandidate` 这类对象
+            （``center``/``width``/``height``/``observed_at``），也可以是 SDK 原始行
+            ``(x, y, w, h)``（机器人识别）或 ``(x, y, w, h, 标签)``（视觉标签）。
+            坐标是归一化还是像素都能认（见 `sighting_from_observation`）。
+        :param now: 给"没有自带时间戳的原始行"打的时间戳（默认取单调钟；
+            离线测试可以传真时钟，这样判定完全可复现）。
+        """
+        try:
+            snapshot = tuple(candidates) if candidates is not None else ()
+        except TypeError:
+            snapshot = ()
+        stamp = time.monotonic() if now is None else now
+        try:
+            stamp = float(stamp)
+        except (TypeError, ValueError):
+            stamp = None
+        with self._sdk_lock:
+            self._sdk_rows = snapshot
+            self._sdk_pushed_at = stamp
+
+    def _sdk_sightings(
+        self, frame_width: int, frame_height: int, now: float
+    ) -> List[SdkSighting]:
+        """快照 → 整帧像素坐标的观测列表，**顺带扔掉过期的**。
+
+        过期这一条很关键：官方识别是"有就推"的回调，车拐过去之后旧读数可能还挂在
+        快照里；拿一条过期读数去选路，比"没有判据"危险得多。
+        """
+        with self._sdk_lock:
+            rows = self._sdk_rows
+            pushed_at = self._sdk_pushed_at
+        hold = max(0.0, float(self.settings.sdk_observation_hold_seconds))
+        sightings: List[SdkSighting] = []
+        mode = ""
+        for row in rows:
+            sighting = sighting_from_observation(row, frame_width, frame_height)
+            if sighting is None:
+                continue
+            stamp = sighting.observed_at if sighting.observed_at is not None else pushed_at
+            if stamp is None:
+                continue            # 没时间戳 = 不知道新不新鲜 → 不敢用
+            age = float(now) - float(stamp)
+            if not math.isfinite(age) or age < 0.0 or age > hold:
+                continue
+            if observation_is_normalized(row):
+                mode = mode or "normalized"
+            else:
+                mode = "pixels"
+            sightings.append(sighting)
+        self.last_sdk_mode = mode
+        return sightings
+
     # -- 拥堵读数 ---------------------------------------------------------
 
-    def _read_blockage(self, fork: ForkDetection, frame, rect) -> BlockageReading:
+    def _read_blockage(
+        self, fork: ForkDetection, frame, rect, now: Optional[float] = None
+    ) -> BlockageReading:
         """读两条分支走廊：哪边停着车（A5）。
+
+        按 `blockage_source` 选判据来源：默认自己的画面判据；
+        选了官方读数（`"sdk"` / `"sdk_or_vision"`）时先看官方读数。
 
         区域 = **整帧高度上的一条带**（`blockage_top_ratio` ~ `blockage_bottom_ratio`），
         横向沿用岔路 ROI 的左右边界，再以分叉点 `split_x` 分成左右两块。
+        两种来源**用同一条带、同一个分叉点**，所以左右的定义完全一致。
 
         为什么不像 v2 那样直接用岔路 ROI：2026-09-16 真车实测，停着的那辆车在
         **画面上方**（y≈36~159），而岔路 ROI 只有 y 0.54~0.96 —— 车整个在区域外面，
@@ -1091,6 +1316,17 @@ class FreeJunctionTask:
         if image.ndim != 3 or image.shape[2] != 3:
             return BlockageReading(BLOCKAGE_NONE)
         height = int(image.shape[0])
+
+        source = str(getattr(settings, "blockage_source", "vision")).strip().lower()
+        if source not in ("vision", "sdk", "sdk_or_vision"):
+            source = "vision"
+        moment = self._last_now if now is None else float(now)
+        if source != "vision":
+            official = self._read_sdk_blockage(fork, image, rect, moment)
+            # "sdk"：官方说没有就是没有（这是它的判据，不再退回画面）；
+            # "sdk_or_vision"：官方这一帧没读数 → 退回画面判据兜底。
+            if source == "sdk" or official.blocked:
+                return official
 
         left_edge, right_edge = int(rect[0]), int(rect[2])
         top = int(_clamp(settings.blockage_top_ratio, 0.0, 0.9) * height)
@@ -1132,6 +1368,62 @@ class FreeJunctionTask:
             right_box=self._to_frame(right_box, left_edge + divider, top),
         )
 
+    def _read_sdk_blockage(
+        self, fork: ForkDetection, image, rect, now: float
+    ) -> BlockageReading:
+        """**官方识别**读数 → 左右分支堵不堵（`blockage_source="sdk"`）。
+
+        判据只有一条：官方 SDK 在**某条分支的走廊里**报出了一辆 RoboMaster 小车
+        （机器人识别），或者一个视觉标签。**不看长宽高、不看颜色、不看形状** ——
+        尺寸只用来记日志（宽占比），不参与判定；这样车离岔路口 1 米、2 米都一样成立。
+
+        左右的定义和画面判据完全一致：同一条检测带 + 同一个分叉点 `split_x`。
+        """
+        settings = self.settings
+        height, width = int(image.shape[0]), int(image.shape[1])
+        if height <= 0 or width <= 0:
+            return BlockageReading(BLOCKAGE_NONE)
+        left_edge, right_edge = int(rect[0]), int(rect[2])
+        top = int(_clamp(settings.blockage_top_ratio, 0.0, 0.9) * height)
+        bottom = int(_clamp(settings.blockage_bottom_ratio, 0.1, 1.0) * height)
+        split = int(fork.split_x)
+
+        left_score = 0.0
+        right_score = 0.0
+        left_box: Optional[Tuple[int, int, int, int]] = None
+        right_box: Optional[Tuple[int, int, int, int]] = None
+        for sighting in self._sdk_sightings(width, height, now):
+            center_x, center_y = sighting.center
+            # 只看"岔路口那条带"和岔路 ROI 的横向范围：和画面判据同一块地方。
+            if center_y < top or center_y > bottom:
+                continue
+            if center_x < left_edge or center_x > right_edge:
+                continue
+            ratio = sighting.width_ratio(width)
+            if center_x < split:
+                if left_box is None or ratio > left_score:
+                    left_score, left_box = ratio, sighting.box()
+            else:
+                if right_box is None or ratio > right_score:
+                    right_score, right_box = ratio, sighting.box()
+
+        if left_box is not None and right_box is not None:
+            reading = BLOCKAGE_BOTH
+        elif left_box is not None:
+            reading = BLOCKAGE_LEFT
+        elif right_box is not None:
+            reading = BLOCKAGE_RIGHT
+        else:
+            reading = BLOCKAGE_NONE
+        return BlockageReading(
+            reading=reading,
+            left_evidence=round(float(left_score), 3),
+            right_evidence=round(float(right_score), 3),
+            left_box=left_box,
+            right_box=right_box,
+            source="sdk",
+        )
+
     @staticmethod
     def _to_frame(box, offset_x, offset_y):
         """区域内的外接框坐标 → 整幅图像坐标（给 evidence / 复盘用）。"""
@@ -1154,12 +1446,21 @@ class FreeJunctionTask:
             return None, "unknown decision rule %r" % (settings.decision_rule,)
 
         if reading.reading == BLOCKAGE_LEFT:
-            return Branch.RIGHT, "left branch blocked by a vehicle (%.2f)" % reading.left_evidence
+            return Branch.RIGHT, "left branch blocked by %s" % self._blocker_text(
+                reading, reading.left_evidence)
         if reading.reading == BLOCKAGE_RIGHT:
-            return Branch.LEFT, "right branch blocked by a vehicle (%.2f)" % reading.right_evidence
+            return Branch.LEFT, "right branch blocked by %s" % self._blocker_text(
+                reading, reading.right_evidence)
         if reading.reading == BLOCKAGE_BOTH:
             return self._fallback("both branches blocked by vehicles")
         return None, "no vehicle on either branch"
+
+    @staticmethod
+    def _blocker_text(reading: BlockageReading, evidence: float) -> str:
+        """理由里写清楚这条判据是**谁**给的（实车复盘时一眼能分）。"""
+        if getattr(reading, "source", "vision") == "sdk":
+            return "a RoboMaster vehicle seen by the official detector (width %.2f)" % evidence
+        return "a vehicle (%.2f)" % evidence
 
     def _fallback(self, reason: str) -> Tuple[Optional[Branch], str]:
         branch = self._as_branch(self.settings.fallback_branch)
