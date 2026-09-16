@@ -21,6 +21,26 @@
 * 报告还提到"运行记录没写模块给的 `message`"——集成侧已在补。所以 v2 把
   **判据读数写进 `TaskUpdate.message`**，实车记录里能直接看到"为什么这么选"。
 
+**3. 2026-09-16 两次实车**（16:52:53 / 16:56:06，`captures/run_*` + 屏幕录制，
+用户提供的 `run_wrong/`）。16:52:53 那次的运行记录里写着
+`junction confirmed, deciding (right branch …)` —— 把**空着的那条**报成"有车"，
+于是去走了真堵的那条（画面证据：车确实往左拐，朝那辆停着的车去了）。
+把当时的现场画面拿出来跑判据，查到一个 v2 的硬伤：
+
+* **检测区域不对**：停着的那辆车在画面**上方**（y≈36~159），而 v2 的走廊只在岔路
+  ROI（y 0.54~0.96）里面 —— 车整个在区域外，"真堵的那条反而看不见"。
+  → v3 改成**整帧高度的一条检测带**（`blockage_top_ratio` 0.10 ~
+  `blockage_bottom_ratio` 0.86），下沿压到 0.86 是为了排掉我们自己车头常驻的橙色轮子。
+* **判据被地砖纹理淹没**：现场是**花岗岩地砖**，细密黑点让 Canny 连成"一整片地毯"
+  （结构像素占 67%~80%，一个框就把整条走廊圈住），真车反而没有独立轮廓。
+  → v3 默认改成**大尺度局部对比度**：车 = "比周围地面暗一大块（或亮一大块）"，
+  地砖黑点/反光是 1~3 像素的小尺度纹理，被大核平均掉；Canny 结构判据降级为可选
+  （`use_structure=False`）。形状闸门也按真车数据重新标定。
+  真车画面实测（4 帧结果一致）：停着车那条 → 宽 0.39 高 0.36 面积 0.14 下沿 0.44；
+  空着那条 → 宽 0.15~0.28 高 0.06~0.16 面积 0.02~0.03 下沿 0.14~0.21。
+  同一次修复还顺手修了：**转弯/出岔路时把"胶带跑出 ROI"误判成丢线而停车**
+  （真车两次都在 TURN/EXIT 里走 0.8 秒就 FAILED），以及**原地多转几十度**。
+
 职责边界（违反会被 `tests/test_task_contract.py` 直接拦下）
 ----------------------------------------------------------
 * 只接收主流程给的 `FramePacket`，绝不自己开相机或视频流；
@@ -57,14 +77,17 @@ A3            真岔路的两条分支是**越往上越张开**的：分叉行�
               不会满足这一条，普通弯道也不会。
 A4            岔路连续出现 `confirm_frames` 帧、同一个拥堵读数连续出现
               `blockage_confirm_frames` 帧，才考虑触发；只闪一帧不算。
-A5            **"拥堵"= 那条分支的走廊里停着一辆同型小车**（官方定义）。判据用
-              **结构**（硬边缘连成的块 + 外接框形状），**不看颜色** —— 理由与 4 号
-              `obstacle.py` 相同：颜色判据在现场没有分离度（皮肤和橙色撞车），
+A5            **"拥堵"= 那条分支的走廊里停着一辆同型小车**（官方定义）。判据看
+              **“比周围地面暗/亮一大块”**（大尺度局部对比度，v3 起），**不看颜色** ——
+              理由和 4 号 `obstacle.py` 一样：颜色判据在现场没有分离度；
               而"任何够暗的像素都算障碍"会把影子和车自己的阴影全算进去。
-              形状判据全部相对走廊尺寸：外接框宽 ≥ `vehicle_min_width_ratio`、
-              高 ≥ `vehicle_min_height_ratio`、面积 ≥ `vehicle_min_area_ratio`、
-              框内有东西的像素 ≥ `vehicle_min_density`，再要求这个框落在走廊**偏下**
-              的位置（`vehicle_min_bottom_ratio`，即"不远处"，不是远处的背景墙）。
+              形状判据全部相对**检测区域**尺寸：外接框宽 ≥ `min_vehicle_width_ratio`、
+              高 ≥ `min_vehicle_height_ratio`、面积 ≥ `min_vehicle_area_ratio`、
+              框内有东西的像素 ≥ `min_vehicle_density`，再要求框的下沿不低于
+              `vehicle_min_bottom_ratio`（不然"远处一整面墙"也会算进来）。
+              检测区域是整帧高度的一条带（`blockage_top_ratio` ~
+              `blockage_bottom_ratio`），**不是**岔路 ROI：真车实测那辆车在
+              y≈36~159，而 ROI 只有 y 0.54~0.96，"只按 ROI 找"会看不见真堵的那条。
 A6            两条分支**只有一条**有车 → 走另一条；**两条都有车** → 判据不成立 →
               停车报失败（或走 `fallback_branch`）；**两条都没有车** → 这不是
               "无拥堵岔路"场景 → **不接管**（`require_blockage_to_trigger`），
@@ -171,6 +194,14 @@ class FreeJunctionConfig:
     roi_right: float = 0.94
     roi_bottom: float = 0.96
 
+    # ---- 找车的检测区域（整帧比例）：**故意比岔路 ROI 高得多** ----
+    # 2026-09-16 真车实测：停着的那辆车在画面左上方（y≈36~159），
+    # 而岔路 ROI 只有 y 0.54~0.96，车整个在走廊外面 → "真堵的那条反而看不见"。
+    # 上沿取 0.10 把远处那辆车包进来；下沿取 0.86 是为了排掉我们自己车头的
+    # 橙色轮子/车体（它常驻在画面最下方正中）。
+    blockage_top_ratio: float = 0.10
+    blockage_bottom_ratio: float = 0.86
+
     # ---- 蓝线颜色管线（沿用已验证的蓝色胶带默认值）----
     hsv_lower: Tuple[int, int, int] = (95, 80, 60)
     hsv_upper: Tuple[int, int, int] = (135, 255, 255)
@@ -200,27 +231,45 @@ class FreeJunctionConfig:
     fallback_branch: Optional[str] = None   # 两条都有车时走哪边；None = 停车报失败
     require_blockage_to_trigger: bool = True  # 两条都没车就不接管（A6）
 
-    corridor_height_ratio: float = 1.0    # 走廊高度 = ROI 高度 × 它（1.0 = 整个 ROI 上部）
-    corridor_bottom_margin: float = 0.05  # 走廊下沿再往上让开一点（相机自己的车体/橙色件）
-    corridor_side_margin: float = 0.0     # 走廊左右各让开一点比例
+    # 旧的"走廊"参数（v2 用来把 ROI 下部切块）。v3 改成整帧高度的检测带之后不再使用，
+    # 保留名字只为兼容，值不影响任何行为。
+    corridor_height_ratio: float = 1.0
+    corridor_bottom_margin: float = 0.05
+    corridor_side_margin: float = 0.0
 
-    use_structure: bool = True            # 结构判据（默认唯一判据）
+    # ---- 判据一（默认）：大尺度局部对比度 ----
+    # 车 = "比周围地面暗一大块（或亮一大块）"；地砖的黑点、反光是**小尺度**纹理，
+    # 会被大核平均掉。2026-09-16 真车实测（4 帧结果一致）：
+    #   停着车那条 → 宽0.39 高0.36 面积0.14 下沿0.44（每帧都是同一个框）
+    #   空着那条   → 宽0.15~0.28 高0.06~0.16 面积0.02~0.03 下沿0.14~0.21
+    use_local_contrast: bool = True
+    contrast_kernel_ratio: float = 0.15   # "周围地面"的大核 = 走廊高度 × 它
+    contrast_threshold: int = 45          # |周围 − 自己| 超过它才算"一块东西"
+    contrast_blur_sigma: float = 1.0      # 先抹掉 1 像素级的噪点
+    contrast_close: int = 9               # 把同一块里的空洞补一补
+
+    # ---- 判据二（默认关）：Canny 结构判据 ----
+    # 4 号 obstacle.py 的路子。但现场是**花岗岩地砖**：细纹理把 Canny 连成"一整片地毯"
+    # （实测结构像素占 67%~80%，一个框就把整条走廊圈住），真车反而被淹没 —— 默认关。
+    use_structure: bool = False
     edge_low: int = 40                    # Canny 低阈值
     edge_high: int = 110                  # Canny 高阈值
     edge_dilate: int = 3                  # 边缘加粗，后面才连得成块
     structure_close: int = 15             # 把边缘连成整块的核大小
-    #: 找车之前，把蓝带**连同边缘**一起抹平多宽（像素）。
+    #: 找车之前，把蓝带**连同边缘**一起抹平多宽（像素）。两个判据共用。
     #: HSV 掩码只盖得住胶带芯，边缘的抗锯齿混合像素在掩码外面；不抹掉它们，
-    #: Canny 就会把胶带自己的轮廓当成"硬边物体"，形状判据一过就变成一辆假车
+    #: 判据就会把胶带自己的轮廓当成"一块东西"
     #: （2026-09-16 真车实测：干净的那条分支被报成"有车"，于是走了堵的那条）。
     tape_clear_px: int = 5
-    min_vehicle_width_ratio: float = 0.15   # 外接框宽 / 走廊宽
-    min_vehicle_height_ratio: float = 0.20  # 外接框高 / 走廊高
-    min_vehicle_area_ratio: float = 0.04    # 外接框面积 / 走廊面积
-    min_vehicle_density: float = 0.05       # 框内"有东西"的像素占比
+
+    # ---- 形状闸门（全部相对走廊尺寸），按 2026-09-16 真车实测重新标定 ----
+    min_vehicle_width_ratio: float = 0.20   # 车 0.39 / 空 0.15~0.28
+    min_vehicle_height_ratio: float = 0.25  # 车 0.36 / 空 0.06~0.16 ← 主要靠这道分开
+    min_vehicle_area_ratio: float = 0.08    # 车 0.14 / 空 0.02~0.03
+    min_vehicle_density: float = 0.05       # 框内"有东西"的像素占比（太稀的空框不算）
     max_vehicle_width_ratio: float = 0.95   # 上限只当兜底（车很近时会顶满走廊）
     max_vehicle_area_ratio: float = 0.90
-    vehicle_min_bottom_ratio: float = 0.55  # 车要在走廊偏下的位置（"不远处"，不是远处背景）
+    vehicle_min_bottom_ratio: float = 0.35  # 车 0.44 / 空 0.14~0.21 → 0.35 两边都分得开
     reject_skin_like: bool = True         # 皮肤色占比过半的候选丢掉（同 obstacle.py）
     skin_reject_ratio: float = 0.50
     use_color_ranges: bool = False        # 颜色判据默认关（A5 的理由）
@@ -376,6 +425,19 @@ def _separated_runs(
 # ---------------------------------------------------------------------------
 
 
+def _blue_mask(roi: np.ndarray, settings: FreeJunctionConfig) -> np.ndarray:
+    """一块图里的蓝色带子掩码（bool）。岔路检测和找车都用这一套 HSV。"""
+    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+    mask = cv2.inRange(
+        hsv,
+        np.array(settings.hsv_lower, dtype=np.uint8),
+        np.array(settings.hsv_upper, dtype=np.uint8),
+    )
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, _odd_kernel(settings.open_kernel))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, _odd_kernel(settings.close_kernel))
+    return mask > 0
+
+
 class FreeJunctionDetector:
     """只做一件事：在一张 BGR 图上找"一分为二"的蓝色带子（A1~A4）。
 
@@ -387,16 +449,7 @@ class FreeJunctionDetector:
 
     def blue_mask(self, roi: np.ndarray) -> np.ndarray:
         """ROI 里的蓝色带子掩码（bool）。"""
-        settings = self.settings
-        hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
-        mask = cv2.inRange(
-            hsv,
-            np.array(settings.hsv_lower, dtype=np.uint8),
-            np.array(settings.hsv_upper, dtype=np.uint8),
-        )
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, _odd_kernel(settings.open_kernel))
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, _odd_kernel(settings.close_kernel))
-        return mask > 0
+        return _blue_mask(roi, self.settings)
 
     def roi_rect(self, frame: np.ndarray) -> Optional[Tuple[int, int, int, int]]:
         """把比例 ROI 换算成像素框 (left, top, right, bottom)。"""
@@ -511,25 +564,58 @@ class VehicleDetector:
     def __init__(self, settings: Optional[FreeJunctionConfig] = None) -> None:
         self.settings = settings if settings is not None else FreeJunctionConfig()
 
+    def _erase_tape(self, gray: np.ndarray, line: Optional[np.ndarray]) -> np.ndarray:
+        """把蓝带**连同边缘**抹成周围地面的灰度。
+
+        HSV 掩码只盖得住胶带芯，边缘的抗锯齿混合像素在掩码外面；不抹掉它们，
+        判据就会把胶带自己的轮廓当成"一块东西"（2026-09-16 真车实测踩过这个坑：
+        干净的那条分支被报成"有车"，于是走了堵的那条）。
+        """
+        if line is None or not bool(np.any(line)):
+            return gray
+        tape = np.zeros(gray.shape, dtype=np.uint8)
+        tape[line] = 255
+        grow = int(self.settings.tape_clear_px)
+        if grow >= 3:
+            tape = cv2.dilate(tape, _odd_kernel(grow))
+        tape = tape > 0
+        floor = gray[~tape]
+        if not floor.size:
+            return gray
+        out = gray.copy()
+        out[tape] = int(np.median(floor))
+        return out
+
+    def contrast_mask(self, region: np.ndarray, line: Optional[np.ndarray]) -> np.ndarray:
+        """大尺度局部对比度：车 = "比周围地面暗一大块（或亮一大块）"。
+
+        * 大核均值模糊得到"周围地面"的亮度水平，再和原图求 |差|；
+        * 车是一两百像素的大块，差值很大；地砖的黑点、反光是 1~3 像素的小尺度纹理，
+          被大核平均进地面里，差值很小 → 自然被抹掉；
+        * 取**绝对值** → 深色车、浅色车都能抓（这才是"不看颜色"的正确做法）。
+        """
+        settings = self.settings
+        gray = self._erase_tape(cv2.cvtColor(region, cv2.COLOR_BGR2GRAY), line)
+        sigma = float(settings.contrast_blur_sigma)
+        if sigma > 0.0:
+            gray = cv2.GaussianBlur(gray, (0, 0), sigmaX=sigma)
+        height = int(gray.shape[0])
+        kernel = int(max(3, round(_clamp(settings.contrast_kernel_ratio, 0.05, 0.5) * height)))
+        if kernel % 2 == 0:
+            kernel += 1
+        background = cv2.blur(gray, (kernel, kernel))
+        mask = cv2.absdiff(background, gray) > int(settings.contrast_threshold)
+        mask = mask.astype(np.uint8) * 255
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, _odd_kernel(3))
+        if settings.contrast_close >= 3:
+            mask = cv2.morphologyEx(
+                mask, cv2.MORPH_CLOSE, _odd_kernel(settings.contrast_close)
+            )
+        return mask
+
     def structure_mask(self, region: np.ndarray, line: Optional[np.ndarray]) -> np.ndarray:
         settings = self.settings
-        gray = cv2.cvtColor(region, cv2.COLOR_BGR2GRAY)
-        if line is not None and bool(np.any(line)):
-            # 关键：掩码只盖得住胶带**芯**，边缘的抗锯齿混合像素不在掩码里。
-            # 只按掩码抹平的话，胶带自己的轮廓会被 Canny 当成"硬边物体"，
-            # 外接框一过形状判据就变成一辆假车 —— 2026-09-16 真车就是这么把
-            # 干净的那条分支报成"有车"、于是走了堵的那条的。所以先**膨胀**
-            # tape_clear_px 再抹，把边缘一起抹掉。
-            tape = np.zeros(gray.shape, dtype=np.uint8)
-            tape[line] = 255
-            grow = int(settings.tape_clear_px)
-            if grow >= 3:
-                tape = cv2.dilate(tape, _odd_kernel(grow))
-            tape = tape > 0
-            floor = gray[~tape]
-            if floor.size:
-                gray = gray.copy()
-                gray[tape] = int(np.median(floor))
+        gray = self._erase_tape(cv2.cvtColor(region, cv2.COLOR_BGR2GRAY), line)
         edges = cv2.Canny(gray, int(settings.edge_low), int(settings.edge_high))
         if settings.edge_dilate >= 3:
             edges = cv2.dilate(edges, _odd_kernel(settings.edge_dilate))
@@ -565,7 +651,14 @@ class VehicleDetector:
         if height < 8 or width < 8:
             return False, 0.0, None
 
+        if line is None:
+            # 调用方没给蓝带掩码时自己算一遍（用的还是同一套 HSV，见 _blue_mask）。
+            line = _blue_mask(region, settings)
+
         mask = np.zeros((height, width), np.uint8)
+        # 判据一（默认）：大尺度局部对比度。判据二（默认关）：Canny 结构。
+        if settings.use_local_contrast:
+            mask = cv2.bitwise_or(mask, self.contrast_mask(region, line))
         if settings.use_structure:
             mask = cv2.bitwise_or(mask, self.structure_mask(region, line))
         if settings.use_color_ranges:
@@ -747,7 +840,7 @@ class FreeJunctionTask:
         不用虚构坐标冒充结果。
         """
         fork, roi, line, rect = self.detector.analyze(image)
-        reading = self._read_blockage(fork, roi, line, rect)
+        reading = self._read_blockage(fork, image, rect)
         self.last_blockage = reading
         branch: Optional[Branch] = None
         reason = "no junction"
@@ -769,7 +862,7 @@ class FreeJunctionTask:
         self.last_detection = fork if fork.valid else None
         self._last_blue_ratio = fork.blue_ratio
         self._last_line_mask = line
-        reading = self._read_blockage(fork, roi, line, rect)
+        reading = self._read_blockage(fork, frame.image, rect)
         self.last_blockage = reading
         self.last_visual = self._visual(fork, self.chosen_branch)
 
@@ -779,42 +872,41 @@ class FreeJunctionTask:
 
     # -- 拥堵读数 ---------------------------------------------------------
 
-    def _read_blockage(
-        self, fork: ForkDetection, roi, line_mask, rect
-    ) -> BlockageReading:
+    def _read_blockage(self, fork: ForkDetection, frame, rect) -> BlockageReading:
         """读两条分支走廊：哪边停着车（A5）。
 
-        走廊 = ROI 下部那一块（默认就是整个 ROI），以 `split_x` 分成左右两块。
-        **刻意不锚在分叉行上**：车停在分支上会挡住那段胶带，被挡之后"最低的合格分叉行"
-        会被顶到车的前面，锚在分叉行上的走廊反而会把车漏在外面（v2 早期版本踩过）。
-        锚在 ROI 下沿 = "离车最近的这一段"，也正好对应"不远处停着一辆车"。
+        区域 = **整帧高度上的一条带**（`blockage_top_ratio` ~ `blockage_bottom_ratio`），
+        横向沿用岔路 ROI 的左右边界，再以分叉点 `split_x` 分成左右两块。
+
+        为什么不像 v2 那样直接用岔路 ROI：2026-09-16 真车实测，停着的那辆车在
+        **画面上方**（y≈36~159），而岔路 ROI 只有 y 0.54~0.96 —— 车整个在区域外面，
+        于是"真堵的那条反而报没有车"。上沿抬到 0.10 把远处的车包进来，
+        下沿压到 0.86 是为了排掉我们自己车头常驻的橙色轮子/车体。
         """
         settings = self.settings
-        if not fork.valid or roi is None or roi.size == 0 or line_mask is None:
+        if not fork.valid or frame is None or rect is None:
             return BlockageReading(BLOCKAGE_NONE)
-        if rect is None:
+        image = np.asarray(frame)
+        if image.ndim != 3 or image.shape[2] != 3:
             return BlockageReading(BLOCKAGE_NONE)
+        height = int(image.shape[0])
 
-        roi_left, roi_top = int(rect[0]), int(rect[1])
-        roi_height, roi_width = roi.shape[:2]
-        split_x_local = int(fork.split_x) - roi_left
-
-        corridor_height = int(_clamp(settings.corridor_height_ratio, 0.1, 1.0) * roi_height)
-        bottom_margin = int(_clamp(settings.corridor_bottom_margin, 0.0, 0.4) * roi_height)
-        corridor_bottom = int(max(12, roi_height - bottom_margin))
-        corridor_top = int(max(0, corridor_bottom - corridor_height))
-        if corridor_bottom - corridor_top < 8:
+        left_edge, right_edge = int(rect[0]), int(rect[2])
+        top = int(_clamp(settings.blockage_top_ratio, 0.0, 0.9) * height)
+        bottom = int(_clamp(settings.blockage_bottom_ratio, 0.1, 1.0) * height)
+        if bottom - top < 16 or right_edge - left_edge < 16:
             return BlockageReading(BLOCKAGE_NONE)
-        margin = int(_clamp(settings.corridor_side_margin, 0.0, 0.4) * roi_width)
-        divider = int(max(6, min(roi_width - 6, split_x_local)))
+        region = image[top:bottom, left_edge:right_edge]
+        region_width = int(region.shape[1])
 
-        left_region = roi[corridor_top:corridor_bottom, margin:divider]
-        right_region = roi[corridor_top:corridor_bottom, divider + margin:roi_width - margin]
-        left_line = line_mask[corridor_top:corridor_bottom, margin:divider]
-        right_line = line_mask[corridor_top:corridor_bottom, divider + margin:roi_width - margin]
+        divider = int(max(6, min(region_width - 6, int(fork.split_x) - left_edge)))
+        left_region = region[:, :divider]
+        right_region = region[:, divider:]
 
-        left_blocked, left_score, left_box = self.vehicle.detect(left_region, left_line)
-        right_blocked, right_score, right_box = self.vehicle.detect(right_region, right_line)
+        # 蓝带掩码由 VehicleDetector 在这个区域里自己算（同一套 HSV），
+        # 这样"抹掉胶带"用的是本区域的掩码，不会张冠李戴。
+        left_blocked, left_score, left_box = self.vehicle.detect(left_region)
+        right_blocked, right_score, right_box = self.vehicle.detect(right_region)
 
         if left_blocked and right_blocked:
             reading = BLOCKAGE_BOTH
@@ -829,19 +921,17 @@ class FreeJunctionTask:
             reading=reading,
             left_evidence=left_score,
             right_evidence=right_score,
-            left_box=self._to_frame(left_box, rect, margin, corridor_top),
-            right_box=self._to_frame(right_box, rect, divider + margin, corridor_top),
+            left_box=self._to_frame(left_box, left_edge, top),
+            right_box=self._to_frame(right_box, left_edge + divider, top),
         )
 
     @staticmethod
-    def _to_frame(box, rect, offset_x, offset_y):
-        """走廊内的外接框坐标 → 整幅图像坐标（给 evidence / 复盘用）。"""
+    def _to_frame(box, offset_x, offset_y):
+        """区域内的外接框坐标 → 整幅图像坐标（给 evidence / 复盘用）。"""
         if box is None:
             return None
-        roi_left, roi_top = int(rect[0]), int(rect[1])
         x0, y0, x1, y1 = box
-        return (x0 + roi_left + offset_x, y0 + roi_top + offset_y,
-                x1 + roi_left + offset_x, y1 + roi_top + offset_y)
+        return (x0 + offset_x, y0 + offset_y, x1 + offset_x, y1 + offset_y)
 
     def _choose_branch(self, reading: BlockageReading) -> Tuple[Optional[Branch], str]:
         """返回 (走哪条分支, 理由)。分支为 None 表示判据不成立 —— 那就别动。"""
