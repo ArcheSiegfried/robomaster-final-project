@@ -49,6 +49,10 @@ NORMALIZED_MAX = 1.5
 #: 低于这个回调频率，模块的观测新鲜度要求就守不住了（0.30s 丢失超时）。
 MIN_USEFUL_HZ = 3.5
 
+#: 数字标识模块要求的"标记宽度占画面宽的比例"下限（与 number_marker 的同名设置一致）。
+#: 低于它模块会一直判 TARGET_TOO_SMALL：看到标识也不停车、不拍照。
+MIN_USEFUL_WIDTH_RATIO = 0.20
+
 
 def _finite(value) -> Optional[float]:
     try:
@@ -115,6 +119,12 @@ class MarkerObservationSource:
         self.empty_callbacks = 0
         self.first_callback_at: Optional[float] = None
         self.last_callback_at: Optional[float] = None
+        # 宽度诊断：数字标识模块要求"标记宽度 > 画面宽 20%"，否则它会一直判
+        # TARGET_TOO_SMALL 而不接管（不拍照、不停车）。只记"快照里有几个 marker"
+        # 回答不了"为什么没接管"，所以这里把看到过的最宽候选也记下来。
+        self.observed_candidates = 0
+        self._max_width_ratio: Optional[float] = None
+        self._max_width_target: str = ""
 
     # ------------------------------------------------------------------
     # 对外
@@ -179,19 +189,38 @@ class MarkerObservationSource:
 
         mode = self._resolve_mode(rows)
         if mode == "normalized":
-            return marker_candidates_from_normalized(
+            result = marker_candidates_from_normalized(
                 rows, width, height, received_at, None
             )
-        return _candidates_from_pixels(rows, received_at)
+        else:
+            result = _candidates_from_pixels(rows, received_at)
+        self._note_width(result, width)
+        return result
+
+    def _note_width(self, candidates, frame_width: int) -> None:
+        """记下"这一帧看到的候选有多宽"——回答"为什么看到了却不接管"。"""
+        if not candidates or frame_width <= 0:
+            return
+        widest = max(candidates, key=lambda item: item.width)
+        ratio = widest.width / float(frame_width)
+        with self._lock:
+            self.observed_candidates += len(candidates)
+            if self._max_width_ratio is None or ratio > self._max_width_ratio:
+                self._max_width_ratio = ratio
+                self._max_width_target = "%s（%.0f 像素）" % (
+                    widest.target_id, widest.width)
 
     def stats(self) -> dict:
-        """给实车排查用：频率、坐标模式、快照里现在有几个 marker。"""
+        """给实车排查用：频率、坐标模式、快照里几个 marker、看到过的最宽候选。"""
         with self._lock:
             callbacks = self.callbacks
             empty = self.empty_callbacks
             first = self.first_callback_at
             last = self.last_callback_at
             snapshot = len(self._marker_info)
+            observed = self.observed_candidates
+            max_ratio = self._max_width_ratio
+            widest = self._max_width_target
         rate = None
         if first is not None and last is not None and last > first:
             rate = round((callbacks - 1) / (last - first), 2)
@@ -204,10 +233,32 @@ class MarkerObservationSource:
             "empty_callbacks": empty,
             "callback_hz": rate,
             "markers_in_snapshot": snapshot,
+            "observed_candidates": observed,
+            "max_width_ratio": (
+                None if max_ratio is None else round(max_ratio, 3)
+            ),
+            "widest_target": widest or "(没有看到候选)",
         }
 
+    def _width_warning(self) -> str:
+        """看到的候选一直太窄时，直接说出这是模块不接管的原因。"""
+        stats = self.stats()
+        ratio = stats["max_width_ratio"]
+        if ratio is None or ratio > MIN_USEFUL_WIDTH_RATIO:
+            return ""
+        return (
+            "看到过的最宽候选只有画面宽的 %.1f%%（目标 %s），低于模块要求的 "
+            "%.0f%%：数字标识会一直判 TARGET_TOO_SMALL —— 看到标识也不会停车、"
+            "不会拍照。把车开近些，或核对 SDK 报的宽度是不是卡片宽度。"
+            % (ratio * 100.0, stats["widest_target"],
+               MIN_USEFUL_WIDTH_RATIO * 100.0)
+        )
+
     def rate_warning(self) -> str:
-        """回调太慢时给一句人话，说明为什么数字标识会失手。"""
+        """回调太慢或候选太窄时给一句人话，说明为什么数字标识会失手。"""
+        width = self._width_warning()
+        if width:
+            return width
         rate = self.stats()["callback_hz"]
         if rate is None:
             return "还没有收到任何 marker 回调。"
