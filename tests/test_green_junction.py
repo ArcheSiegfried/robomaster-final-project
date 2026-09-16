@@ -36,6 +36,7 @@ from green_junction import (  # noqa: E402
     evaluate_branches,
     line_is_centered,
     make_light_probe,
+    make_two_lamp_probe,
     near_field_line,
     near_line_is_centered,
 )
@@ -117,6 +118,20 @@ def green_lamp_frame(center=(500, 100), radius=22):
     """实车朝向的岔路 + 画面右上方一盏绿灯（给 3 号的检测器认）。"""
     image = approach_frame()
     cv2.circle(image, center, radius, (0, 255, 0), -1)  # BGR 纯绿 ≈ HSV H=60
+    return image
+
+
+def two_lamp_frame(green_on_left=True, y=100, radius=22):
+    """**本关卡的真实场景**：岔路口两边各放一盏灯，一边红一边绿（灯立在路边）。
+
+    和 :func:`green_lamp_frame` 的区别就是"同时有两盏"——这正是 3 号的
+    ``TrafficLightDetector`` 会翻车的场景：它整帧只挑**一盏**得分最高的，
+    而且 ``red_priority=True``，两盏同时可见时只会报红。
+    """
+    image = approach_frame()
+    red_x, green_x = (500, 100) if green_on_left else (100, 500)
+    cv2.circle(image, (red_x, y), radius, (0, 0, 255), -1)    # 红（BGR 纯红）
+    cv2.circle(image, (green_x, y), radius, (0, 255, 0), -1)   # 绿
     return image
 
 
@@ -999,6 +1014,201 @@ class LightProbeAdapterTests(unittest.TestCase):
         self.assertEqual(task.chosen_branch, Branch.RIGHT)
         self.assertEqual(task.state, JunctionState.COMPLETED)
         self.assertEqual(harness.owner, "line")
+
+
+class TwoLampTests(unittest.TestCase):
+    """A15/A16：岔路口两边各一盏灯（一边红一边绿，灯立在路边），往绿灯那边走。"""
+
+    def setUp(self):
+        detection = JunctionDetector(JunctionConfig()).detect(approach_frame())
+        self.assertTrue(detection.valid, detection.message)
+        self.branches = detection.branches
+        self.settings = JunctionConfig()
+
+    # -- 判据：绿灯在哪边就走哪边 ------------------------------------------
+
+    def test_green_on_the_left_beats_red_on_the_right(self):
+        chosen, reason = evaluate_branches(
+            self.branches,
+            [
+                LightReading(color=LightColor.RED, branch=Branch.RIGHT),
+                LightReading(color=LightColor.GREEN, branch=Branch.LEFT),
+            ],
+            self.settings,
+        )
+        self.assertIsNotNone(chosen)
+        self.assertIs(chosen.side, Branch.LEFT)
+        self.assertIn("green light on the left branch", reason)
+
+    def test_green_on_the_right_beats_red_on_the_left(self):
+        chosen, reason = evaluate_branches(
+            self.branches,
+            [
+                LightReading(color=LightColor.GREEN, branch=Branch.RIGHT),
+                LightReading(color=LightColor.RED, branch=Branch.LEFT),
+            ],
+            self.settings,
+        )
+        self.assertIsNotNone(chosen)
+        self.assertIs(chosen.side, Branch.RIGHT)
+        self.assertIn("green light on the right branch", reason)
+
+    def test_both_green_falls_back_to_the_rule(self):
+        chosen, reason = evaluate_branches(
+            self.branches,
+            [
+                LightReading(color=LightColor.GREEN, branch=Branch.LEFT),
+                LightReading(color=LightColor.GREEN, branch=Branch.RIGHT),
+            ],
+            JunctionConfig(fallback_rule="left"),
+        )
+        self.assertIsNotNone(chosen)
+        self.assertIs(chosen.side, Branch.LEFT)
+        self.assertIn("fallback_rule", reason)
+
+    def test_two_reds_never_move(self):
+        chosen, reason = evaluate_branches(
+            self.branches,
+            [
+                LightReading(color=LightColor.RED, branch=Branch.LEFT),
+                LightReading(color=LightColor.RED, branch=Branch.RIGHT),
+            ],
+            self.settings,
+        )
+        self.assertIsNone(chosen)
+        self.assertIn("red", reason)
+
+    def test_one_red_only_is_still_red(self):
+        chosen, reason = evaluate_branches(
+            self.branches,
+            [LightReading(color=LightColor.RED, branch=Branch.LEFT)],
+            self.settings,
+        )
+        self.assertIsNone(chosen)
+        self.assertIn("left branch", reason)
+
+    def test_green_without_a_side_plus_a_red_side_takes_the_other_side(self):
+        """A16：只知道"看到绿灯"，但知道左边是红灯 → 走右边。"""
+        chosen, reason = evaluate_branches(
+            self.branches,
+            [
+                LightReading(color=LightColor.GREEN, branch=None),
+                LightReading(color=LightColor.RED, branch=Branch.LEFT),
+            ],
+            self.settings,
+        )
+        self.assertIsNotNone(chosen)
+        self.assertIs(chosen.side, Branch.RIGHT)
+        self.assertIn("red", reason)
+
+    def test_green_without_a_side_alone_uses_the_fallback_rule(self):
+        chosen, _ = evaluate_branches(
+            self.branches,
+            [LightReading(color=LightColor.GREEN, branch=None)],
+            JunctionConfig(fallback_rule="left"),
+        )
+        self.assertIsNotNone(chosen)
+        self.assertIs(chosen.side, Branch.LEFT)
+
+    # -- 适配器：把"整帧一盏"变成"左右各一盏" ----------------------------
+
+    def test_adapter_splits_the_frame_into_left_and_right(self):
+        class CropDetector:
+            """按调用顺序返回：第一刀（左半边）红、第二刀（右半边）绿。"""
+
+            def __init__(self):
+                self.calls = 0
+
+            def detect(self, image):
+                self.calls += 1
+                return VisualDetection(
+                    valid=True,
+                    kind="traffic_light",
+                    center=(10, 10),
+                    color="red" if self.calls == 1 else "green",
+                )
+
+        probe = make_two_lamp_probe(CropDetector())
+        readings = probe(packet(two_lamp_frame(), 1, 0.0), 0.0)
+        self.assertEqual(len(readings), 2)
+        self.assertIs(readings[0].color, LightColor.RED)
+        self.assertIs(readings[0].branch, Branch.LEFT)
+        self.assertIs(readings[1].color, LightColor.GREEN)
+        self.assertIs(readings[1].branch, Branch.RIGHT)
+
+    def test_adapter_keeps_the_other_half_when_one_half_fails(self):
+        class FlakyDetector:
+            def __init__(self):
+                self.calls = 0
+
+            def detect(self, image):
+                self.calls += 1
+                if self.calls == 1:
+                    return VisualDetection(
+                        valid=True, kind="traffic_light", center=(10, 10), color="green"
+                    )
+                raise RuntimeError("右半边炸了")
+
+        readings = make_two_lamp_probe(FlakyDetector())(packet(two_lamp_frame(), 1, 0.0), 0.0)
+        self.assertEqual(len(readings), 1)
+        self.assertIs(readings[0].color, LightColor.GREEN)
+        self.assertIs(readings[0].branch, Branch.LEFT)
+
+    def test_adapter_with_no_lamps_returns_nothing(self):
+        readings = make_two_lamp_probe(lambda image: None)(packet(approach_frame(), 1, 0.0), 0.0)
+        self.assertEqual(readings, [])
+
+    # -- 和 3 号真检测器串起来 ---------------------------------------------
+
+    def test_single_lamp_adapter_only_reports_red_when_both_are_visible(self):
+        """说明为什么必须做左右切分：整帧只问一次时，``red_priority`` 只会报红。"""
+        from traffic_light import TrafficLightDetector
+
+        probe = make_light_probe(TrafficLightDetector())
+        reading = probe(packet(two_lamp_frame(), 1, 0.0), 0.0)
+        self.assertIsNotNone(reading)
+        self.assertIs(reading.color, LightColor.RED)
+
+    def test_real_detector_two_lamps_drives_the_module_to_the_green_side(self):
+        """本关卡的正式场景，端到端：绿灯在哪边，车就走哪边。"""
+        from traffic_light import TrafficLightDetector
+
+        for green_on_left, expected in ((True, Branch.LEFT), (False, Branch.RIGHT)):
+            task = GreenJunctionTask(light_probe=make_two_lamp_probe(TrafficLightDetector()))
+            harness = TaskHarness(task=task)
+            harness.start_line(now=1.0)
+            now = 1.05
+            for _ in range(60):
+                now += 0.05
+                decision = harness.feed_image(now, two_lamp_frame(green_on_left=green_on_left))
+                if task.finished and decision.owner == "line":
+                    break
+            self.assertTrue(
+                any(row.task_name == "green_junction" for row in harness.traces),
+                "绿灯亮着时模块应该接管",
+            )
+            self.assertEqual(
+                task.chosen_branch,
+                expected,
+                "绿灯在%s边却走了 %s" % ("左" if green_on_left else "右", task.chosen_branch),
+            )
+            self.assertEqual(task.state, JunctionState.COMPLETED)
+            self.assertEqual(harness.owner, "line")
+
+    def test_two_lamp_probe_readings_are_exposed_for_logging(self):
+        from traffic_light import TrafficLightDetector
+
+        task = GreenJunctionTask(light_probe=make_two_lamp_probe(TrafficLightDetector()))
+        now = 10.0
+        for index in range(4):
+            now += FRAME_DT
+            task.step(packet(two_lamp_frame(green_on_left=False), index + 1, now), now)
+        self.assertEqual(len(task.last_readings), 2)
+        sides = sorted(item.branch.value for item in task.last_readings)
+        self.assertEqual(sides, ["left", "right"])
+        greens = [item for item in task.last_readings if item.color is LightColor.GREEN]
+        self.assertEqual(len(greens), 1)
+        self.assertEqual(greens[0].branch.value, "right")
 
 
 class CoordinatorHarnessTests(unittest.TestCase):

@@ -21,8 +21,6 @@
 运行时判据不成立就 ``FAILED`` 停车，宁可不动也不瞎动。
 
 ============  ==========================================================
-假设编号       内容
-============  ==========================================================
 A1            岔路是"蓝色巡线带一分为二"，两条分支都是蓝色（``require_blue_branches``）。
               如果正式赛道用别的颜色/材质，改 HSV 区间即可。
 A2            岔路出现在画面上方：分叉带（同一行上被空隙拉开的蓝色带）落在 ROI 的
@@ -46,11 +44,13 @@ A4            分叉带的上沿离 ROI 底部还要有 ``min_branch_pixels_belo
 A5            图像中心 = 车头正前方。相机水平视野 ``horizontal_fov_deg`` 默认 70 度，
               用来把像素偏移换算成转向角；这个值只影响转多少，不影响选哪边。
 A6            灯的判据由 **3 号（traffic_light.py）** 提供。本模块通过注入的
-              ``light_probe(frame, now) -> LightReading`` 读取，自己不认红绿灯
-              （``LIGHT_OWNER`` 常量说明这个边界）。没有注入探针时，唯一可用的判据是
-              ``fallback_color``，默认 ``"none"`` 表示"没有判据"：**这种配置下本模块
-              连接管都不接管**（``require_rule_source``），把岔路让给后面注册的
-              ``free_junction``；否则它只可能白停 ``decision_timeout`` 秒再 FAILED。
+              ``light_probe(frame, now)`` 读取，自己不认红绿灯
+              （``LIGHT_OWNER`` 常量说明这个边界）。探针可以返回**一盏**读数
+              （``LightReading``）、**左右两盏**的列表、或者空的 ``[]``；
+              没有注入探针时，唯一可用的判据是 ``fallback_color``，默认 ``"none"``
+              表示"没有判据"：**这种配置下本模块连接管都不接管**
+              （``require_rule_source``），把岔路让给后面注册的 ``free_junction``；
+              否则它只可能白停 ``decision_timeout`` 秒再 FAILED。
 A7            两条分支都是绿灯、或者灯只报了一个颜色没有报位置时，
               ``fallback_rule`` 决定走哪边；默认 ``"straightest"``（走最接近车头正前方的那边）。
 A8            转向是一段有限动作：yaw = 选中分支的偏角 × ``yaw_gain``，被
@@ -68,13 +68,21 @@ A11           "线回到画面中央"这个判据**不依赖框架传参**：协
 A12           只有"分叉带已经贴到最后一截画面"（``drove_past_fork_row_ratio``）
               才可能判"车已经开过岔路口"：正常进近时车头前方的带子是单条且居中，
               和"开过了"长得一样，不加上这一条就会把正常进近误判成失败。
-A13           灯的**位置**可以拿来选边：探针给的读数如果带画面里的像素坐标
-              （``center``），左半边 → 走左分支，右半边 → 走右分支；没有坐标时才用
-              ``fallback_rule``。见 :func:`make_light_probe`。
+A13           灯的**位置**可以拿来选边：读数带画面里的像素坐标（``center``）时，
+              左半边 → 走左分支，右半边 → 走右分支。
+              两盏灯分居两侧时用 :func:`make_two_lamp_probe`（它把画面竖着切成两半，
+              左右各问一次 3 号的检测器，见 A15/A16）。
 A14           "接了探针"不等于"有判据"：只有**这一帧真的拿到一个能用的读数**
-              （红灯或绿灯；``UNKNOWN`` / ``None`` / 探针抛异常都不算）才认为自己适用。
+              （红灯或绿灯；``UNKNOWN`` / 空列表 / 探针抛异常都不算）才认为自己适用。
               否则只要岔路一出现就会接管、白等 ``decision_timeout`` 再失败，
               把岔路从后面的模块手里抢走（``require_rule_source``）。
+A15           **本关卡的真实要求**：第一个岔路口在**两边各放一盏灯**（一边红一边绿），
+              灯立在**路旁边**（不挡在路中间）；车要往**绿灯那一侧**的路走。
+              所以判据是"绿灯在哪一边"，不是"有没有绿灯"：
+              绿灯在左 → 走左分支，绿灯在右 → 走右分支（A13 负责把位置翻成左右）。
+A16           只知道"看到绿灯"、不知道在哪边，但**知道某一边是红灯**时，
+              走另一边（例如"左边是红灯 + 某处有绿灯"→ 走右边）。
+              这是 A15 的降级判据，用在只有一盏灯被认出、另一盏被遮挡的时候。
 ============  ==========================================================
 
 修订说明（2026-09-15 实车测试报告）：本次改了三处，全部只在本文件里，
@@ -91,6 +99,9 @@ A14           "接了探针"不等于"有判据"：只有**这一帧真的拿到
    34 条 ``float division by zero``）。新实现里 ``span <= 0`` 直接判否。
 """
 
+from __future__ import annotations
+
+import collections.abc
 from dataclasses import dataclass
 from enum import Enum
 from typing import Callable, List, Optional, Sequence, Tuple
@@ -162,7 +173,9 @@ class LightReading:
 
 
 #: 灯判据的读取接口。3 号/1 号把它的函数注入进来即可，不需要本模块依赖 3 号的文件。
-LightProbe = Callable[[FramePacket, float], Optional[LightReading]]
+#: 返回值可以是**一盏**读数（``LightReading``）、**左右两盏**的列表/元组/生成器、
+#: 空列表 ``[]``、``None``，或者 :func:`make_light_probe` 认得的那几种对象（A6）。
+LightProbe = Callable[[FramePacket, float], object]
 
 #: 3 号 ``VisualDetection.color`` / ``TaskUpdate`` 里的颜色字符串 → 本模块的枚举。
 _LIGHT_COLOR_NAMES = {"green": LightColor.GREEN, "red": LightColor.RED}
@@ -217,6 +230,62 @@ def _reading_from(
     return LightReading(color=color, branch=branch, confidence=confidence)
 
 
+def _iter_probe_values(value):
+    """把探针返回值拆成"一个一个待解释的对象"（支持一次给左右两盏）。"""
+    if value is None:
+        return []
+    if isinstance(value, (str, bytes, LightReading)):
+        return [value]
+    if isinstance(value, np.ndarray):  # 不是读数的数组，按"看不懂"处理
+        return [value]
+    if isinstance(value, collections.abc.Iterable):
+        items = []
+        for item in value:
+            items.extend(_iter_probe_values(item))
+        return items
+    return [value]
+
+
+def _as_readings(
+    value,
+    frame=None,
+    infer_branch: bool = True,
+    min_confidence: float = 0.0,
+) -> List[LightReading]:
+    """把探针返回值统一成 :class:`LightReading` 列表。
+
+    支持"一盏"和"左右两盏"两种给法（A6/A15）；看不懂的、置信度不够的丢掉。
+    """
+    readings: List[LightReading] = []
+    for item in _iter_probe_values(value):
+        converted = _reading_from(item, frame, infer_branch, min_confidence)
+        if converted is not None:
+            readings.append(converted)
+    return readings
+
+
+def _resolve_light_source(source):
+    """判断别人给的"灯来源"是什么形状，返回 ``(kind, reader)``。
+
+    ``kind`` 是 ``"detect"``（``reader(image)``）、``"step"``（``reader(frame, now)``）
+    或 ``"image"`` / ``"frame"``（可调用对象，按参数个数判断）。
+    """
+    if hasattr(source, "detect") and callable(getattr(source, "detect")):
+        return "detect", getattr(source, "detect")
+    if hasattr(source, "step") and callable(getattr(source, "step")):
+        return "step", getattr(source, "step")
+    if callable(source):
+        try:
+            single_argument = len(inspect.signature(source).parameters) <= 1
+        except (TypeError, ValueError):
+            single_argument = False
+        return ("image" if single_argument else "frame"), source
+    raise TypeError(
+        "expected a callable, a detector-like (detect(image)) or a task-like "
+        "(step(frame, now)) object"
+    )
+
+
 def make_light_probe(
     source,
     infer_branch_from_position: bool = True,
@@ -248,35 +317,92 @@ def make_light_probe(
     选边（A13）：读数带 ``center``（整幅图像素坐标）且 ``infer_branch_from_position``
     为真时，灯在画面左半边 → ``LEFT``，右半边 → ``RIGHT``；否则 ``branch=None``，
     由 ``fallback_rule`` 决定。看不懂的返回值、探针抛异常，一律按"没有判据"处理。
+
+    两边各一盏灯（本关卡的真实情况，A15）请用 :func:`make_two_lamp_probe`。
     """
-    reader = None
-    if hasattr(source, "detect") and callable(getattr(source, "detect")):
-        reader = lambda frame, now: source.detect(_frame_image(frame))  # noqa: E731
-    elif hasattr(source, "step") and callable(getattr(source, "step")):
-        reader = lambda frame, now: source.step(frame, now)  # noqa: E731
-    elif callable(source):
-        try:
-            parameters = inspect.signature(source).parameters
-            single_argument = len(parameters) <= 1
-        except (TypeError, ValueError):
-            single_argument = False
-        if single_argument:
-            # 例如直接传了绑定方法 detector.detect：它收的是图像，不是 FramePacket。
-            reader = lambda frame, now: source(_frame_image(frame))  # noqa: E731
-        else:
-            reader = source
-    else:
-        raise TypeError(
-            "make_light_probe expects a callable, a detector-like or a task-like object"
-        )
+    kind, reader = _resolve_light_source(source)
 
     def probe(frame, now) -> Optional[LightReading]:
         try:
-            value = reader(frame, now)
+            if kind in ("detect", "image"):
+                value = reader(_frame_image(frame))
+            else:
+                value = reader(frame, now)
         except Exception:
             # 别人的模块出错不能让车失控；按"没有判据"处理（A14）。
             return None
-        return _reading_from(value, frame, infer_branch_from_position, min_confidence)
+        readings = _as_readings(value, frame, infer_branch_from_position, min_confidence)
+        if not readings:
+            return None
+        # 一次给了多盏时，取第一盏绿的；没有绿的取第一盏（颜色信息仍然有用）。
+        for item in readings:
+            if item.color is LightColor.GREEN:
+                return item
+        return readings[0]
+
+    return probe
+
+
+def _packet_like(frame, image: np.ndarray) -> FramePacket:
+    """用同一帧的序号/时刻造一个新的 ``FramePacket``（给裁剪过的半幅图用）。"""
+    return FramePacket(
+        image=image,
+        sequence=int(getattr(frame, "sequence", 0) or 0),
+        captured_at=float(getattr(frame, "captured_at", 0.0) or 0.0),
+    )
+
+
+def make_two_lamp_probe(
+    source,
+    split: float = 0.5,
+    min_confidence: float = 0.0,
+) -> LightProbe:
+    """左右各问一次，返回**两盏灯的读数列表**（A15：一边红一边绿）。
+
+    为什么需要它：本关卡在岔路口**两边各放一盏灯**（灯立在路边），而 3 号的
+    ``TrafficLightDetector.detect()`` 整帧只挑**一盏得分最高的**，并且
+    ``red_priority=True`` —— 两盏同时可见时它只会报红，直接用就会让车
+    "看到绿灯也不走"。这里改成把画面竖着切一刀，左右半边各问一次检测器，
+    再把读数按"来自哪一半"翻成左/右分支（A13）：
+
+    ```python
+    from green_junction import make_two_lamp_probe
+    from traffic_light import TrafficLightDetector
+
+    GreenJunctionTask(light_probe=make_two_lamp_probe(TrafficLightDetector()))
+    ```
+
+    返回的是 ``[LightReading, ...]``（可能有 0、1 或 2 盏）；
+    ``split`` 是切分位置（占画面宽度的比例，默认 0.5）。
+    某一半里看不懂 / 抛异常，只丢那一半，不影响另一半。
+    """
+    kind, reader = _resolve_light_source(source)
+    ratio = min(max(float(split), 0.05), 0.95)
+
+    def probe(frame, now) -> List[LightReading]:
+        image = _frame_image(frame)
+        if image is None or getattr(image, "ndim", 0) != 3:
+            return []
+        width = int(image.shape[1])
+        if width < 4:
+            return []
+        cut = int(round(width * ratio))
+        cut = max(1, min(width - 1, cut))
+        readings: List[LightReading] = []
+        for side, crop in ((Branch.LEFT, image[:, :cut]), (Branch.RIGHT, image[:, cut:])):
+            try:
+                if kind in ("detect", "image"):
+                    value = reader(crop)
+                else:
+                    value = reader(_packet_like(frame, crop), now)
+            except Exception:
+                continue
+            for item in _as_readings(value, None, False, min_confidence):
+                # 半幅图里算出来的左右没有意义：直接按"它来自哪一半"定边（A13/A15）。
+                readings.append(
+                    LightReading(color=item.color, branch=side, confidence=item.confidence)
+                )
+        return readings
 
     return probe
 
@@ -900,51 +1026,11 @@ def _straightest(branches: Sequence[BranchGeometry]) -> Optional[BranchGeometry]
     return min(branches, key=lambda item: abs(item.bearing_deg))
 
 
-def evaluate_branches(
+def _by_fallback_rule(
     branches: Sequence[BranchGeometry],
-    reading: Optional[LightReading],
     settings: JunctionConfig,
 ) -> Tuple[Optional[BranchGeometry], str]:
-    """按判据选出要走的分支；选不出来就返回 ``(None, 原因)``。
-
-    判据优先级：
-
-    1. 探针给了"哪一边是绿灯" → 走那一边；
-    2. 探针只知道颜色、不知道位置 → 颜色必须是绿的，再按 ``fallback_rule`` 选边；
-    3. 没有探针 → 用 ``fallback_color`` 当颜色（默认 ``"none"`` = 没有判据 → 失败）。
-    """
-    if not branches:
-        return None, "no branch geometry"
-
-    color: Optional[LightColor] = None
-    forced: Optional[BranchGeometry] = None
-    if reading is not None:
-        color = reading.color
-        if reading.branch is not None:
-            if reading.color is not LightColor.GREEN:
-                return None, f"{reading.branch.value} branch is {reading.color.value}"
-            forced = next(
-                (item for item in branches if item.side is reading.branch), None
-            )
-            if forced is None:
-                return None, "probe points at a missing branch"
-    else:
-        fallback = (settings.fallback_color or "none").strip().lower()
-        if fallback == "green":
-            color = LightColor.GREEN
-        elif fallback == "red":
-            color = LightColor.RED
-        else:
-            return None, "no light probe and fallback_color is none"
-
-    if color is LightColor.RED:
-        return None, "red light"
-    if color is not LightColor.GREEN:
-        return None, "light color unknown"
-
-    if forced is not None:
-        return forced, "probe selected branch"
-
+    """灯只给了颜色、没有给位置时怎么选边（A7）。"""
     rule = (settings.fallback_rule or "straightest").strip().lower()
     if rule == "left":
         chosen = next((item for item in branches if item.side is Branch.LEFT), None)
@@ -954,9 +1040,79 @@ def evaluate_branches(
         return (chosen, "fallback_rule=right") if chosen else (None, "no right branch")
     if rule == "none":
         return None, "light cannot tell left from right"
-
     chosen = _straightest(branches)
     return (chosen, "fallback_rule=straightest") if chosen else (None, "no branch")
+
+
+def evaluate_branches(
+    branches: Sequence[BranchGeometry],
+    reading,
+    settings: JunctionConfig,
+) -> Tuple[Optional[BranchGeometry], str]:
+    """按判据选出要走的分支；选不出来就返回 ``(None, 原因)``。
+
+    ``reading`` 可以是**一盏**读数、**左右两盏**的列表/元组/生成器、``None``。
+
+    判据优先级（本关卡的真实要求见 A15）:
+
+    1. **绿灯在哪一边就走哪边**（读数带 ``branch`` 时）；
+    2. 看到绿灯但不知道在哪边，而**知道某一边是红灯** → 走另一边（A16）；
+    3. 只知道颜色、没有位置 → 按 ``fallback_rule``（默认 ``straightest``）；
+    4. 只有红灯 → 不走，返回原因（原地等/超时失败）；
+    5. 什么都没有 → 用 ``fallback_color``（默认 ``"none"`` = 没有判据 → 失败）。
+    """
+    if not branches:
+        return None, "no branch geometry"
+
+    readings = _as_readings(reading, None, False, 0.0)
+    greens = [item for item in readings if item.color is LightColor.GREEN]
+    reds = [item for item in readings if item.color is LightColor.RED]
+
+    # 1) 绿灯的位置是明确的 → 就走那一边（A15/A13）
+    #    两边都是绿灯时没有可用的信息，交给 fallback_rule（A7）。
+    green_sides = []
+    for item in greens:
+        if item.branch is not None and item.branch not in green_sides:
+            green_sides.append(item.branch)
+    if len(green_sides) == 1:
+        chosen = next(
+            (branch for branch in branches if branch.side is green_sides[0]), None
+        )
+        if chosen is None:
+            return None, "probe points at a missing branch"
+        return chosen, "green light on the %s branch" % green_sides[0].value
+    if len(green_sides) > 1:
+        return _by_fallback_rule(branches, settings)
+
+    if not readings:
+        # 没有探针 / 探针这一帧什么都没给 → 退到 fallback_color（A6）
+        fallback = (settings.fallback_color or "none").strip().lower()
+        if fallback == "green":
+            return _by_fallback_rule(branches, settings)
+        if fallback == "red":
+            return None, "red light"
+        return None, "no light probe and fallback_color is none"
+
+    # 2) 只看到绿灯、不知道哪边，但知道某一边是红的 → 走另一边（A16）
+    if greens:
+        red_sides = [item.branch for item in reds if item.branch is not None]
+        if len(red_sides) == 1:
+            other = Branch.RIGHT if red_sides[0] is Branch.LEFT else Branch.LEFT
+            chosen = next((branch for branch in branches if branch.side is other), None)
+            if chosen is not None:
+                return chosen, "green seen; %s branch is red so take %s" % (
+                    red_sides[0].value,
+                    other.value,
+                )
+        return _by_fallback_rule(branches, settings)
+
+    # 3) 没看到绿灯
+    if reds:
+        sides = [item.branch.value for item in reds if item.branch is not None]
+        if sides:
+            return None, "red light on the %s branch" % "/".join(sides)
+        return None, "red light"
+    return None, "light color unknown"
 
 
 # --------------------------------------------------------------------------
@@ -992,6 +1148,8 @@ class GreenJunctionTask:
         self.last_detection: Optional[JunctionDetection] = None
         self.last_line: Optional[LineDetection] = None
         self.last_reading: Optional[LightReading] = None
+        #: 本帧探针给的全部读数（A15：岔路两边各一盏灯，所以这里有 0/1/2 个）。
+        self.last_readings: List[LightReading] = []
         self.chosen_branch: Optional[Branch] = None
         self.last_message = "idle"
         self.mask: Optional[np.ndarray] = None
@@ -1030,6 +1188,7 @@ class GreenJunctionTask:
         self.last_detection = None
         self.last_line = None
         self.last_reading = None
+        self.last_readings = []
         self.chosen_branch = None
         self.last_message = "idle"
         self.mask = None
@@ -1144,30 +1303,29 @@ class GreenJunctionTask:
             yaw=yaw,
         )
 
-    def _read_probe(self, frame: FramePacket, now: float) -> Optional[LightReading]:
+    def _read_probe(self, frame: FramePacket, now: float) -> List[LightReading]:
+        """这一帧探针给出的全部读数（0 / 1 / 2 盏灯都合法，见 A6/A15）。"""
         if self.light_probe is None:
-            return None
+            return []
         try:
-            reading = self.light_probe(frame, now)
+            value = self.light_probe(frame, now)
         except Exception:
             # 别人的模块出错不能让车失控；按"没有判据"处理。
-            return None
-        if reading is None:
-            return None
-        if isinstance(reading, LightReading):
-            return reading
-        return None
+            return []
+        # infer_branch=True：探针直接甩一个 VisualDetection 过来时，
+        # 这里也能按它在画面里的位置翻成左右（A13）。
+        return _as_readings(value, frame, True, 0.0)
 
-    def _rule_reading(self, frame: FramePacket, now: float) -> Optional[LightReading]:
-        """本帧的灯读法：优先探针，其次 ``fallback_color``（A6）。"""
+    def _rule_reading(self, frame: FramePacket, now: float) -> List[LightReading]:
+        """本帧的灯读法列表：优先探针，其次 ``fallback_color``（A6）。"""
         if self.light_probe is not None:
             return self._read_probe(frame, now)
         fallback = (self.settings.fallback_color or "none").strip().lower()
         if fallback == "green":
-            return LightReading(color=LightColor.GREEN)
+            return [LightReading(color=LightColor.GREEN)]
         if fallback == "red":
-            return LightReading(color=LightColor.RED)
-        return None
+            return [LightReading(color=LightColor.RED)]
+        return []
 
     def _rule_source_available(self, frame: FramePacket, now: float) -> bool:
         """这一帧到底有没有**能用的**判据（A14）。
@@ -1176,15 +1334,18 @@ class GreenJunctionTask:
         岔路出现它就会接管；如果那个岔路口没有灯，它就白等 ``decision_timeout``
         再失败，把岔路从后面注册的 ``free_junction`` 手里抢走。
         现在改成：**真的拿到读数**（红灯或绿灯）才算有来源；
-        ``None`` / ``UNKNOWN`` / 探针抛异常都不算。
+        空的读数列表 / ``UNKNOWN`` / 探针抛异常都不算。
         """
         if not self.settings.require_rule_source:
             return True
-        reading = self._rule_reading(frame, now)
-        self.last_reading = reading
-        if reading is None:
-            return False
-        return reading.color is not LightColor.UNKNOWN
+        readings = self._rule_reading(frame, now)
+        self._remember_readings(readings)
+        return any(item.color is not LightColor.UNKNOWN for item in readings)
+
+    def _remember_readings(self, readings: List[LightReading]) -> None:
+        """存下这一帧看到的灯，给日志/evidence 用（A15：可能是左右两盏）。"""
+        self.last_readings = list(readings)
+        self.last_reading = readings[0] if readings else None
 
     def _line_centered(self, frame: FramePacket, now: float) -> Tuple[bool, str]:
         """线回到画面中央了没有（见 A11）。
@@ -1352,9 +1513,9 @@ class GreenJunctionTask:
                 return self._failed("junction lost before a rule could be applied")
             return self._running(now, "waiting for junction re-detection")
 
-        reading = self._read_probe(frame, now)
-        self.last_reading = reading
-        chosen, reason = evaluate_branches(detection.branches, reading, settings)
+        readings = self._read_probe(frame, now)
+        self._remember_readings(readings)
+        chosen, reason = evaluate_branches(detection.branches, readings, settings)
         if chosen is None:
             if self._elapsed(now) > settings.decision_timeout:
                 return self._failed("no usable rule: %s" % reason)
