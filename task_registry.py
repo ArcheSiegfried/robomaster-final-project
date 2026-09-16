@@ -19,12 +19,16 @@ from route import RouteTask
 from traffic_light import TrafficLightTask
 
 # 功能模块：一个文件 = 一个名额 = 一个人。顺序即接管优先级。
+#
+# 2026-09-16 按实车反馈调整：`number_marker` 从第 2 位降到第 5 位。它在实车上的表现
+# 是"看到了标识却不接管"（不拍照、不停车），却因为排在第 2 位而挡在岔路/红绿灯前面；
+# 先让真正会动作的模块先接管。它的诊断见 marker_source.stats() 的宽度字段。
 MOTION_TASK_CLASSES = (
     TrafficLightTask,  # 红灯是停车条件，最先判断
-    NumberMarkerTask,
     GreenJunctionTask,  # 绿灯岔路
     FreeJunctionTask,  # 无拥堵岔路
     RouteTask,  # 长断线巡回
+    NumberMarkerTask,  # 数字标识（2026-09-16 从第 2 位降到第 5 位）
     ObstacleTask,  # 动作最复杂，放最后
 )
 
