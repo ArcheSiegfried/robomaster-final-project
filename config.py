@@ -11,7 +11,10 @@ class VisionConfig:
     hsv_lower: HSV = (95, 80, 60)
     hsv_upper: HSV = (135, 255, 255)
     roi_left: float = 0.06
-    roi_top: float = 0.54
+    # Real-car right-angle logs showed the upper far band seeing the outgoing
+    # arm too early and commanding about 90 deg/s before the chassis reached
+    # the corner.  Move the top edge down so steering is based on nearer tape.
+    roi_top: float = 0.62
     roi_right: float = 0.94
     roi_bottom: float = 0.96
     open_kernel: int = 3

@@ -86,7 +86,7 @@ MIN_ENDPOINT_GAP_DISTANCE = 0.08
 MAX_ENDPOINT_GAP_DISTANCE = 1.40
 MIN_LOCK_BRANCH_PIXELS = 100.0
 MIN_LOCK_BOTTOM_RATIO = 0.80
-ALIGN_ANGLE_DEG = 18.0
+ALIGN_ANGLE_DEG = 10.0
 ALIGN_YAW_GAIN = 0.38
 ALIGN_MIN_YAW = 5.0
 ALIGN_MAX_YAW = 18.0
@@ -99,7 +99,6 @@ CORNER_MAX_YAW = 38.0
 CENTER_TARGET_ERROR = 0.11
 CENTER_LATERAL_GAIN = 0.16
 CENTER_MAX_LATERAL = 0.12
-PREALIGN_CENTER_ERROR = 0.22
 DOCK_LATERAL_GAIN = 0.12
 DOCK_MAX_LATERAL = 0.09
 RIGHT_ANGLE_MIN_DEG = 50.0
@@ -780,20 +779,6 @@ class RouteTask:
             self._begin_search(now)
             return self._running(
                 now, STOP_COMMAND, "route heading lost; returning to search"
-            )
-        target_error = self._candidate_target_error(self._candidate, frame)
-        if abs(target_error) > PREALIGN_CENTER_ERROR:
-            self._stable_frames = 0
-            self._stable_last_sequence = frame.sequence
-            lateral = max(
-                -CENTER_MAX_LATERAL,
-                min(target_error * CENTER_LATERAL_GAIN, CENTER_MAX_LATERAL),
-            )
-            return self._running(
-                now,
-                MotionCommand(lateral=lateral),
-                "centering near gap endpoint before heading alignment",
-                self._candidate.detection,
             )
         aligned = abs(self._candidate.angle_deg) <= ALIGN_ANGLE_DEG
         if frame.sequence != self._stable_last_sequence:

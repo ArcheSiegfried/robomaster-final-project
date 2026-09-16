@@ -28,6 +28,10 @@ MIN_FRAGMENT_MAJOR_PIXELS = 28.0
 # a physical endpoint.
 ENDPOINT_BORDER_PIXELS = 28
 MIN_ENDPOINT_BRANCH_PIXELS = 24.0
+ENDPOINT_FIT_INNER_PIXELS = 10.0
+ENDPOINT_FIT_OUTER_PIXELS = 140.0
+MIN_ENDPOINT_FIT_POINTS = 24
+MAX_ENDPOINT_FIT_MEDIAN_ERROR = 6.0
 # Steering at the farthest visible endpoint makes a connected corner look
 # sharper and earlier than it really is.  Follow a point this far along the
 # skeleton from the robot-side end instead; the far endpoint remains available
@@ -227,31 +231,46 @@ class RouteVision:
         left, top = offset
         frame_height, frame_width = frame_shape
         features = []
-        # A local Euclidean neighbourhood is more stable than the first two
-        # skeleton pixels and remains cheap for the small route components.
-        tangent_radius = 30.0
         for y, x in endpoint_pixels:
             distances = np.hypot(points[:, 1] - x, points[:, 0] - y)
-            band = points[
-                (distances >= MIN_ENDPOINT_BRANCH_PIXELS)
-                & (distances <= tangent_radius)
-            ]
-            if len(band) == 0:
-                far_index = int(np.argmax(distances))
-                target_y, target_x = points[far_index]
-            else:
-                # Median suppresses one-pixel skeleton spurs around a bend.
-                target_y, target_x = np.median(band, axis=0)
-            dx = float(target_x - x)
-            dy = float(target_y - y)
             branch_length = float(np.max(distances))
             if branch_length < MIN_ENDPOINT_BRANCH_PIXELS:
                 continue
-            # Keep the endpoint tangent directed.  In particular, a top end
-            # whose branch runs downwards is 180 degrees, not 0 degrees.  The
-            # old max(..., epsilon) collapsed both ends to the same angle and
-            # allowed the selected physical endpoint to flip every frame.
-            angle = degrees(atan2(dx, -dy))
+
+            # The course guarantees a substantial straight segment after a
+            # physical gap.  Estimate its direction from that segment instead
+            # of the first 20-30 skeleton pixels at the endpoint: the latter
+            # was dominated by jagged tape ends and produced unstable ALIGN
+            # commands.  Huber fitting suppresses the remaining skeleton spurs.
+            fit_band = points[
+                (distances >= ENDPOINT_FIT_INNER_PIXELS)
+                & (distances <= ENDPOINT_FIT_OUTER_PIXELS)
+            ]
+            if len(fit_band) < MIN_ENDPOINT_FIT_POINTS:
+                continue
+            fit_xy = np.column_stack(
+                (fit_band[:, 1], fit_band[:, 0])
+            ).astype(np.float32)
+            vx, vy, x0, y0 = cv2.fitLine(
+                fit_xy, cv2.DIST_HUBER, 0, 0.01, 0.01
+            ).reshape(-1)
+            vx, vy = float(vx), float(vy)
+            x0, y0 = float(x0), float(y0)
+            residuals = np.abs(
+                (fit_xy[:, 0] - x0) * vy
+                - (fit_xy[:, 1] - y0) * vx
+            )
+            if float(np.median(residuals)) > MAX_ENDPOINT_FIT_MEDIAN_ERROR:
+                continue
+
+            # Direct the fitted axis from the physical endpoint into the new
+            # route.  This keeps left/right 90-degree approaches distinct and
+            # lets ALIGN rotate the chassis along the route before centering.
+            mean_dx = float(np.mean(fit_xy[:, 0]) - x)
+            mean_dy = float(np.mean(fit_xy[:, 1]) - y)
+            if vx * mean_dx + vy * mean_dy < 0.0:
+                vx, vy = -vx, -vy
+            angle = degrees(atan2(vx, -vy))
             while angle > 180.0:
                 angle -= 360.0
             while angle <= -180.0:
