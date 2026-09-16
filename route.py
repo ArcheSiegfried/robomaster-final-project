@@ -91,11 +91,13 @@ CENTER_REALIGN_ANGLE_DEG = 18.0
 ALIGN_YAW_GAIN = 0.38
 ALIGN_MIN_YAW = 5.0
 ALIGN_MAX_YAW = 18.0
-# After the raised view identifies which side contains the new route, lower
-# the camera and commit to a substantial turn before asking the near-field
-# line detector to judge alignment.  This avoids stopping after only a few
-# degrees because an old or peripheral fragment briefly enters the low view.
-ALIGN_BASE_ROTATION_DEG = 50.0
+SIDE_HINT_DEADBAND = 0.08
+SIDE_HINT_CONFIRM_FRAMES = 3
+# The raised view determines only the side.  Start checking the normal green
+# detector after a modest low-view turn instead of blindly rotating 50 deg;
+# later pulses can still accumulate the full angle needed by a right-angle gap.
+ALIGN_BASE_ROTATION_DEG = 28.0
+ALIGN_LINE_HEADING_LIMIT = 0.18
 ALIGN_ROTATE_SECONDS = 0.25
 ALIGN_INSPECT_SECONDS = 0.18
 DOCK_FORWARD_SPEED = 0.08
@@ -188,6 +190,9 @@ class RouteTask:
         self._align_direction = 0.0
         self._align_phase = ""
         self._align_phase_started_at: Optional[float] = None
+        self._side_hint = 0.0
+        self._side_hint_frames = 0
+        self._side_hint_last_sequence: Optional[int] = None
 
     @property
     def active(self) -> bool:
@@ -241,6 +246,9 @@ class RouteTask:
         self._align_direction = 0.0
         self._align_phase = ""
         self._align_phase_started_at = None
+        self._side_hint = 0.0
+        self._side_hint_frames = 0
+        self._side_hint_last_sequence = None
         self.last_detection = VisualDetection.no_result(KIND)
         self._line_detector.reset()
 
@@ -637,6 +645,9 @@ class RouteTask:
         self._candidate_angle = None
         self._candidate_last_sequence = None
         self._stable_last_sequence = None
+        self._side_hint = 0.0
+        self._side_hint_frames = 0
+        self._side_hint_last_sequence = None
         self._line_detector.reset()
 
     def _begin_search(self, now: float) -> None:
@@ -647,21 +658,66 @@ class RouteTask:
         ]
         self._search_target_index = 0
 
-    def _start_align(self, now: float) -> None:
+    def _remember_candidate_side(self, frame: FramePacket) -> None:
+        """Keep a weak left/right hint without weakening endpoint lock gates."""
+        if self._candidate is None:
+            return
+        endpoint = self._candidate.entry_endpoint
+        target_x = (
+            endpoint.point[0]
+            if endpoint is not None
+            else self._candidate.lower_point[0]
+        )
+        side_error = (target_x - frame.image.shape[1] / 2.0) / max(
+            frame.image.shape[1] / 2.0, 1.0
+        )
+        if abs(side_error) < SIDE_HINT_DEADBAND:
+            return
+        if frame.sequence == self._side_hint_last_sequence:
+            return
+        side = 1.0 if side_error > 0.0 else -1.0
+        self._side_hint_frames = (
+            self._side_hint_frames + 1 if side == self._side_hint else 1
+        )
+        self._side_hint = side
+        self._side_hint_last_sequence = frame.sequence
+
+    def _start_align(self, frame: FramePacket, now: float) -> None:
         self.state = ALIGNING
         self._phase_started_at = now
         self._stable_frames = 0
         self._stable_last_sequence = None
-        if self._candidate is not None:
-            self._align_direction = (
-                1.0 if self._candidate.angle_deg > 0.0 else -1.0
+        if self._side_hint_frames >= SIDE_HINT_CONFIRM_FRAMES:
+            self._align_direction = self._side_hint
+        elif self._candidate is not None:
+            endpoint = self._candidate.entry_endpoint
+            target_x = (
+                endpoint.point[0]
+                if endpoint is not None
+                else self._candidate.lower_point[0]
             )
+            side_error = (target_x - frame.image.shape[1] / 2.0) / max(
+                frame.image.shape[1] / 2.0, 1.0
+            )
+            # Endpoint tangent describes which way the tape extends, not
+            # which side of the chassis its gap-facing end lies on.  For a
+            # left-side endpoint, negative yaw must turn the chassis left.
+            if abs(side_error) >= 0.05:
+                self._align_direction = 1.0 if side_error > 0.0 else -1.0
+            else:
+                center = self._candidate.detection.center
+                center_x = target_x if center is None else center[0]
+                center_error = center_x - frame.image.shape[1] / 2.0
+                if abs(center_error) >= frame.image.shape[1] * 0.025:
+                    self._align_direction = 1.0 if center_error > 0.0 else -1.0
+                else:
+                    self._align_direction = self._search_direction
         elif self._align_direction == 0.0:
             self._align_direction = self._search_direction
         self._align_phase = "lower"
         self._align_phase_started_at = now
-        # Purple recovery geometry has completed its one job: choosing the
-        # turn direction. Subsequent stopping is decided by the normal green
+        # Raised-view geometry has completed its one job: choosing the turn
+        # direction. Subsequent stopping is decided by the normal green
         # line detector at the normal camera pitch.
         self.last_detection = VisualDetection.no_result(KIND)
 
@@ -670,6 +726,17 @@ class RouteTask:
         self._phase_started_at = now
         self._stable_frames = 0
         self._stable_last_sequence = None
+        # The chassis has rotated substantially since the raised-view target
+        # was first observed.  Reacquire that route in its new image position
+        # after the gimbal rises instead of continuity-locking to stale pixels.
+        self._candidate = None
+        self._candidate_frames = 0
+        self._candidate_seen_far = False
+        self._candidate_near = False
+        self._candidate_center = None
+        self._candidate_angle = None
+        self._candidate_last_at = None
+        self._candidate_last_sequence = None
 
     def _start_docking(self, now: float) -> None:
         self.state = DOCKING
@@ -804,8 +871,16 @@ class RouteTask:
     def _step_search(self, frame: FramePacket, now: float) -> TaskUpdate:
         ready, reason = self._candidate_ready(frame)
         if ready:
-            self._start_align(now)
+            self._start_align(frame, now)
             return self._running(now, STOP_COMMAND, reason, self._candidate.detection)
+        if self._side_hint_frames >= SIDE_HINT_CONFIRM_FRAMES:
+            self._start_align(frame, now)
+            return self._running(
+                now,
+                STOP_COMMAND,
+                "stable far-route side found; lowering before low-view turn",
+                self._candidate.detection if self._candidate is not None else None,
+            )
 
         if self._search_target_index >= len(self._search_targets):
             return self._finish(TaskStatus.FAILED, "bounded route search exhausted")
@@ -848,6 +923,9 @@ class RouteTask:
             else self._align_phase_started_at
         )
         elapsed = now - phase_started
+        line_aligned = line.valid and (
+            abs(line.heading) <= ALIGN_LINE_HEADING_LIMIT
+        )
 
         if self._align_phase == "lower":
             if elapsed < self._view_settle_seconds:
@@ -878,18 +956,27 @@ class RouteTask:
 
         if self._align_phase == "inspect":
             if frame.sequence != self._stable_last_sequence:
-                self._stable_frames = self._stable_frames + 1 if line.valid else 0
+                self._stable_frames = (
+                    self._stable_frames + 1 if line_aligned else 0
+                )
                 self._stable_last_sequence = frame.sequence
+                if line.valid and not line_aligned:
+                    self._align_direction = 1.0 if line.heading > 0.0 else -1.0
             if self._stable_frames >= REACQUIRE_STABLE_FRAMES:
-                return self._finish(
-                    TaskStatus.COMPLETED,
-                    "normal line detector confirmed route after low-view turn",
+                self._start_centering(now)
+                return self._running(
+                    now,
+                    STOP_COMMAND,
+                    "green route heading confirmed; raising view for fitted-axis centering",
                 )
             if elapsed < ALIGN_INSPECT_SECONDS:
+                detail = "no green route"
+                if line.valid:
+                    detail = f"green heading {line.heading:+.2f}"
                 return self._line_view_running(
                     now,
                     f"stopped low-view line check {self._stable_frames}/"
-                    f"{REACQUIRE_STABLE_FRAMES}",
+                    f"{REACQUIRE_STABLE_FRAMES}; {detail}",
                 )
             self._align_phase = "rotate"
             self._align_phase_started_at = now
@@ -898,15 +985,17 @@ class RouteTask:
             elapsed = 0.0
 
         if self._align_phase == "rotate":
-            # If the green detector sees the route during a pulse, stop first;
-            # confirmation is then done on sharp, stationary frames.
-            if line.valid:
+            # Stop early only when the green route is already parallel.  A
+            # merely visible but still oblique route must receive the planned
+            # pulse; otherwise inspect -> rotate -> inspect returns STOP on
+            # every frame and the chassis can never finish aligning.
+            if line_aligned:
                 self._align_phase = "inspect"
                 self._align_phase_started_at = now
                 self._stable_frames = 1
                 self._stable_last_sequence = frame.sequence
                 return self._line_view_running(
-                    now, "green route appeared during turn; stopped to confirm"
+                    now, "aligned green route appeared; stopped to confirm"
                 )
             if elapsed >= ALIGN_ROTATE_SECONDS:
                 self._align_phase = "inspect"
@@ -926,20 +1015,38 @@ class RouteTask:
         return self._finish(TaskStatus.FAILED, "invalid low-view alignment phase")
 
     def _step_centering(self, frame: FramePacket, now: float) -> TaskUpdate:
+        """Center the fitted new-route axis after chassis heading alignment."""
+        centering_elapsed = now - float(self._phase_started_at)
+        if centering_elapsed < self._view_settle_seconds:
+            return self._running(
+                now,
+                STOP_COMMAND,
+                "raising view for fitted-axis centering; chassis stopped",
+            )
         if self._candidate is None:
+            if centering_elapsed < (
+                self._view_settle_seconds + LOCKED_TARGET_LOSS_SECONDS
+            ):
+                return self._running(
+                    now,
+                    STOP_COMMAND,
+                    "waiting for fresh route model after raising view",
+                )
             if (
                 self._candidate_last_at is not None
                 and now - self._candidate_last_at < LOCKED_TARGET_LOSS_SECONDS
             ):
                 return self._running(
-                    now, STOP_COMMAND, "locked route model briefly missing; stopped"
+                    now,
+                    STOP_COMMAND,
+                    "locked route model briefly missing; stopped",
                 )
             return self._finish(
                 TaskStatus.FAILED,
                 "locked route model lost while centering",
             )
         if abs(self._candidate.angle_deg) > CENTER_REALIGN_ANGLE_DEG:
-            self._start_align(now)
+            self._start_align(frame, now)
             return self._running(
                 now, STOP_COMMAND, "heading drifted while centering; realigning"
             )
@@ -951,7 +1058,9 @@ class RouteTask:
         if self._stable_frames >= REACQUIRE_STABLE_FRAMES:
             self._start_docking(now)
             return self._running(
-                now, STOP_COMMAND, "fitted route axis centered; docking"
+                now,
+                STOP_COMMAND,
+                "fitted route axis centered; docking",
             )
         lateral = max(
             -CENTER_MAX_LATERAL,
@@ -979,7 +1088,7 @@ class RouteTask:
                 "locked route model lost during final approach",
             )
         if abs(self._candidate.angle_deg) > DOCK_ANGLE_DEG:
-            self._start_align(now)
+            self._start_align(frame, now)
             return self._running(
                 now,
                 STOP_COMMAND,
@@ -1177,8 +1286,19 @@ class RouteTask:
         # The raised view is used only to find the far-route shape and choose
         # a turn direction.  Once alignment starts, keep the camera low and
         # let the normal green line detector decide when the turn is complete.
-        if self.state != ALIGNING:
+        observe_candidate = self.state in (BRIDGING, SEARCHING, CENTERING, DOCKING)
+        if (
+            self.state == CENTERING
+            and now - float(self._phase_started_at) < self._view_settle_seconds
+        ):
+            observe_candidate = False
+        if observe_candidate:
             self._observe_candidate(frame, now)
+            if self.state == SEARCHING or (
+                self.state == BRIDGING
+                and now - float(self._phase_started_at) >= BRIDGE_MIN_SECONDS
+            ):
+                self._remember_candidate_side(frame)
 
         if self.state == BRIDGING:
             bridge_elapsed = now - float(self._phase_started_at)
@@ -1210,11 +1330,20 @@ class RouteTask:
 
             ready, reason = self._candidate_ready(frame)
             if ready and bridge_elapsed >= BRIDGE_MIN_SECONDS:
-                self._start_align(now)
-                return self._running(
-                    now, STOP_COMMAND, reason, self._candidate.detection
-                )
+                self._start_align(frame, now)
+                return self._running(now, STOP_COMMAND, reason, self._candidate.detection)
             if bridge_elapsed >= BRIDGE_MAX_SECONDS:
+                if self._side_hint_frames >= SIDE_HINT_CONFIRM_FRAMES:
+                    self._start_align(frame, now)
+                    return self._running(
+                        now,
+                        STOP_COMMAND,
+                        "bridge ended with stable far-route side; lowering "
+                        "before low-view turn",
+                        self._candidate.detection
+                        if self._candidate is not None
+                        else None,
+                    )
                 self._begin_search(now)
                 return self._running(
                     now, STOP_COMMAND, "blank bridge budget ended; starting fan search"
