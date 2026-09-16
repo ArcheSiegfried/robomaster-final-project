@@ -15,12 +15,12 @@ if str(ROOT) not in sys.path:
 import task_registry  # noqa: E402
 
 EXPECTED_ORDER = (
-    "traffic_light",
-    "green_junction",
-    "free_junction",
-    "route",
-    "number_marker",
-    "obstacle",
+    "traffic_light",    # 1 红绿灯
+    "green_junction",   # 2 红绿灯岔路
+    "obstacle",         # 3 障碍物绕行
+    "route",            # 4 短线巡回
+    "free_junction",    # 5 障碍物岔路
+    "number_marker",    # 6 数字识别
 )
 
 
@@ -29,9 +29,17 @@ class RegistryOrderTests(unittest.TestCase):
         names = tuple(cls.name for cls in task_registry.MOTION_TASK_CLASSES)
         self.assertEqual(names, EXPECTED_ORDER)
 
-    def test_number_marker_is_fifth(self):
+    def test_number_marker_is_last(self):
+        """数字识别排最后：它目前在实车上"看到标识却不接管"，先让会动作的模块先上。"""
         names = [cls.name for cls in task_registry.MOTION_TASK_CLASSES]
-        self.assertEqual(names.index("number_marker"), 4, "数字标识要排在第 5 位")
+        self.assertEqual(names.index("number_marker"), len(names) - 1)
+
+    def test_obstacle_outranks_the_junctions_and_the_marker(self):
+        """障碍物绕行在第 3 位：车前方的障碍必须先处理。"""
+        names = [cls.name for cls in task_registry.MOTION_TASK_CLASSES]
+        self.assertLess(names.index("obstacle"), names.index("free_junction"))
+        self.assertLess(names.index("obstacle"), names.index("route"))
+        self.assertLess(names.index("obstacle"), names.index("number_marker"))
 
     def test_every_registered_task_appears_once(self):
         names = [cls.name for cls in task_registry.MOTION_TASK_CLASSES]
