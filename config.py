@@ -131,6 +131,9 @@ class RuntimeConfig:
     console_status: bool = True
     #: 心跳行间隔（秒）。只影响"还活着"那行的频率，不影响状态变化行。
     console_heartbeat_seconds: float = 2.0
+    #: 有模块接管时的心跳间隔（秒）。比上面快得多，好让操作员在 VS Code 终端里
+    #: 实时看到"此刻是哪个模块在开车、已经跑了多久、它在发什么命令"——调优先级用。
+    console_task_heartbeat_seconds: float = 0.5
     display: bool = True
     vision: VisionConfig = field(default_factory=VisionConfig)
     control: ControlConfig = field(default_factory=ControlConfig)
