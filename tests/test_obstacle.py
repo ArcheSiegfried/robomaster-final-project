@@ -212,6 +212,38 @@ class ObstacleDetectorTests(unittest.TestCase):
         cv2.rectangle(image, (240, 170), (360, 240), (170, 170, 170), 4)
         self.assertFalse(self.detector.detect(image).valid, "浅色结构被当成障碍了")
 
+    def test_ignores_background_at_the_top_of_the_roi(self):
+        """v5 反馈的"一启动就避障"：两个误判框的 y 正好等于 ROI 顶边。
+
+        框内是"中灰 70%+亮白 22%"和"暗区 85%"——墙、白板、暗处，全是背景。
+        v5 时我故意豁免了上沿，这次不再豁免。框尺寸直接抄自报告。
+        """
+        cases = {
+            "中灰背景": (306, 108, 439, 161, (128, 128, 128)),
+            "暗区背景": (180, 108, 316, 157, (60, 60, 60)),
+        }
+        for name, (x1, y1, x2, y2, color) in cases.items():
+            image = line_frame()
+            cv2.rectangle(image, (x1, y1), (x2, y2), color, -1)
+            self.assertFalse(
+                self.detector.detect(image).valid, "ROI 顶边的%s没被淘汰" % name
+            )
+
+    def test_ignores_a_candidate_off_to_the_side(self):
+        """v5 反馈第三个误判：62x63 的块在 ROI 左下角，横向偏了 65%。
+
+        真障碍挡在线上、就在车正前方，横向不该偏出 ROI 中间一半。框抄自报告。
+        """
+        image = line_frame()
+        cv2.rectangle(image, (185, 201), (247, 264), (120, 120, 120), -1)
+        self.assertFalse(self.detector.detect(image).valid, "侧前方的块被当成障碍了")
+
+    def test_ignores_a_candidate_in_the_upper_part_of_the_roi(self):
+        """框中心落在 ROI 上半部（太远）不算挡路的障碍。"""
+        image = line_frame()
+        cv2.rectangle(image, (280, 118), (360, 172), (120, 120, 120), -1)
+        self.assertFalse(self.detector.detect(image).valid, "ROI 上半部的块被当成障碍了")
+
     def test_picks_the_bigger_nearer_candidate(self):
         """同时有两块时，选更大更靠下的那块。"""
         image = line_frame()
@@ -596,6 +628,33 @@ class ObstacleStateTests(unittest.TestCase):
         update = task.step(FramePacket(line_frame(), 2, now), now)
         self.assertEqual(update.status, TaskStatus.RUNNING)
         self.assertIsNotNone(update.motion)
+
+    def test_startup_grace_can_suppress_takeover(self):
+        """启动预热是可用的旋钮：设成 3 秒时，刚开始这段时间不许接管。
+
+        默认是 0（关），因为闸四/闸五已经把实测那三帧挡掉了；
+        要压制"一启动就避障"时把它设成 3.0 即可。
+        """
+        original = obstacle.STARTUP_GRACE_SECONDS
+        obstacle.STARTUP_GRACE_SECONDS = 3.0
+        try:
+            task = ObstacleTask()
+            seq = 0
+            now = 1.0
+            for _ in range(obstacle.CONFIRM_FRAMES + 2):
+                seq += 1
+                update = task.step(FramePacket(obstacle_frame(), seq, now), now)
+                now += 0.05
+                self.assertEqual(update.status, TaskStatus.NOT_TRIGGERED)
+            # 过了预热期就恢复正常
+            now = 1.0 + 3.0 + 0.10
+            for _ in range(obstacle.CONFIRM_FRAMES):
+                seq += 1
+                update = task.step(FramePacket(obstacle_frame(), seq, now), now)
+                now += 0.05
+            self.assertEqual(update.status, TaskStatus.RUNNING)
+        finally:
+            obstacle.STARTUP_GRACE_SECONDS = original
 
     def test_seek_moves_back_towards_the_line_and_fails_without_it(self):
         """绕完线不见了：必须主动往回挪去找，找不到就停车报失败。"""

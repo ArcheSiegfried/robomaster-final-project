@@ -191,9 +191,22 @@ MAX_OBSTACLE_WIDTH = 0.60
 # 闸一：**贴边淘汰**。11 个误判框里有 9 个压在 ROI 的下沿/左沿/右沿上。
 #   几何理由：真障碍是"挡在路中间"的东西，应该完整待在 ROI 里面；
 #   被 ROI 边界切开的，多半是背景、场地边界或者车体自身的边缘。
-#   注意：**上沿不算**——远处的东西本来就会从 ROI 上沿露出来。
 REJECT_EDGE_TOUCHING = True
 EDGE_TOUCH_MARGIN = 0.02     # 距边界 2% 以内就算"贴着"
+
+# 闸四（v6 新增）：**上沿不再豁免**。
+#   v5 时我故意不判上沿，理由是"远处的东西会从上面露出来"。结果实车反馈
+#   （2026-09-16，7 次运行里 3 次"一启动就避障"）打脸：三个误判框里有两个
+#   y=108 正好等于 ROI 顶边，框内是"中灰 70%+亮白 22%"和"暗区 85%"——全是背景
+#   （墙 / 白板 / 暗处），几乎没有一个蓝线像素。
+#   真障碍立在赛道上、在可绕的距离上，不该从 ROI 最顶上开始。
+TOP_INSET_RATIO = 0.06       # 框的上沿必须比 ROI 顶边低 6% 以上
+
+# 闸五（v6 新增）：**位置判据**。真障碍挡在线上、就在车正前方，所以
+#   纵向应该出现在走廊下半部（近处），横向不该偏出 ROI 中间一半。
+#   实测那三帧：两帧在 ROI 上半部（中心 0.15 / 0.16），第三帧横向偏了 65%。
+MIN_LOWER_RATIO = 0.40       # 框中心必须在 ROI 高度 40% 以下
+MAX_CENTER_OFFSET_RATIO = 0.50   # 横向偏移不能超过 ROI 半宽的 50%
 
 # 闸二：**抬高置信度门槛**。实测误判的 confidence 是 0.38~0.85，最低 0.38，
 #   而原来门槛 0.35 —— 形同虚设。取 0.50 的依据：
@@ -201,6 +214,12 @@ EDGE_TOUCH_MARGIN = 0.02     # 距边界 2% 以内就算"贴着"
 #   门槛放在 0.50 就能吃掉 0.39 那一帧，又不像 0.60 那样会误伤
 #   "真实但稍远、稍小"的障碍（那种的打分本来就在 0.6 附近）。
 MIN_CONFIDENCE = 0.50
+
+# 启动预热（审阅人建议 3；**默认关**，理由见文件末尾"v6"一节）：
+#   启动后这么久之内不接管。实测那 3 次误触发都在 t≈2.0s，
+#   把它设成 3.0 就能全部压掉。默认关是因为闸四/闸五已经把那三帧挡掉了，
+#   而预热期会顺带压掉"启动时真有一台车挡在前面"这种正当情况。
+STARTUP_GRACE_SECONDS = 0.00
 
 # 闸三：**框里必须真的有"东西"**：既不像地面、也不像蓝线。
 #   关掉颜色判据之后只剩"硬边 + 连成块"，对**高对比背景**没有区分力；
@@ -331,6 +350,7 @@ class ObstacleDetector:
         self.last_candidates = 0
         self.last_skin_rejected = 0
         self.last_edge_rejected = 0
+        self.last_position_rejected = 0
         self.last_flat_rejected = 0
         self.last_mask = None
 
@@ -414,6 +434,7 @@ class ObstacleDetector:
         self.last_candidates = 0
         self.last_skin_rejected = 0
         self.last_edge_rejected = 0
+        self.last_position_rejected = 0
         self.last_flat_rejected = 0
         self.last_mask = None
         if image is None:
@@ -474,6 +495,22 @@ class ObstacleDetector:
                     self.last_edge_rejected += 1
                     continue
 
+            # 闸四 + 闸五：位置判据（v6）
+            #   闸四：上沿不再豁免——实测两个误判框的 y 正好等于 ROI 顶边，
+            #         框内是墙 / 白板 / 暗处。真障碍不该从 ROI 最顶上开始。
+            #   闸五：纵向要在下半部（近处）、横向不能偏出中间一半。
+            center_x = box_left + box_width / 2.0
+            center_y = box_top + box_height / 2.0
+            if box_top < roi_height * TOP_INSET_RATIO:
+                self.last_position_rejected += 1
+                continue
+            if center_y < roi_height * MIN_LOWER_RATIO:
+                self.last_position_rejected += 1
+                continue
+            if abs(center_x - roi_width / 2.0) > (roi_width / 2.0) * MAX_CENTER_OFFSET_RATIO:
+                self.last_position_rejected += 1
+                continue
+
             inside = mask[box_top:box_top + box_height, box_left:box_left + box_width]
             density = cv2.countNonZero(inside) / box_area
             if density < MIN_DENSITY:
@@ -493,8 +530,6 @@ class ObstacleDetector:
                 continue
 
             self.last_candidates += 1
-            center_x = box_left + box_width / 2.0
-            center_y = box_top + box_height / 2.0
             area_score = _clamp(box_ratio / 0.15, 0.0, 1.0)
             lower_score = _clamp(center_y / float(roi_height), 0.0, 1.0)
             center_score = 1.0 - _clamp(
@@ -564,6 +599,8 @@ class ObstacleTask:
         self.locked = False
         # 上一次 step() 的时刻：用来发现"我们被从外面踢掉了"（见 STALE_STEP_GAP）
         self._last_step_at = None
+        # 第一次被调用的时刻：启动预热用（STARTUP_GRACE_SECONDS，默认 0 即关闭）
+        self._first_step_at = None
 
     # ---------------- 对外 ----------------
 
@@ -573,6 +610,8 @@ class ObstacleTask:
 
     def step(self, frame: FramePacket, now: float) -> TaskUpdate:
         """主循环每帧调用一次，必须立刻返回。"""
+        if self._first_step_at is None:
+            self._first_step_at = now
         if self.stage != "IDLE" and self._was_cut_short(now):
             # 协调器在外面把控制权拿走了（视频中断 / 人工按键 / 硬超时），
             # 而且不会通知模块。发现断档就作废重来，绝不从半路接着走。
@@ -608,6 +647,17 @@ class ObstacleTask:
     # ---------------- 还没接管：判断要不要管 ----------------
 
     def _step_idle(self, detection: VisualDetection, now: float) -> TaskUpdate:
+        # 启动预热：默认关（STARTUP_GRACE_SECONDS = 0）。
+        # 要压制"一启动就避障"，把它设成 3.0 左右即可。
+        if (
+            STARTUP_GRACE_SECONDS > 0.0
+            and self._first_step_at is not None
+            and (now - self._first_step_at) < STARTUP_GRACE_SECONDS
+        ):
+            return TaskUpdate(
+                TaskStatus.NOT_TRIGGERED, detection=detection, message="startup warm-up"
+            )
+
         # 画面里障碍消失够久 -> 认为换了一段路，连绕计数归零、解锁
         if detection.valid:
             self.last_seen_at = now
