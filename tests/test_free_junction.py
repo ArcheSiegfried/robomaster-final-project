@@ -33,6 +33,8 @@ from free_junction import (  # noqa: E402
     FreeJunctionTask,
     JunctionState,
     VehicleDetector,
+    _fork_rows,
+    _separated_runs,
 )
 from models import FramePacket, TaskStatus  # noqa: E402
 
@@ -116,6 +118,19 @@ def noise_split_frame():
     image = np.full((360, 640, 3), FLOOR, np.uint8)
     cv2.rectangle(image, (290, 194), (350, 350), BLUE, -1)
     cv2.rectangle(image, (305, 194), (335, 350), FLOOR, -1)
+    return image
+
+
+def edge_fork_frame():
+    """右分支一直伸到 ROI 右边缘之外。
+
+    加速版的整列扫描最初就是漏了这种"某一段贴着边缘"的行（数段数时少算一段），
+    真车画面里踩到过：同一帧旧版认得出岔路、新版认不出。这个帧专门守这个 bug。
+    """
+    image = np.full((360, 640, 3), FLOOR, np.uint8)
+    cv2.rectangle(image, (548, 300), (572, 350), BLUE, -1)
+    cv2.line(image, (560, 300), (200, 190), BLUE, 18)
+    cv2.line(image, (560, 300), (700, 170), BLUE, 18)
     return image
 
 
@@ -745,6 +760,72 @@ class OfficialSdkCriterionTests(unittest.TestCase):
         task.update_candidates([(0.80, 0.40, 0.18, 0.26)], now=1.10)   # 换成右边
         task.step(FramePacket(image, 3, 1.10), 1.10)
         self.assertEqual(task.last_blockage.reading, BLOCKAGE_RIGHT)
+
+
+class SpeedRegressionTests(unittest.TestCase):
+    """**提速不许改判**（2026-09-16 19:58 实车运行里 step() 超预算的修法）。
+
+    那一次运行成功但日志一直报 `free_junction step was slow: 0.031s (limit 0.020s)`，
+    连模块结束后的帧也在报。三处改动：整列扫描向量化预筛、用不到判据的阶段不算判据、
+    判据在缩小的检测带上算。这一组测试把"结果必须和老实算完全一样"钉住。
+    """
+
+    def test_fork_rows_equals_the_naive_full_scan(self):
+        """加速后的整列扫描 == 逐行老实扫（含"某一段贴着 ROI 边缘"的行）。"""
+        settings = FreeJunctionConfig()
+        for image in (fork_frame(), fork_frame(car_left=True), fork_frame(tips=(200, 440)),
+                      noise_split_frame(), edge_fork_frame(), line_frame()):
+            _fork, _roi, mask, _rect = FreeJunctionDetector(settings).analyze(image)
+            naive = []
+            for row in range(mask.shape[0]):
+                found = _separated_runs(
+                    mask[row], settings.merge_gap_px, settings.min_run_px,
+                    settings.min_branch_separation_px, settings.min_gap_over_tape)
+                if found is not None:
+                    naive.append((row, found[0], found[1], found[2]))
+            fast = _fork_rows(
+                mask, settings.merge_gap_px, settings.min_run_px,
+                settings.min_branch_separation_px, settings.min_gap_over_tape)
+            self.assertEqual(naive, fast, "整列扫描的加速版和逐行扫描结果不一致")
+
+    def test_a_fork_touching_the_roi_edge_is_still_found(self):
+        """贴着 ROI 右边缘的分支也要认得出（加速版最初漏掉的就是这种行）。"""
+        self.assertTrue(FreeJunctionDetector().detect(edge_fork_frame()).valid)
+
+    def test_downscaling_does_not_change_the_reading(self):
+        """检测带缩小一半只提速、不改判。"""
+        for image, expected in (
+            (fork_frame(car_left=True), BLOCKAGE_LEFT),
+            (fork_frame(car_right=True), BLOCKAGE_RIGHT),
+            (fork_frame(), BLOCKAGE_NONE),
+        ):
+            readings = []
+            for scale in (1.0, 0.5):
+                task = FreeJunctionTask(FreeJunctionConfig(vehicle_downscale=scale))
+                fork, _roi, _line, rect = task.detector.analyze(image)
+                readings.append(task._read_blockage(fork, image, rect, 1.0).reading)
+            self.assertEqual(
+                readings, [expected, expected],
+                "缩放检测带改变了读数：1.0 -> %s，0.5 -> %s（期望 %s）"
+                % (readings[0], readings[1], expected),
+            )
+
+    def test_the_blockage_is_not_recomputed_after_the_branch_is_chosen(self):
+        """APPROACH / TURN / EXIT 用的是已定分支，不该每帧再算一遍判据。"""
+        task = FreeJunctionTask()
+        seen = []
+        original = task._read_blockage
+
+        def counting(*args, **kwargs):
+            seen.append(task.state)
+            return original(*args, **kwargs)
+
+        task._read_blockage = counting
+        records = run_with_states(task, fork_frame(car_left=True))
+        self.assertIs(records[-1][1].status, TaskStatus.COMPLETED)
+        self.assertTrue(seen, "IDLE / DECIDE 阶段必须算判据")
+        for state in (JunctionState.APPROACH, JunctionState.TURN, JunctionState.EXIT):
+            self.assertNotIn(state, seen, "%s 阶段不该再算判据" % state)
 
 
 class HarnessIntegrationTests(unittest.TestCase):
