@@ -244,6 +244,31 @@ class ObstacleDetectorTests(unittest.TestCase):
         cv2.rectangle(image, (280, 118), (360, 172), (120, 120, 120), -1)
         self.assertFalse(self.detector.detect(image).valid, "ROI 上半部的块被当成障碍了")
 
+    def test_ignores_a_flat_neutral_region(self):
+        """闸六：一块"平的、中性色"的区域不是障碍。
+
+        审阅人给的 589 帧记录里，闸四/闸五之后漏网的 6 帧全是这个特征：
+        `145456` 中灰 90.6% / meanV=104；`131607`、`131842` 那几帧亮白、
+        meanV 211~226。它们既没有内部结构、也没有颜色。
+        框坐标直接抄自那份记录。
+        """
+        cases = {
+            "中灰平板": (247, 193, 322, 254, (104, 104, 104)),
+            "亮白平板": (230, 179, 300, 261, (225, 225, 225)),
+        }
+        for name, (x1, y1, x2, y2, color) in cases.items():
+            image = line_frame()
+            cv2.rectangle(image, (x1, y1), (x2, y2), color, -1)
+            self.assertFalse(self.detector.detect(image).valid, "%s 被当成障碍了" % name)
+
+    def test_a_grey_object_with_inner_structure_is_still_an_obstacle(self):
+        """闸六不能把"有结构的灰色物体"一起拒掉 —— 另一台车就是这样的。"""
+        image = line_frame()
+        cv2.rectangle(image, (280, 180), (400, 250), (120, 120, 120), -1)
+        cv2.rectangle(image, (300, 220), (330, 248), (35, 35, 35), -1)   # 内部深色结构
+        cv2.rectangle(image, (355, 220), (385, 248), (35, 35, 35), -1)
+        self.assertTrue(self.detector.detect(image).valid, "有结构的灰色物体被拒了")
+
     def test_picks_the_bigger_nearer_candidate(self):
         """同时有两块时，选更大更靠下的那块。"""
         image = line_frame()

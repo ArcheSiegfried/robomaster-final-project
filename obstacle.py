@@ -231,6 +231,22 @@ MIN_OBJECT_RATIO = 0.05      # 框内"非地面非蓝线"的像素占比要 >= 5
 FLOOR_S_MAX = 60             # 饱和度 <= 60 且
 FLOOR_V_MIN = 140            # 亮度 >= 140 -> 算"浅色地面"
 
+# 闸六（v7 新增）：**平坦的中性色区域不是障碍**。
+#   审阅人给了 29 次运行、589 张截图的逐帧记录：一共 74 帧被判成"有障碍"
+#   （那一批里没有真障碍）。闸四干掉 63 帧（贴在 ROI 上沿的背景），闸五干掉 5 帧，
+#   剩下 6 帧的共同点是：**全是平坦的中性色区域** ——
+#     145456 12.12s  中灰 90.6%  meanV=104
+#     123656 32.14s  亮白 59.4% + 中灰 40.6%  meanV=153
+#     131607 0.0/2.03/4.06s 与 131842 4.02s  亮白为主  meanV=211~226
+#   真障碍不一样：**要么有结构**（轮子、云台、接缝、明暗面 —— 轮廓里面还有硬边缘），
+#   **要么是彩色道具**（饱和度高）。一块平的灰/白区域两样都没有。
+#
+#   判据：框内部（躲开它自己那圈轮廓）还有硬边缘，**或者**框内平均饱和度够高。
+#   两者都不满足 -> 拒。
+MIN_INTERNAL_EDGE_RATIO = 0.01   # 框内部硬边缘像素占比的下限
+INTERNAL_INSET_PX = 8            # 往里收这么多像素，躲开物体自己的轮廓
+MIN_MEAN_SATURATION = 70         # 或者框内平均饱和度 >= 70（彩色道具）
+
 # 去噪用的形态学核（函数内部会自动取奇数）
 OPEN_KERNEL = 3
 CLOSE_KERNEL = 5
@@ -366,7 +382,11 @@ class ObstacleDetector:
         )
 
     def _structure_mask(self, roi, line):
-        """硬边缘 -> 连成块。不依赖障碍颜色。"""
+        """硬边缘 -> 连成块。不依赖障碍颜色。
+
+        返回 (连成块的掩膜, 加粗后的原始边缘图)。边缘图给闸六用：
+        "框里面除了自己那圈轮廓，还有没有别的东西"。
+        """
         gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
         if cv2.countNonZero(line):
             # 把蓝线像素抹成"周围地面的灰度"：线本身不再产生边缘，
@@ -379,7 +399,36 @@ class ObstacleDetector:
         gray = cv2.GaussianBlur(gray, (5, 5), 0)
         edges = cv2.Canny(gray, EDGE_LOW, EDGE_HIGH)
         edges = cv2.dilate(edges, _odd_kernel(EDGE_DILATE))
-        return cv2.morphologyEx(edges, cv2.MORPH_CLOSE, _odd_kernel(STRUCTURE_CLOSE))
+        blobs = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, _odd_kernel(STRUCTURE_CLOSE))
+        return blobs, edges
+
+    @staticmethod
+    def _looks_like_an_object(patch, edges, box):
+        """闸六：框里是"有结构的立体物"或者"彩色道具"吗。
+
+        patch 是框内的 HSV；edges 是整块 ROI 的边缘图（可能为 None）。
+        """
+        if patch.size == 0:
+            return False
+        if float(patch[:, :, 1].mean()) >= MIN_MEAN_SATURATION:
+            # 彩色道具：平均饱和度够高（地面/墙/影子都是低饱和的）
+            return True
+        if edges is None:
+            return False
+
+        box_left, box_top, box_width, box_height = box
+        inset = INTERNAL_INSET_PX
+        inner_left = box_left + inset
+        inner_top = box_top + inset
+        inner_right = box_left + box_width - inset
+        inner_bottom = box_top + box_height - inset
+        if inner_right <= inner_left or inner_bottom <= inner_top:
+            return False
+        inner = edges[inner_top:inner_bottom, inner_left:inner_right]
+        total = float(inner.shape[0] * inner.shape[1])
+        if total <= 0:
+            return False
+        return (int(cv2.countNonZero(inner)) / total) >= MIN_INTERNAL_EDGE_RATIO
 
     def _color_mask(self, hsv):
         mask = np.zeros(hsv.shape[:2], dtype=np.uint8)
@@ -455,8 +504,10 @@ class ObstacleDetector:
         line = self._line_mask(hsv)
 
         mask = np.zeros((roi_height, roi_width), dtype=np.uint8)
+        edges = None
         if USE_STRUCTURE:
-            mask |= self._structure_mask(roi, line)
+            structure, edges = self._structure_mask(roi, line)
+            mask |= structure
         if USE_COLOR_RANGES:
             mask |= self._color_mask(hsv)
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, _odd_kernel(OPEN_KERNEL))
@@ -527,6 +578,13 @@ class ObstacleDetector:
             if self._is_skin_like(patch, inside):
                 # 皮肤色的东西不当障碍（见 P0-1）
                 self.last_skin_rejected += 1
+                continue
+
+            # 闸六：一块"平的、中性色"的区域不是障碍
+            if not self._looks_like_an_object(
+                patch, edges, (box_left, box_top, box_width, box_height)
+            ):
+                self.last_flat_rejected += 1
                 continue
 
             self.last_candidates += 1
