@@ -126,6 +126,22 @@ def run_task(task, image, frames=400, dt=0.05, start=1.0):
     return updates, (records[-1][2] if records else start)
 
 
+def drive_sequence(task, phases, dt=0.05, start=1.0):
+    """按顺序喂不同的画面：phases = [(图, 帧数), ...]，记下 (状态, 更新, 时间)。"""
+    records = []
+    now = start
+    sequence = 1
+    for image, count in phases:
+        for _ in range(count):
+            update = task.step(FramePacket(image, sequence, now), now)
+            records.append((task.state, update, now))
+            sequence += 1
+            now += dt
+            if update.status in (TaskStatus.COMPLETED, TaskStatus.FAILED):
+                return records
+    return records
+
+
 def turn_yaws(records):
     """只取"转向阶段实际发出的" yaw，不含对准和直行阶段。"""
     return [
@@ -212,6 +228,27 @@ class VehicleDetectorTests(unittest.TestCase):
         cv2.rectangle(region, (60, 5), (140, 40), CAR_BODY, -1)
         blocked, _score, _box = VehicleDetector().detect(region, None)
         self.assertFalse(blocked)
+
+    def test_a_clean_tape_is_not_a_vehicle(self):
+        """**2026-09-16 真车 bug 的回归测试**：干净的蓝带不许被当成一辆车。
+
+        当时的现象：左侧分支停着一辆车（真堵），右侧空着；模块却报"右侧有车"，
+        于是选了左边那条堵的。根因是胶带边缘的抗锯齿像素不在 HSV 掩码里，
+        抹不干净 → Canny 把胶带自己的轮廓当成"硬边物体" → 外接框过了形状判据。
+        修法：找车之前把蓝带按 `tape_clear_px` 膨胀后再抹平（见 structure_mask）。
+        """
+        region = np.full((150, 280, 3), FLOOR, np.uint8)
+        cv2.line(region, (40, 149), (200, 0), BLUE, 16)          # 斜穿走廊的一条胶带
+        region = cv2.GaussianBlur(region, (5, 5), 0)             # 真实相机感：边缘是软的
+        detector = FreeJunctionDetector()
+        line = detector.blue_mask(region)
+        self.assertGreater(float(line.mean()), 0.0, "掩码应该有东西")
+        blocked, score, box = VehicleDetector().detect(region, line)
+        self.assertFalse(
+            blocked,
+            "干净的蓝带自己就被判成车了（真车上会因此选错边）：证据=%.3f 框=%s"
+            % (score, box),
+        )
 
     def test_skin_like_blob_is_rejected(self):
         """手/皮肤色占比过半的候选丢掉（同 obstacle.py 的现场教训）。"""
@@ -346,24 +383,51 @@ class OwnershipAndTimingTests(unittest.TestCase):
         self.assertIn("time budget", task.last_message)
         self.assertEqual(updates[-1].motion.forward, 0.0)
 
-    def test_lost_line_while_owning_control_stops_the_car(self):
+    def test_lost_line_while_deciding_stops_the_car(self):
+        """原地等判据的时候整条线不见了 → 停车认输（这一段必须看得见线）。"""
+        settings = FreeJunctionConfig(decide_timeout=2.0)
+        task = FreeJunctionTask(settings=settings)
+        blank = np.full((360, 640, 3), FLOOR, np.uint8)
+        records = drive_sequence(
+            task, [(fork_frame(car_left=True, car_right=True), 10), (blank, 20)]
+        )
+        updates = [update for _state, update, _now in records]
+        self.assertIs(updates[-1].status, TaskStatus.FAILED)
+        self.assertIn("line lost", task.last_message)
+        self.assertEqual(updates[-1].motion.forward, 0.0)
+
+    def test_lost_line_during_the_turn_does_not_stop_the_car(self):
+        """**2026-09-16 真车 bug 的回归测试**：转弯/出岔路时胶带跑出 ROI 不算丢线。
+
+        当时的现象：两次都在 TURN/EXIT 里走了 0.8 秒就 FAILED 停在岔路口中间。
+        车头一转，胶带本来就可能不在画面里了 —— 那不是"线没了"，不该停车。
+        """
         task = FreeJunctionTask()
         blank = np.full((360, 640, 3), FLOOR, np.uint8)
-        image = fork_frame(car_left=True)
-        now = 1.0
-        for index in range(8):
-            task.step(FramePacket(image, index + 1, now), now)
-            now += 0.05
-        self.assertTrue(task.active, "前几帧应该已经接管")
-        last = None
-        for index in range(10):
-            last = task.step(FramePacket(blank, 100 + index, now), now)
-            now += 0.05
-            if last.status is TaskStatus.FAILED:
-                break
-        self.assertIs(last.status, TaskStatus.FAILED)
-        self.assertIn("line lost", task.last_message)
-        self.assertEqual(last.motion.forward, 0.0)
+        records = drive_sequence(task, [(fork_frame(car_left=True), 30), (blank, 80)])
+        updates = [update for _state, update, _now in records]
+        self.assertIs(updates[-1].status, TaskStatus.COMPLETED)
+        self.assertNotIn("line lost", task.last_message)
+
+    def test_turn_ends_early_once_the_tape_is_back_in_the_centre(self):
+        """线已经回到车头正前方 → 转向提前收工，不在原地多拧几十度。"""
+        task = FreeJunctionTask()
+        records = drive_sequence(
+            task, [(fork_frame(car_left=True), 30), (line_frame(), 40)]
+        )
+        turn_at = exit_at = None
+        for state, _update, now in records:
+            if state is JunctionState.TURN and turn_at is None:
+                turn_at = now
+            if state is JunctionState.EXIT and exit_at is None:
+                exit_at = now
+        self.assertIsNotNone(turn_at, "应该进入转向阶段")
+        self.assertIsNotNone(exit_at, "应该进入出岔路阶段")
+        self.assertLess(
+            exit_at - turn_at,
+            task.settings.turn_seconds,
+            "线已经回中央了，还在按时间把角度转满",
+        )
 
     def test_missing_frame_while_owning_control_fails(self):
         task = FreeJunctionTask()

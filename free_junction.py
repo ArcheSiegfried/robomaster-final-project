@@ -209,6 +209,11 @@ class FreeJunctionConfig:
     edge_high: int = 110                  # Canny 高阈值
     edge_dilate: int = 3                  # 边缘加粗，后面才连得成块
     structure_close: int = 15             # 把边缘连成整块的核大小
+    #: 找车之前，把蓝带**连同边缘**一起抹平多宽（像素）。
+    #: HSV 掩码只盖得住胶带芯，边缘的抗锯齿混合像素在掩码外面；不抹掉它们，
+    #: Canny 就会把胶带自己的轮廓当成"硬边物体"，形状判据一过就变成一辆假车
+    #: （2026-09-16 真车实测：干净的那条分支被报成"有车"，于是走了堵的那条）。
+    tape_clear_px: int = 5
     min_vehicle_width_ratio: float = 0.15   # 外接框宽 / 走廊宽
     min_vehicle_height_ratio: float = 0.20  # 外接框高 / 走廊高
     min_vehicle_area_ratio: float = 0.04    # 外接框面积 / 走廊面积
@@ -233,6 +238,13 @@ class FreeJunctionConfig:
     turn_yaw: float = 45.0
     turn_seconds: float = 1.2
     turn_timeout: float = 2.5
+    #: 转向至少要转这么久，才允许"看到线回到中央就收工"。
+    #: 真车实测：只按时间转固定角度会出现"原地多转几十度"；而线一旦回到车头
+    #: 正前方，就说明已经拐进分支了，不必把剩下的角度转满。
+    turn_min_seconds: float = 0.5
+    #: "线回到画面中央"的容差（相对画面宽度）与需要的连续帧数。
+    center_tolerance_ratio: float = 0.18
+    center_confirm_frames: int = 2
     exit_forward: float = 0.15
     exit_seconds: float = 1.0
     exit_timeout: float = 2.0
@@ -503,10 +515,21 @@ class VehicleDetector:
         settings = self.settings
         gray = cv2.cvtColor(region, cv2.COLOR_BGR2GRAY)
         if line is not None and bool(np.any(line)):
-            floor = gray[~line]
+            # 关键：掩码只盖得住胶带**芯**，边缘的抗锯齿混合像素不在掩码里。
+            # 只按掩码抹平的话，胶带自己的轮廓会被 Canny 当成"硬边物体"，
+            # 外接框一过形状判据就变成一辆假车 —— 2026-09-16 真车就是这么把
+            # 干净的那条分支报成"有车"、于是走了堵的那条的。所以先**膨胀**
+            # tape_clear_px 再抹，把边缘一起抹掉。
+            tape = np.zeros(gray.shape, dtype=np.uint8)
+            tape[line] = 255
+            grow = int(settings.tape_clear_px)
+            if grow >= 3:
+                tape = cv2.dilate(tape, _odd_kernel(grow))
+            tape = tape > 0
+            floor = gray[~tape]
             if floor.size:
                 gray = gray.copy()
-                gray[line] = int(np.median(floor))
+                gray[tape] = int(np.median(floor))
         edges = cv2.Canny(gray, int(settings.edge_low), int(settings.edge_high))
         if settings.edge_dilate >= 3:
             edges = cv2.dilate(edges, _odd_kernel(settings.edge_dilate))
@@ -666,7 +689,9 @@ class FreeJunctionTask:
         self._decide_count = 0
         self._clear_count = 0
         self._lost_count = 0
+        self._center_count = 0
         self._last_blue_ratio = 0.0
+        self._last_line_mask = None
         self._state_since: Optional[float] = None
         self._run_started_at: Optional[float] = None
         self._rearm_ready_at: Optional[float] = None
@@ -709,6 +734,8 @@ class FreeJunctionTask:
         self.last_message = "reset"
         self.last_outcome = None
         self._decide_count = 0
+        self._center_count = 0
+        self._last_line_mask = None
         self._state_since = None
         self._run_started_at = None
         self._arm_rearm()
@@ -741,6 +768,7 @@ class FreeJunctionTask:
         fork, roi, line, rect = self.detector.analyze(frame.image)
         self.last_detection = fork if fork.valid else None
         self._last_blue_ratio = fork.blue_ratio
+        self._last_line_mask = line
         reading = self._read_blockage(fork, roi, line, rect)
         self.last_blockage = reading
         self.last_visual = self._visual(fork, self.chosen_branch)
@@ -916,13 +944,20 @@ class FreeJunctionTask:
                 and now - self._run_started_at > settings.max_task_seconds):
             return self._fail(now, "task time budget exceeded")
 
-        if settings.abort_on_line_lost:
+        # 只在"车头前面必须看得见线"的阶段才因为丢线认输：DECIDE / APPROACH。
+        # TURN / EXIT 时车头一转，胶带本来就可能跑出 ROI —— 那不是"线没了"，
+        # 再按丢线停车就会在岔路口中间白停一次（2026-09-16 真车：两次都是在
+        # TURN/EXIT 里走了 0.8 s 就 FAILED）。这两段仍有各自的超时兜底。
+        line_watch = self.state in (JunctionState.DECIDE, JunctionState.APPROACH)
+        if settings.abort_on_line_lost and line_watch:
             if fork.valid or self._blue_present():
                 self._lost_count = 0
             else:
                 self._lost_count += 1
                 if self._lost_count >= max(1, int(settings.lost_line_frames)):
                     return self._fail(now, "line lost while owning control")
+        else:
+            self._lost_count = 0
 
         if self.state is JunctionState.DECIDE:
             branch, reason = self._choose_branch(reading)
@@ -954,7 +989,13 @@ class FreeJunctionTask:
         if self.state is JunctionState.TURN:
             if self._elapsed(now) >= settings.turn_timeout:
                 return self._fail(now, "turn timed out")
+            # 线已经回到车头正前方 → 说明已经拐进分支了，不必把剩下的角度转满。
+            # （真车实测：只按时间转，会把车在原地多拧几十度，然后停住。）
+            self._center_count = self._center_count + 1 if self._tape_centered() else 0
+            centered = self._center_count >= max(1, int(settings.center_confirm_frames))
             if self._elapsed(now) >= settings.turn_seconds:
+                self._enter(JunctionState.EXIT, now)
+            elif centered and self._elapsed(now) >= settings.turn_min_seconds:
                 self._enter(JunctionState.EXIT, now)
             else:
                 return self._running(
@@ -981,6 +1022,7 @@ class FreeJunctionTask:
         self._state_since = now
         self._lost_count = 0
         self._clear_count = 0
+        self._center_count = 0
 
     # -- 运动请求 ---------------------------------------------------------
 
@@ -1042,6 +1084,35 @@ class FreeJunctionTask:
         if fork is not None and fork.valid:
             return True
         return self._last_blue_ratio >= self.settings.min_blue_ratio
+
+    def _tape_centered(self) -> bool:
+        """车头正前方（画面中央、ROI 底部那一条）是不是又只有一条线了？
+
+        用来判断"已经拐进分支"，好让 TURN 提前收工 —— 只在**已经转够
+        `turn_min_seconds`** 并且连续 `center_confirm_frames` 帧满足时才算。
+        要求三件事：
+
+        * ROI 底部那一小条里有蓝线；
+        * 那一条上**只有一段**线（出现两段说明车还压在岔路口上）；
+        * 这一段的中心离画面中线不超过 `center_tolerance_ratio` × 画面宽度。
+        """
+        line = self._last_line_mask
+        if line is None:
+            return False
+        height, width = line.shape[:2]
+        if height <= 0 or width <= 0:
+            return False
+        band_top = int(height * 0.75)
+        band = line[band_top:, :]
+        if band.size == 0:
+            return False
+        row = band[band.shape[0] // 2]
+        runs = _row_runs(row, self.settings.merge_gap_px, self.settings.min_run_px)
+        if len(runs) != 1:
+            return False
+        center = (runs[0][0] + runs[0][1]) / 2.0
+        tolerance = float(self.settings.center_tolerance_ratio) * width
+        return abs(center - width / 2.0) <= tolerance
 
     def _fork_gone(self, fork: ForkDetection) -> bool:
         """分叉是否已经消失（说明车已经开进分支里了）。"""
