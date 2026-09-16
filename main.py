@@ -21,6 +21,7 @@ def build_coordinator(
     settings=CONFIG,
     capture_directory=DEFAULT_CAPTURE_DIRECTORY,
     gimbal_output=None,
+    motion_task_names=None,
 ):
     """Wire every registered module into the coordinator.
 
@@ -34,7 +35,7 @@ def build_coordinator(
         settings,
         follower,
         output,
-        motion_tasks=build_motion_tasks(),
+        motion_tasks=build_motion_tasks(motion_task_names),
         observers=build_observers(capture_directory),
         gimbal_output=gimbal_output,
     )
@@ -302,6 +303,21 @@ class ConsoleStatus:
             state += "（已丢线 %.1fs）" % max(0.0, now - self._lost_since)
         bits.append("巡线 %s" % state)
         bits.append("任务 %s" % (getattr(decision, "task_name", None) or self._task_name or "无"))
+        if getattr(decision, "state", None) == TASK_ACTIVE:
+            command = decision.command
+            bits.append(
+                "实际命令 x=%.2f y=%.2f yaw=%.0f"
+                % (command.forward, command.lateral, command.yaw)
+            )
+            update = getattr(decision, "task_update", None)
+            if update is not None and update.gimbal is not None:
+                bits.append(
+                    "云台 pitch=%.0f yaw=%.0f"
+                    % (update.gimbal.pitch, update.gimbal.yaw)
+                )
+            message = str(getattr(decision, "message", "") or "")
+            if message:
+                bits.append(message)
         return "-- " + " | ".join(bits)
 
 
@@ -388,7 +404,11 @@ def _align_camera(ep_robot, output, robot_module) -> None:
         raise RuntimeError("cannot confirm chassis stop after camera alignment")
 
 
-def main() -> None:
+def main(
+    motion_task_names=None,
+    marker_subscription=True,
+    run_label="FULL",
+) -> None:
     # Keeping this import inside main makes every offline import hardware-safe.
     from robomaster import camera, robot
 
@@ -422,7 +442,10 @@ def main() -> None:
         print("[main] 云台就位，正在打开视频流 ...", flush=True)
         gimbal_output = GimbalOutput(ep_robot.gimbal, CONFIG)
         coordinator = build_coordinator(
-            follower, output, gimbal_output=gimbal_output
+            follower,
+            output,
+            gimbal_output=gimbal_output,
+            motion_task_names=motion_task_names,
         )
         resolution_name = f"STREAM_{CONFIG.camera_resolution.upper()}"
         resolution = getattr(camera, resolution_name)
@@ -432,12 +455,13 @@ def main() -> None:
         stream_started = True
         # 数字标识的观测来源：SDK 的 marker 订阅（任务模块不许自己碰 SDK）。
         # 视频流起来之后再订阅；订阅失败只是模块不触发，不影响巡线。
-        marker_source = MarkerObservationSource(
-            ep_robot.vision,
-            CONFIG.marker_color,
-            CONFIG.marker_coordinate_mode,
-        )
-        marker_source.start()
+        if marker_subscription:
+            marker_source = MarkerObservationSource(
+                ep_robot.vision,
+                CONFIG.marker_color,
+                CONFIG.marker_coordinate_mode,
+            )
+            marker_source.start()
         source = LatestFrameSource(
             ep_robot.camera,
             CONFIG.camera_strategy,
@@ -448,7 +472,8 @@ def main() -> None:
             cv2.namedWindow("Low-speed line base")
             cv2.namedWindow("Line mask")
         print(
-            "Ready and stopped. SPACE resume/pause, R reset, Q/ESC quit. "
+            f"[{run_label}] Ready and stopped. "
+            "SPACE resume/pause, R reset, Q/ESC quit. "
             f"{len(coordinator.motion_tasks)} task module(s) registered."
         )
         console = ConsoleStatus(
@@ -464,7 +489,7 @@ def main() -> None:
         console.note(
             "marker 订阅：%s"
             % ("成功" if marker_source is not None and marker_source.enabled
-               else "未订阅（数字标识不会触发）")
+               else "未订阅")
         )
         console.note("提示：丢线/接管/异常都会打在这里，不用盯 cv2 窗口。")
 

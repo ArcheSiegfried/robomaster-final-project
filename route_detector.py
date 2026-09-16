@@ -37,6 +37,7 @@ class RouteCandidate:
     detection: VisualDetection
     angle_deg: float
     near: bool
+    bottom_ratio: float
     upper_point: Tuple[int, int]
     lower_point: Tuple[int, int]
     elongation: float
@@ -231,6 +232,7 @@ class RouteVision:
                     detection=detection,
                     angle_deg=float(angle),
                     near=near,
+                    bottom_ratio=float(bottom_ratio),
                     upper_point=upper,
                     lower_point=lower,
                     elongation=float(elongation),

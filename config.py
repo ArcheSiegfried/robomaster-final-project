@@ -99,12 +99,20 @@ class RuntimeConfig:
     # 实车教训：原来写 0.012s（12ms），实测 75% 的循环拿不到新帧 → 每次任务接管
     # 都在 0.1 秒内被视频间隔误判踢掉（见 coordinator.video_gap）。
     consumer_wait_timeout: float = 0.05
-    video_gap_stop_seconds: float = 0.22
+    # AP 模式日志还出现过 0.41s 和 0.50s 后自行恢复的孤立传输间隙。
+    # 旧运动命令仍会在 0.15s 后失效（见下面 command_timeout），因此 0.60s 的
+    # 视频锁停阈值不会让底盘带着旧命令穿过长间隙。
+    # 来源：王炜嘉在 fix/route-only-realtest 的实车测试（2026-09-15）——
+    # 原来的 0.22s 会把这类能自恢复的孤立间隙当成视频丢失，任务被误杀。
+    video_gap_stop_seconds: float = 0.60
     command_timeout: float = 0.15
     resume_detection_max_age: float = 0.15
     gimbal_pitch: int = -25
     gimbal_yaw: int = 0
-    gimbal_search_pitch: int = -5
+    # -5 度在最早的实车恢复跑里画面里墙/天花板太多，路线被压到画面下沿。
+    # 取 -12：比巡线视角（-25）看得宽，又不丢掉大部分地面。
+    # 来源：王炜嘉在 fix/route-only-realtest 的实车测试（2026-09-15）。
+    gimbal_search_pitch: int = -12
     gimbal_pitch_min: int = -25
     gimbal_pitch_max: int = 10
     gimbal_yaw_min: int = -30

@@ -466,6 +466,7 @@ class TaskCoordinator:
             state=self.state,
             owner=self.output.owner,
             line=decision,
+            task_name=self.active_task_name,
             command=STOP_COMMAND,
             force_stop=decision.force_stop,
             message=message or decision.message,

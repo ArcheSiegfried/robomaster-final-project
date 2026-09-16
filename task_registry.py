@@ -35,9 +35,28 @@ OBSERVER_CLASSES = (
 )
 
 
-def build_motion_tasks():
-    """Instantiate every registered motion task, in takeover priority order."""
-    return tuple(cls() for cls in MOTION_TASK_CLASSES)
+def build_motion_tasks(enabled_names=None):
+    """Instantiate registered motion tasks, optionally selecting by task name.
+
+    ``None`` keeps the normal production behaviour and builds every registered
+    task.  A tuple such as ``("route",)`` is intended for an isolated real-car
+    test entry: the registry remains complete, while unrelated unfinished
+    detectors cannot take over during that test.
+    """
+    if enabled_names is None:
+        return tuple(cls() for cls in MOTION_TASK_CLASSES)
+
+    requested = tuple(enabled_names)
+    if not requested:
+        raise ValueError("at least one motion task must be enabled")
+    if len(requested) != len(set(requested)):
+        raise ValueError("enabled motion task names must be unique")
+
+    by_name = {cls.name: cls for cls in MOTION_TASK_CLASSES}
+    unknown = tuple(name for name in requested if name not in by_name)
+    if unknown:
+        raise ValueError("unknown motion task(s): %s" % ", ".join(unknown))
+    return tuple(by_name[name]() for name in requested)
 
 
 def build_observers(capture_directory=None):
