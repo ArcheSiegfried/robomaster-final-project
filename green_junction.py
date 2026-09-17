@@ -1475,6 +1475,7 @@ class GreenJunctionTask:
         self._drove_past_frames = 0
         self._rule_side: Optional[Branch] = None
         self._rule_side_count = 0
+        self._chosen_bearing: Optional[float] = None
         self._saw_green = False
         self._last_all_readings: List[LightReading] = []
         self._idle_since: Optional[float] = None
@@ -1517,6 +1518,7 @@ class GreenJunctionTask:
         self._drove_past_frames = 0
         self._rule_side = None
         self._rule_side_count = 0
+        self._chosen_bearing = None
         self._saw_green = False
         self._last_all_readings = []
         self._idle_since = None
@@ -1617,7 +1619,9 @@ class GreenJunctionTask:
         也就是等判据期间原地停着，绝不自己往前冲。
         """
         settings = self.settings
-        bearing = self.chosen_bearing_deg or 0.0
+        bearing = self._chosen_bearing
+        if bearing is None:
+            bearing = self.chosen_bearing_deg or 0.0
         yaw = bearing * settings.yaw_gain
         limit = abs(settings.max_turn_yaw)
         yaw = max(-limit, min(limit, yaw))
@@ -1905,6 +1909,9 @@ class GreenJunctionTask:
             )
 
         self.chosen_branch = chosen.side
+        # 把选中分支的偏角锁在这里：每帧重算的话，岔路几何一跳 yaw 就跟着跳
+        # （2026-09-16 实测：yaw 在 -14 与 +36 之间来回，车会抖着转）。
+        self._chosen_bearing = float(chosen.bearing_deg)
         self._enter(JunctionState.TURN, now)
         return self._running(
             now,
