@@ -1321,6 +1321,42 @@ class BuiltinLampTests(unittest.TestCase):
         )
         self.assertEqual(self.spotter.readings(image), [])
 
+    def test_lamp_on_the_centre_line_does_not_claim_a_side(self):
+        """A20：灯骑在画面中线上时只报颜色，不报"哪一边"。
+
+        实车日志里灯心 x=321→319 就翻边（画面宽 640，中线 320），
+        "左/右"标签在决策那一瞬间是噪声，不能拿它选道。
+        """
+        image = approach_frame()
+        cv2.circle(image, (321, 100), 22, (0, 255, 0), -1)
+        strict = LampSpotter(JunctionConfig(lamp_center_deadband=0.06))
+        readings = strict.readings(image)
+        self.assertEqual(len(readings), 1)
+        self.assertIs(readings[0].color, LightColor.GREEN)
+        self.assertIsNone(readings[0].branch, "中线附近不得认边")
+        self.assertEqual(readings[0].center[0], 321.0, "坐标还是要报，日志靠它定位")
+
+        # 离中线足够远（真的立在路边）→ 照旧认边。
+        far = approach_frame()
+        cv2.circle(far, (100, 100), 22, (0, 255, 0), -1)
+        self.assertIs(strict.readings(far)[0].branch, Branch.LEFT)
+
+        # 默认 0 = 关闭死区 → 旧行为不变（x=321 依旧是"右"）。
+        self.assertIs(self.spotter.readings(image)[0].branch, Branch.RIGHT)
+
+    def test_centre_line_lamp_with_fallback_none_refuses_to_guess(self):
+        """A20 + fallback_rule=none：分不清左右时**不乱猜**，返回理由。"""
+        image = approach_frame()
+        cv2.circle(image, (321, 100), 22, (0, 255, 0), -1)
+        readings = LampSpotter(JunctionConfig(lamp_center_deadband=0.06)).readings(image)
+        branches = JunctionDetector(JunctionConfig()).detect(junction_frame()).branches
+        self.assertEqual(len(branches), 2, "合成岔路画面应该给出两条分支")
+        chosen, reason = evaluate_branches(
+            branches, readings, JunctionConfig(fallback_rule="none")
+        )
+        self.assertIsNone(chosen)
+        self.assertIn("cannot tell left from right", reason)
+
     def test_tiny_speck_is_not_a_lamp(self):
         """半径太小（< lamp_min_radius）的亮点不是灯。"""
         image = self._frame_with(lambda img: cv2.circle(img, (100, 100), 3, (0, 0, 255), -1))

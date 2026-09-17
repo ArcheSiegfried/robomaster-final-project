@@ -422,6 +422,7 @@ def make_two_lamp_probe(
     split: float = 0.5,
     min_confidence: float = 0.0,
     overlap: float = 0.08,
+    dead_zone: float = 0.0,
 ) -> LightProbe:
     """左右各问一次，返回**两盏灯的读数列表**（A15：一边红一边绿）。
 
@@ -450,6 +451,10 @@ def make_two_lamp_probe(
       里那盏 x=300..380 的灯就是这么丢的）。留一点重叠，两边都能看到它；
     * 归边用灯的**整幅图坐标**（不是"它来自哪一半"）：整幅 x < 切分线 → 左，
       否则右；同一侧、同一颜色的重复读数按置信度去重。
+    * ``dead_zone``：切分线两侧各留一条"不认边"的死区（占画面宽度比例，默认 0）。
+      灯正好骑在切分线上时，"左/右"其实只是噪声（实车日志里灯心 ``x=321→319``
+      就能翻边），这时读数只报颜色、``branch=None``，由 ``fallback_rule`` 兜底，
+      不要拿一个随机标签去选道。
 
     ``split`` 在实车上怎么定：用配套工具 ``green_junction_selftest.py --captures``
     看"左/右灯"那一列（打的就是这个探针的结果）。
@@ -460,6 +465,7 @@ def make_two_lamp_probe(
     kind, reader = _resolve_light_source(source)
     ratio = min(max(float(split), 0.05), 0.95)
     span = min(max(float(overlap), 0.0), 0.45)
+    dead = min(max(float(dead_zone), 0.0), 0.30)
 
     def probe(frame, now) -> List[LightReading]:
         image = _frame_image(frame)
@@ -495,14 +501,26 @@ def make_two_lamp_probe(
                 centre = _value_center(raw)
                 if centre is not None:
                     full_x = start + centre[0]
+                    full_y = float(centre[1]) if len(centre) > 1 else 0.0
                 else:
                     # 读数不带位置（例如对方只返回颜色）：只能按这一半自己的中心算
                     # —— 左半 → 左，右半 → 右。要知道真实位置就得让来源报 center。
                     full_x = (start + stop) / 2.0
-                side = Branch.LEFT if full_x < cut else Branch.RIGHT
+                    full_y = 0.0
+                if dead > 0.0 and abs(full_x - cut) < dead * width:
+                    # 骑在切分线上：不认边（A20），只报"看到某色的灯"。
+                    side = None
+                else:
+                    side = Branch.LEFT if full_x < cut else Branch.RIGHT
                 for item in readings:
                     reading = LightReading(
-                        color=item.color, branch=side, confidence=item.confidence
+                        color=item.color,
+                        branch=side,
+                        confidence=item.confidence,
+                        # 位置和尺寸要往下传：日志/自测靠它判断"这盏灯在哪、
+                        # 是哪一帧的哪一块"，丢了就只剩一个左/右的字。
+                        radius=float(getattr(item, "radius", 0.0) or 0.0),
+                        center=(float(full_x), full_y),
                     )
                     key = (side, item.color)
                     previous = kept.get(key)
@@ -592,6 +610,12 @@ class JunctionConfig:
     lamp_require_colour_dominance: bool = True
     #: 内置检测器的置信度门槛（0 = 不卡）。
     lamp_min_confidence: float = 0.0
+    #: 中线死区（A20）：灯心离画面中线的距离小于"画面宽度 × 这个比例"时，
+    #: **不说它是哪一边的灯**（读数 ``branch=None``），交给 ``fallback_rule``。
+    #: 为什么要它：实车日志里灯举在车头正前方时，灯心会在中线附近来回走
+    #: （``x=321 → 319`` 就翻边），"左/右"标签在决策那一瞬间是随机的；
+    #: 只有离中线足够远（灯真的立在路边）才敢认边。0 = 关闭（旧行为）。
+    lamp_center_deadband: float = 0.0
     #: 同一个"哪边是绿灯"要连续几帧都成立才转身（单帧闪烁不算；0/1 = 关闭）。
     light_confirm_frames: int = 2
     #: 岔路口只放红灯、另一边没灯时：把红的那边当"不能走"，走另一边（A18）。
@@ -1294,13 +1318,20 @@ class LampSpotter:
                 )
                 if confidence < settings.lamp_min_confidence:
                     continue
+                centre_x = float(center[0])
+                deadband = float(getattr(settings, "lamp_center_deadband", 0.0) or 0.0) * width
+                if deadband > 0.0 and abs(centre_x - center_x) < deadband:
+                    # 骑在画面中线上：这一帧不认边（A20），只报"看到绿灯"。
+                    side = None
+                else:
+                    side = Branch.LEFT if centre_x < center_x else Branch.RIGHT
                 found.append(
                     LightReading(
                         color=light_colour,
-                        branch=Branch.LEFT if center[0] < center_x else Branch.RIGHT,
+                        branch=side,
                         confidence=confidence,
                         radius=radius,
-                        center=(float(center[0]), float(center[1])),
+                        center=(centre_x, float(center[1])),
                     )
                 )
         found.sort(key=lambda item: -item.confidence)
