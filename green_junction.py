@@ -2202,7 +2202,11 @@ class GreenJunctionTask:
         aligned, aligned_why = self._aligned_now()
         # 只有当**当前帧再也算不出带子方向**（检测丢了）时，才允许"转过目标角度"
         # 当退出条件；方向还看得见时，唯一标准就是那条带子竖直了。
-        rotated = self.chosen_tilt_deg is None and not self._turn_still_needed()
+        # A22e 死角修复（2026-09-17 23:17 实车）：yaw 被上限/target 停住之后，
+        # 状态机不能还留在 TURN 里等「带子竖直」——那会既不转也不走，
+        # 干等到 turn_timeout 判失败，车就卡在岔路口（日志：failed turn did not
+        # finish inside turn_timeout，而 yaw 早已是 0）。停住就进 SETTLE 去判。
+        rotated = not self._turn_still_needed()
         settled = (
             self._turn_elapsed(now) >= settings.turn_min_duration
             and (centered or aligned or rotated)
