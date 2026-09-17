@@ -42,5 +42,6 @@
 - 阶段 4 提交：`4c9e54c`，已推送个人仓库工作分支。
 - 阶段 5 检查：`python -m unittest tests.test_route_gimbal tests.test_gimbal_release_closure tests.test_single_green_fork tests.test_integrated_score_evidence -q`，26 项通过；项目生产 Python 文件 `py_compile` 通过；安全导入 `main` 不加载 `robomaster`；静态检索显示正常底盘调用仅在 `motion_output.py`、唯一生产视频入口在 `main.py`，逐帧任务代码没有新增 `sleep` 或无界循环；`git diff --check` 通过。没有运行完整离线套件、虚拟赛道或实车。
 - 本轮已阅读的规则书原件由用户放在项目根目录；第五阶段将其作为项目依据原样纳入分支。额外创建 `INTEGRATION_TEST_CHECKLIST.md` 作为逐级实车待验证项，不宣称任何实车结果。
-- 尚未完成：完整实车联调和团队仓库 PR 审核/合并。单任务历史实车成功不等于本分支整场验证通过。
-- 下一步准确操作：核对最终 diff/敏感信息，提交阶段 5 并推送；在团队仓库创建以 `integration` 为 base 的 PR，等待负责人审批。现场按清单逐级测试，并反馈精确 SHA 与失败日志。
+- 阶段 5 文档提交：`4306758`，已推送个人仓库及团队仓库的同名工作分支；规则书原样纳入项目。团队仓库 PR [#74](https://github.com/ArcheSiegfried/robomaster-final-project/pull/74) 已创建，base 为 `integration`，尚未合并。
+- 尚未完成：完整实车联调与 PR 审核/合并。单任务历史实车成功不等于本分支整场验证通过。
+- 下一步准确操作：现场负责人按 `INTEGRATION_TEST_CHECKLIST.md` 逐级验证本分支精确 SHA，上传成功/失败日志及正式照片，重点核对数字回转的真实角度和云台断线模式；确认后再审查、合并 PR。
