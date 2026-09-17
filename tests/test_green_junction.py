@@ -819,18 +819,29 @@ class StateMachineTests(unittest.TestCase):
         update = task.step(packet(junction_frame(), 41, now), now, fake_line(error=0.9))
         self.assertEqual(update.status, TaskStatus.RUNNING)
 
-    def test_losing_the_junction_while_turning_fails_after_the_grace(self):
-        settings = JunctionConfig(junction_gap_grace=0.2, turn_min_duration=10.0)
+    def test_losing_the_junction_mid_turn_is_bounded_not_fatal(self):
+        """A22：转向中途岔路检测丢掉是**预期**现象，不能立刻判失败。
+
+        2026-09-17 22:38 实车：车已经转过去、对准了左边分支，却因为岔路形态在
+        画面里散开而报 `lost the junction while turning`。改成：丢掉之后按
+        「转过锁死目标角度」收尾，转向仍然有界（不会一直转下去）。
+        """
+        settings = JunctionConfig(junction_gap_grace=0.2, turn_min_duration=0.0)
         task = GreenJunctionTask(
             settings=settings, light_probe=lambda frame, now: green(Branch.RIGHT)
         )
         now = self._advance_until(task, JunctionState.TURN)
-        now += 1.0
-        update = task.step(packet(blank_frame(), 31, now), now, fake_line(error=0.9))
-        self.assertEqual(update.status, TaskStatus.FAILED)
-        self.assertEqual(update.motion, STOP)
-        self.assertIn("lost the junction", update.message)
-
+        update = None
+        for index in range(20):
+            now += FRAME_DT
+            update = task.step(
+                packet(blank_frame(), 40 + index, now), now, fake_line(error=0.9)
+            )
+            if task.state is not JunctionState.TURN:
+                break
+        self.assertNotEqual(update.status, TaskStatus.FAILED)
+        self.assertIn(task.state, (JunctionState.SETTLE, JunctionState.COMPLETED))
+        self.assertLessEqual(abs(task._turn_rotated_deg), abs(task._chosen_tilt or 0.0) + 1.0)
     def test_short_junction_flicker_does_not_take_over(self):
         """只闪一帧的岔路形态不算岔路（连续确认）。"""
         task = GreenJunctionTask(

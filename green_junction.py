@@ -715,8 +715,7 @@ class BranchGeometry:
 def _branch_tilt(
     xs: Sequence[float],
     ys: Sequence[float],
-    center_x: float,
-    frame_center: float,
+    side: Branch,
 ) -> Optional[float]:
     """分支带子在画面里的**方向**（相对竖直的偏斜，度，带符号）。
 
@@ -725,8 +724,11 @@ def _branch_tilt(
     = 车头已经和这条分支平行（这才是"对准了"的真正判据，而且不需要知道相机俯仰：
     与相机光轴平行的地面直线，其消失点就在画面中线，成像是竖直的）。
 
-    符号取分支在画面左右哪一侧（中心偏角），**不用斜率的符号**：接近水平的分支
-    其斜率符号会指向反方向（实车那次左分支的斜率是负的），只有"在左/在右"可靠。
+    符号**取分支自己的左右身份**（``Branch.LEFT`` → 负），不用斜率的符号、也不用
+    "中心在哪一侧"：接近水平的分支其斜率符号会指向反方向；而用中心位置取符号时，
+    车一转过去中心就跨过中线，符号翻转 → yaw 在 ±上限之间来回翻
+    （2026-09-17 22:38 实车实测：`y=-75 → +75 → -75 → +75`）。
+    分支身份在整个转向过程中是稳定的。
     """
     if len(xs) < 2 or len(xs) != len(ys):
         return None
@@ -738,7 +740,7 @@ def _branch_tilt(
     except Exception:
         return None
     tilt = abs(math.degrees(math.atan(slope)))
-    sign = -1.0 if center_x < frame_center else 1.0
+    sign = -1.0 if side is Branch.LEFT else 1.0
     return sign * min(tilt, 89.0)
 
 
@@ -1131,7 +1133,7 @@ class JunctionDetector:
                     center=(center_x, center_y),
                     bearing_deg=float(bearing),
                     rows=rows,
-                    tilt_deg=_branch_tilt(xs, ys, center_x, frame_center),
+                    tilt_deg=_branch_tilt(xs, ys, side),
                 )
             )
         return result[0], result[1], "ok"
@@ -2158,10 +2160,11 @@ class GreenJunctionTask:
 
         if detection.valid:
             self._last_seen_at = now
-        else:
-            gap = 0.0 if self._last_seen_at is None else max(0.0, now - self._last_seen_at)
-            if gap > settings.junction_gap_grace:
-                return self._failed("lost the junction while turning")
+        # 岔路检测在转向中途丢掉是**预期**的：车一转进分支，Y 形在画面里就散了。
+        # 所以这里不判失败（A22），改由"转过锁死目标角度"这条兜底收尾 ——
+        # 检测丢了时 chosen_tilt_deg 变成 None，rotated 才允许生效，转向仍然有界。
+        # （2026-09-17 22:38 实车就是转到一半报 "lost the junction while turning"，
+        #  而那时车其实已经对准左边的分支了。）
 
         centered, line_source = self._line_centered(frame, now)
         # 三种"转到位"都算（A21/A22）：
