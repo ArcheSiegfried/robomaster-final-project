@@ -200,8 +200,8 @@ class ModeAwareGimbalTests(unittest.TestCase):
         output.send(aim)
         output.send(aim)
         self.assertEqual(robot.modes, ["free"])
-        # SDK moveto uses the power-on frame, not the current body frame.
-        self.assertEqual(robot.gimbal.last_move()["yaw"], -55)
+        # SDK moveto's yaw is chassis-relative even when the ground angle is 35.
+        self.assertEqual(robot.gimbal.last_move()["yaw"], -90)
         output.restore_line_view()
         self.assertEqual(robot.modes, ["free", "chassis"])
         self.assertEqual(robot.gimbal.last_move()["pitch"], CONFIG.gimbal_pitch)
@@ -221,9 +221,29 @@ class ModeAwareGimbalTests(unittest.TestCase):
         modes = types.SimpleNamespace(FREE="free", CHASSIS_LEAD="chassis")
         output = RouteGimbalOutput(robot, CONFIG, modes)
         output._angle_at = time.monotonic() - 1.0
-        with self.assertRaisesRegex(RuntimeError, "no fresh gimbal yaw"):
+        with self.assertRaisesRegex(RuntimeError, "no fresh chassis-relative gimbal yaw"):
             output.send(GimbalCommand(pitch=-12, yaw=-90))
         self.assertEqual(robot.modes, [])
+
+    def test_ground_yaw_is_not_added_to_side_look(self):
+        robot = _FakeRobot()
+        modes = types.SimpleNamespace(FREE="free", CHASSIS_LEAD="chassis")
+        output = RouteGimbalOutput(robot, CONFIG, modes)
+        # Recent field CSVs had ground yaw near -100 degrees. Adding it to
+        # the -84 degree task request produced the observed -184 degree move.
+        output._on_angle((0.0, 0.0, 0.0, -100.0))
+        output.send(GimbalCommand(pitch=-12, yaw=-84))
+        self.assertEqual(robot.gimbal.last_move()["yaw"], -84)
+        self.assertEqual(robot.modes, ["free"])
+
+    def test_out_of_range_side_look_is_rejected_before_mode_change(self):
+        robot = _FakeRobot()
+        modes = types.SimpleNamespace(FREE="free", CHASSIS_LEAD="chassis")
+        output = RouteGimbalOutput(robot, CONFIG, modes)
+        with self.assertRaisesRegex(RuntimeError, "chassis-relative limit"):
+            output.send(GimbalCommand(pitch=-12, yaw=-184))
+        self.assertEqual(robot.modes, [])
+        self.assertEqual(robot.gimbal.calls, [])
 
 
 if __name__ == "__main__":
