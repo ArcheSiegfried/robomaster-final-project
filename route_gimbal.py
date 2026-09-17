@@ -18,7 +18,10 @@ from models import (
     VisualDetection,
 )
 from route import (
+    HANDOFF_VIEW_TIMEOUT_SECONDS,
     KIND,
+    LINE_CENTER_MIN_LATERAL,
+    LINE_CENTER_MAX_LATERAL,
     MAX_ENDPOINT_GAP_DISTANCE,
     MIN_ENDPOINT_GAP_DISTANCE,
     MIN_LOCK_BRANCH_PIXELS,
@@ -52,6 +55,13 @@ SIDE_AIM_ENDPOINT_MIN_ROW = 0.77
 BODY_TURN_SPEED = 24.0
 BODY_TURN_TOLERANCE_DEG = 3.0
 BODY_TURN_MAX_SECONDS = 5.0
+LOW_GUIDE_MIN_FRAMES = 2
+LOW_GUIDE_MAX_ERROR = 0.55
+LOW_GUIDE_CENTER_ERROR = 0.07
+LOW_GUIDE_LATERAL_GAIN = 0.18
+LOW_GUIDE_FORWARD_SPEED = 0.055
+LOW_GUIDE_YAW_GAIN = 0.20
+LOW_GUIDE_MAX_YAW = 10.0
 
 
 class GimbalAlignedRouteTask(RouteTask):
@@ -71,6 +81,8 @@ class GimbalAlignedRouteTask(RouteTask):
         self._side_last_error: Optional[float] = None
         self._side_last_sequence: Optional[int] = None
         self._side_confirm_frames = 0
+        self._low_guide_frames = 0
+        self._low_guide_last_sequence: Optional[int] = None
 
     def reset(self) -> None:
         super().reset()
@@ -304,6 +316,54 @@ class GimbalAlignedRouteTask(RouteTask):
         return self._side_update(
             now, MotionCommand(yaw=yaw),
             f"body following fixed camera heading; remaining {remaining:+.1f}deg",
+        )
+
+    def _step_reacquiring(self, line, frame: FramePacket, now: float) -> TaskUpdate:
+        # The normal detector deliberately requires both its near and far ROI
+        # bands. Immediately after a right-angle gap, the new route can bend
+        # out of its far band despite clearly crossing the lower image. Keep
+        # task ownership and use only the near blue component to guide a
+        # small, bounded approach; never declare success from this fallback.
+        elapsed = now - float(self._phase_started_at)
+        settle = 0.0 if self._reacquire_view_already_low else self._view_settle_seconds
+        if line.valid or elapsed < settle or elapsed - settle >= HANDOFF_VIEW_TIMEOUT_SECONDS:
+            return super()._step_reacquiring(line, frame, now)
+
+        self._stable_frames = 0
+        near = self._route_vision.bottom_line(
+            frame.image, frame.image.shape[1] / 2.0
+        )
+        if not near.present or abs(near.error) > LOW_GUIDE_MAX_ERROR:
+            self._low_guide_frames = 0
+            return self._line_view_running(
+                now, "normal line invalid and no safe near-line guide; stopped"
+            )
+        if frame.sequence != self._low_guide_last_sequence:
+            self._low_guide_frames += 1
+            self._low_guide_last_sequence = frame.sequence
+        if self._low_guide_frames < LOW_GUIDE_MIN_FRAMES:
+            return self._line_view_running(
+                now, "confirming near blue line before low-view correction"
+            )
+        self.last_detection = near.detection
+        if abs(near.error) > LOW_GUIDE_CENTER_ERROR:
+            lateral = max(
+                -LINE_CENTER_MAX_LATERAL,
+                min(near.error * LOW_GUIDE_LATERAL_GAIN, LINE_CENTER_MAX_LATERAL),
+            )
+            if abs(lateral) < LINE_CENTER_MIN_LATERAL:
+                lateral = LINE_CENTER_MIN_LATERAL if lateral > 0.0 else -LINE_CENTER_MIN_LATERAL
+            motion = MotionCommand(lateral=lateral)
+        else:
+            yaw = max(
+                -LOW_GUIDE_MAX_YAW,
+                min(near.angle_deg * LOW_GUIDE_YAW_GAIN, LOW_GUIDE_MAX_YAW),
+            )
+            motion = MotionCommand(forward=LOW_GUIDE_FORWARD_SPEED, yaw=yaw)
+        return self._line_view_motion(
+            now, motion,
+            f"near-line guiding until normal detector recovers; error {near.error:+.2f}",
+            near.detection,
         )
 
     def step(self, frame: FramePacket, now: float) -> TaskUpdate:
