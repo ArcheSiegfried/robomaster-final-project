@@ -473,10 +473,24 @@ class FreeJunctionConfig:
     approach_yaw_gain: float = 22.0
     max_approach_yaw: float = 12.0
     approach_seconds_max: float = 2.0
-    turn_forward: float = 0.04        # 微前进
+    #: 转弯时的前进速度。**2026-09-17 17:24 / 17:26 / 17:27 三次实车的共同问题**：
+    #: 摄像头装在车头前上方、看得比车头远 0.5~0.8 m，所以"看到岔路"时车头其实
+    #: 还没到路口；原来的 0.04 太小 —— 车几乎是**原地**把方向转完，等车头到岔路口
+    #: 时早就转过去了（17:24 那次交回巡线后直接 LINE_LOST）。
+    #: 提到与 APPROACH 同速：边转边前进，转弯摊在更长的一段路上。
+    turn_forward: float = 0.08
     turn_yaw: float = 14.0            # 微转（最大角速度；45 -> 20 -> 14，越改越稳）
     turn_seconds: float = 2.5         # 只是**上限**：正常会提前收工
     turn_timeout: float = 3.5
+    #: 岔路还"远"时的转向打折比例与"算近"的门槛（见 `_turn_rate_scale`）。
+    #: 17:24 那次的画面量出来：接管那一刻岔路的路口还在画面 y≈250/360（画面中央偏下），
+    #: 车头离路口还有 0.5~0.8 m —— 一看到就满舵转，自然会拐早。
+    #: 所以岔路还在 ROI 上部（`fork_close_ratio` 以上）时只按 `turn_far_yaw_scale` 转，
+    #: 等它进到 ROI 下部（车真的到了）再给足。
+    #: 0.6 是"压掉过早满舵"又不至于转不够的折中：实车若还是拐早 → 往 0.45 调；
+    #: 若变成转不够（退出时岔路还在视野里）→ 往 0.75 调。一次只改一个。
+    turn_far_yaw_scale: float = 0.6
+    fork_close_ratio: float = 0.72
     #: 转向至少要转这么久，才允许"看到线回到中央就收工"。
     turn_min_seconds: float = 0.3
     #: 闭环转向的增益：yaw = 增益 × 偏角（-1..1），再限幅到 `turn_yaw`。
@@ -532,8 +546,9 @@ class ForkDetection:
     box: Tuple[int, int, int, int] = (0, 0, 0, 0)
     #: ROI 里蓝线像素占比。即使判不出岔路也会填，用来判断"是不是整条线都不见了"。
     blue_ratio: float = 0.0
-    #: 整幅图像宽度，用来把像素偏差换算成归一化误差（对准阶段要用）。
+    #: 整幅图像宽度/高度，用来把像素偏差换算成归一化误差、以及判断"岔路离得多近"。
     frame_width: int = 0
+    frame_height: int = 0
 
     @classmethod
     def empty(cls) -> "ForkDetection":
@@ -765,7 +780,9 @@ class FreeJunctionDetector:
         if factor != 1.0:
             work = cv2.resize(roi, None, fx=factor, fy=factor, interpolation=cv2.INTER_AREA)
         mask = self.blue_mask(work, factor)
-        fork = self._locate(work, mask, left, top, frame.shape[1], factor)
+        fork = self._locate(
+            work, mask, left, top, frame.shape[1], factor, frame.shape[0]
+        )
         if factor != 1.0 and mask.size:
             mask = cv2.resize(
                 mask.astype(np.uint8) * 255,
@@ -797,7 +814,8 @@ class FreeJunctionDetector:
         return fork
 
     def _locate(
-        self, roi, mask, left, top, frame_width, factor: float = 1.0
+        self, roi, mask, left, top, frame_width, factor: float = 1.0,
+        frame_height: int = 0,
     ) -> ForkDetection:
         """在已经算好的 ROI 掩码里找分叉（整列扫描 + 张开度判据）。
 
@@ -813,7 +831,10 @@ class FreeJunctionDetector:
             scale = 1.0
         roi_height, roi_width = mask.shape[:2]
         blue_ratio = float(np.count_nonzero(mask)) / float(max(1, mask.size))
-        empty = ForkDetection(valid=False, blue_ratio=blue_ratio, frame_width=frame_width)
+        empty = ForkDetection(
+            valid=False, blue_ratio=blue_ratio, frame_width=frame_width,
+            frame_height=int(frame_height),
+        )
 
         # A2：整列扫描（v1 只看 50% 处那 7 行，远一点的岔路会整个漏掉）。
         # 具体实现在 `_fork_rows()`：先向量化筛掉无关行，只对候选行精算 —— 逐行
@@ -876,6 +897,7 @@ class FreeJunctionDetector:
             ),
             blue_ratio=blue_ratio,
             frame_width=frame_width,
+            frame_height=int(frame_height),
         )
 
 
@@ -1912,8 +1934,8 @@ class FreeJunctionTask:
                 forward=_clamp(settings.approach_forward, 0.0, settings.max_forward),
                 lateral=0.0,
                 yaw=_clamp(
-                    self._approach_yaw(), -settings.max_approach_yaw,
-                    settings.max_approach_yaw,
+                    self._approach_yaw() * self._turn_rate_scale(self.last_detection),
+                    -settings.max_approach_yaw, settings.max_approach_yaw,
                 ),
             )
         if self.state is JunctionState.TURN:
@@ -1928,6 +1950,7 @@ class FreeJunctionTask:
                     -settings.turn_yaw,
                     settings.turn_yaw,
                 )
+            yaw *= self._turn_rate_scale(self.last_detection)
             return MotionCommand(
                 forward=_clamp(settings.turn_forward, 0.0, settings.max_forward),
                 lateral=0.0,
@@ -1950,6 +1973,38 @@ class FreeJunctionTask:
             lateral=0.0,
             yaw=_clamp(yaw, -settings.max_yaw, settings.max_yaw),
         )
+
+    def _turn_rate_scale(self, fork: Optional[ForkDetection]) -> float:
+        """岔路还"远"的时候把转向速率打折（1.0 = 不打折）。
+
+        摄像头装在车头前上方，比车头早 0.5~0.8 m 看到岔路（2026-09-17 17:24 的画面
+        量出来：接管那一刻岔路的路口还在画面 y≈250/360，车头离路口还有半米多）。
+        一看到就按满舵转，等车头到岔路口时方向早就转过去了 —— 车会"拐早"、
+        切进分支内侧，交回巡线后直接 `LINE_LOST`。
+        所以：岔路还在 ROI 上部（`fork_close_ratio` 以上）时只按 `turn_far_yaw_scale`
+        的比例转，等它进到 ROI 下部（车真的到了）再给足。
+
+        岔路看不见了（已经开进分支）→ 不打折，交给"顺脚下那条线"的闭环去修。
+        """
+        settings = self.settings
+        if fork is None or not fork.valid or fork.frame_height <= 0:
+            return 1.0
+        try:
+            ratio = float(settings.fork_close_ratio)
+            scale = float(settings.turn_far_yaw_scale)
+        except (TypeError, ValueError):
+            return 1.0
+        if not 0.0 <= ratio <= 1.0 or not math.isfinite(scale):
+            return 1.0
+        height = int(fork.frame_height)
+        top = int(_clamp(settings.roi_top, 0.0, 1.0) * height)
+        bottom = int(_clamp(settings.roi_bottom, 0.0, 1.0) * height)
+        if bottom - top <= 0:
+            return 1.0
+        close_row = top + ratio * (bottom - top)
+        if fork.split_row >= close_row:
+            return 1.0
+        return max(0.0, min(1.0, scale))
 
     def _approach_yaw(self) -> float:
         """对准阶段：往选中分支偏一点点，每帧只修一点（A8）。

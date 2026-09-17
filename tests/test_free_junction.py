@@ -978,6 +978,54 @@ class AimDirectionTests(unittest.TestCase):
         self.assertGreater(offset, 0.0)
         self.assertGreater(yaw * offset, 0.0, "对准和转弯的方向符号必须一致")
 
+    def test_the_turn_is_gentler_while_the_junction_is_still_far(self):
+        """岔路还在画面远处时**先别急着转**（摄像头比车头早半米看到岔路）。
+
+        2026-09-17 17:24 / 17:26 / 17:27 三次实车都是"看到就满舵转"，
+        车头还没到路口方向就转过去了；17:24 那次交回巡线后直接 LINE_LOST。
+        """
+        settings = FreeJunctionConfig()
+        task = FreeJunctionTask(settings)
+
+        def turn_yaw(split_row):
+            task.state = JunctionState.TURN
+            task.chosen_branch = Branch.RIGHT
+            task.last_detection = ForkDetection(
+                valid=True, split_row=split_row, split_x=300, left_x=200,
+                right_x=420, frame_width=640, frame_height=360,
+            )
+            task._last_line_mask = None
+            return task._motion(1.0).yaw
+
+        far = turn_yaw(200)      # 岔路还在 ROI 上半部（车头离路口还远）
+        near = turn_yaw(330)     # 岔路已经到画面下部（车到了）
+        self.assertGreater(near, 0.0)
+        self.assertGreater(far, 0.0, "远处也要转一点，不能完全不转")
+        self.assertLess(far, near, "远处应该转得更轻")
+        self.assertAlmostEqual(
+            far / near, settings.turn_far_yaw_scale, delta=0.05,
+            msg="远处的转向比例应该正好是 turn_far_yaw_scale",
+        )
+
+    def test_the_turn_keeps_moving_forward(self):
+        """转弯时要真的往前挪：0.04 太小，车几乎原地转身（实车就是这么拐早的）。"""
+        settings = FreeJunctionConfig()
+        self.assertGreaterEqual(
+            settings.turn_forward, settings.approach_forward * 0.9,
+            "转弯时的前进速度不该比对准阶段还慢一大截",
+        )
+        task = FreeJunctionTask(settings)
+        task.state = JunctionState.TURN
+        task.chosen_branch = Branch.RIGHT
+        task.last_detection = ForkDetection(
+            valid=True, split_row=330, split_x=300, left_x=200, right_x=420,
+            frame_width=640, frame_height=360,
+        )
+        task._last_line_mask = None
+        self.assertAlmostEqual(
+            task._motion(1.0).forward, settings.turn_forward, delta=1e-9
+        )
+
 
     def test_no_detection_while_the_rearm_gate_is_cooling(self):
         """封锁冷却期内**连画面都不看**：这些帧一定是"不接管"，却白花最贵的一步。
