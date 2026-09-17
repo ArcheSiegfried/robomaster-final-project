@@ -86,7 +86,7 @@ A5            **"拥堵"= 那条分支的走廊里停着一辆大疆 RoboMaster 
                 空地/暗墙彩色 **0.000**），所以车远到 1~2 米也认得出。
                 胶带连同边缘先抹掉，免得"胶带+影子"被凑成一辆车。
               * `"sdk"`：**只用官方 SDK 的识别结果**（机器人识别 / 视觉标签），
-                由集成层订阅、`main.py` 每帧推给本模块（见 `update_candidates()`）。
+                由集成层订阅、`main.py` 每帧推给本模块（见 `update_robot_observations()`）。
                 这条路上本模块**不看长宽高、不看颜色、不看形状**，只信官方读数。
               * `"sdk_or_vision"`：有新鲜官方读数就用它，没有就退回画面判据。
 
@@ -159,9 +159,15 @@ class SdkSighting:
     任务模块**不许碰 SDK**（红线 8；`tests/task_harness.py` 的
     `FORBIDDEN_PATTERNS` 里有 ``\\brobomaster\\b``，`scripts/check_module.py`
     会把它查出来）。所以官方读数由**集成层**订阅，再由 `main.py` 的
-    `feed_marker_observations()` 每帧推给实现了 `update_candidates()` 的任务
-    —— 和 6 号 `number_marker` 走的是同一条通路，
-    **不需要改 `main.py` / `task_registry.py`**。本模块只消费这个纯数据。
+    `feed_robot_observations()` 每帧推给实现了 `update_robot_observations()` 的任务
+    —— 和 5 号 `obstacle.py` 走的是同一条通路（`robot_source.py` 订阅 SDK 的
+    **机器人识别**，`name="robot"`），**不需要改 `main.py` / `task_registry.py`**。
+    本模块只消费这个纯数据。
+
+    ⚠️ 这条通路**必须**用 `update_robot_observations` 这个名字：`main.py` 的
+    `feed_marker_observations()` 推的是 SDK 的**视觉标签(marker)**，而"墙上的标签"
+    和"岔路上停着一辆车"是两回事 —— 用 `update_candidates` 接会把标签当成车
+    （2026-09-17 的接口适配就是为此改的名）。
     """
 
     center: Tuple[float, float]
@@ -363,7 +369,7 @@ class FreeJunctionConfig:
     # ---- 拥堵判据的**来源**（A5）----
     #: **默认 `"sdk_or_vision"`：官方 SDK 的机器人识别说了算**（大疆 SDK 里
     #: `vision.sub_detect_info(name="robot")` 就是"识别同款 RoboMaster 小车"的接口）。
-    #: 只要主循环把官方读数推给本模块（见 `update_candidates()`），判据就**只**看它：
+    #: 只要主循环把官方读数推给本模块（见 `update_robot_observations()`），判据就**只**看它：
     #: 不看颜色、不看长宽高、不看形状。
     #: 官方读数这一帧没到（例如集成层还没订阅 robot 识别）→ 退回画面判据兜底，
     #: 并在 message 里写明 `official robot detection unavailable`，一眼能看出用的是哪套。
@@ -1343,7 +1349,7 @@ class FreeJunctionTask:
         )
         self.state = JunctionState.IDLE
         self.last_detection: Optional[ForkDetection] = None
-        #: 官方 SDK 观测的快照（由 `main.py` 每帧推送，见 `update_candidates()`）。
+        #: 官方 SDK 观测的快照（由 `main.py` 每帧推送，见 `update_robot_observations()`）。
         #: 回调可能来自 SDK 自己的线程，所以读写都要过这把锁。
         self._sdk_lock = threading.Lock()
         self._sdk_rows: Tuple = ()
@@ -1477,12 +1483,15 @@ class FreeJunctionTask:
 
     # -- 官方 SDK 观测（集成层推来的纯数据）--------------------------------
 
-    def update_candidates(self, candidates: Iterable, now: Optional[float] = None) -> None:
-        """主循环推来的**官方 SDK 观测快照**（与 6 号 `number_marker` 同一套接口）。
+    def update_robot_observations(self, candidates: Iterable, now: Optional[float] = None) -> None:
+        """主循环推来的**官方 SDK 机器人识别**观测快照（与 5 号 `obstacle.py` 同一套接口）。
 
         接这条通路**不需要改 `main.py` / `task_registry.py`**：`main.py` 的
-        `feed_marker_observations()` 每帧对任何实现了本方法的名字调一次
-        （``push(candidates)``，喂在 `coordinator.step()` 之前）。
+        `feed_robot_observations()` 每帧对任何实现了本方法的名字调一次
+        （``push(rows, observed_at)``，喂在 `coordinator.step()` 之前）。
+
+        ⚠️ **不要**改成 `update_candidates`：那个名字属于 `number_marker` 的
+        **视觉标签(marker)** 通道（`feed_marker_observations()`），标签不是车。
 
         本模块只**存快照**：不订阅、不碰 SDK、不做判定 —— 判定在
         `_read_blockage()` 里，而且只在 `blockage_source` 选了官方读数时才用。
