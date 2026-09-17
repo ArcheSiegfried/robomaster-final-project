@@ -410,6 +410,20 @@ class FreeJunctionConfig:
     #: 检测带小于这么多像素就不缩放（小图/合成帧保持原样，行为可复现）。
     vehicle_downscale_min_pixels: int = 60000
 
+    # ---- 岔路检测的运算尺度（2026-09-17 试过后**默认关掉**）----
+    #: <1 = 先把岔路 ROI 缩小再算。**默认 1.0 = 不缩放**，原因见下。
+    #:
+    #: 试过 0.5，在 184 张实车画面上做等价性比对（`.local/probe_fork_scale.py`）：
+    #:   * **1 帧直接漏掉岔路**（原尺寸认得出、半尺寸认不出）；
+    #:   * 51 帧几何差 > 8 px，最大 **112 px**，而且偏差最大的正是"瞄准用的
+    #:     `left_x` / `right_x`"（braches 张开最大那一行在缩小图上会落到别的行）。
+    #: 岔路检测是**触发条件**，漏一帧就等于不接管、车直接开向障碍物 —— 这点提速
+    #: 不值得冒这个险，所以整条链路保留但默认不启用。要试就自己把它调小，
+    #: 并**先跑 `.local/probe_fork_scale.py`** 看那三项差异是否都可接受。
+    fork_downscale: float = 1.0
+    #: ROI 小于这么多像素就不缩放（小图/合成帧保持原样）。
+    fork_downscale_min_pixels: int = 40000
+
     # ---- 判据二（默认关）：大尺度局部对比度（不看颜色，当兜底用）----
     use_local_contrast: bool = False
     contrast_kernel_ratio: float = 0.15   # "周围地面"的大核 = 走廊高度 × 它
@@ -670,16 +684,27 @@ def _fork_rows(
 # ---------------------------------------------------------------------------
 
 
-def _blue_mask(roi: np.ndarray, settings: FreeJunctionConfig) -> np.ndarray:
-    """一块图里的蓝色带子掩码（bool）。岔路检测和找车都用这一套 HSV。"""
+def _blue_mask(
+    roi: np.ndarray, settings: FreeJunctionConfig, scale: float = 1.0
+) -> np.ndarray:
+    """一块图里的蓝色带子掩码（bool）。岔路检测和找车都用这一套 HSV。
+
+    `scale` < 1 表示这张图是缩放过的：形态学核要**同比缩放**，核的相对大小才不变
+    —— 否则在缩小图上用原尺寸的核，等于把闭运算核放大了一倍，会把岔路的两条分支
+    重新粘成一条（config 里 `close_kernel` 的注释专门警告过这件事）。
+    """
     hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
     mask = cv2.inRange(
         hsv,
         np.array(settings.hsv_lower, dtype=np.uint8),
         np.array(settings.hsv_upper, dtype=np.uint8),
     )
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, _odd_kernel(settings.open_kernel))
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, _odd_kernel(settings.close_kernel))
+    mask = cv2.morphologyEx(
+        mask, cv2.MORPH_OPEN, _odd_kernel(_scaled_px(settings.open_kernel, scale))
+    )
+    mask = cv2.morphologyEx(
+        mask, cv2.MORPH_CLOSE, _odd_kernel(_scaled_px(settings.close_kernel, scale))
+    )
     return mask > 0
 
 
@@ -692,9 +717,9 @@ class FreeJunctionDetector:
     def __init__(self, settings: Optional[FreeJunctionConfig] = None) -> None:
         self.settings = settings if settings is not None else FreeJunctionConfig()
 
-    def blue_mask(self, roi: np.ndarray) -> np.ndarray:
+    def blue_mask(self, roi: np.ndarray, scale: float = 1.0) -> np.ndarray:
         """ROI 里的蓝色带子掩码（bool）。"""
-        return _blue_mask(roi, self.settings)
+        return _blue_mask(roi, self.settings, scale)
 
     def roi_rect(self, frame: np.ndarray) -> Optional[Tuple[int, int, int, int]]:
         """把比例 ROI 换算成像素框 (left, top, right, bottom)。"""
@@ -725,8 +750,38 @@ class FreeJunctionDetector:
             return empty
         left, top, right, bottom = rect
         roi = frame[top:bottom, left:right]
-        mask = self.blue_mask(roi)
-        fork = self._locate(roi, mask, left, top, frame.shape[1])
+        # **岔路检测也在缩小的 ROI 上算**（`fork_downscale`）：分叉几何全是相对量，
+        # 缩放不改变判据，但把这一步的耗时按面积降下来。掩码最后放回 ROI 原尺寸，
+        # 这样 `analyze()` 的返回值和以前一样（外面拿它算"脚下那条线偏多少"，与尺度无关）。
+        factor = self._fork_scale(roi)
+        work = roi
+        if factor != 1.0:
+            work = cv2.resize(roi, None, fx=factor, fy=factor, interpolation=cv2.INTER_AREA)
+        mask = self.blue_mask(work, factor)
+        fork = self._locate(work, mask, left, top, frame.shape[1], factor)
+        if factor != 1.0 and mask.size:
+            mask = cv2.resize(
+                mask.astype(np.uint8) * 255,
+                (int(roi.shape[1]), int(roi.shape[0])),
+                interpolation=cv2.INTER_NEAREST,
+            ) > 0
+        return fork, roi, mask, rect
+
+    def _fork_scale(self, roi: np.ndarray) -> float:
+        """岔路检测要在多小的 ROI 上算（1.0 = 原尺寸，见 `fork_downscale`）。"""
+        settings = self.settings
+        try:
+            scale = float(getattr(settings, "fork_downscale", 1.0))
+        except (TypeError, ValueError):
+            return 1.0
+        if not math.isfinite(scale) or not 0.0 < scale < 1.0:
+            return 1.0
+        if roi is None or getattr(roi, "size", 0) == 0:
+            return 1.0
+        minimum = int(getattr(settings, "fork_downscale_min_pixels", 0) or 0)
+        if int(roi.shape[0]) * int(roi.shape[1]) < max(0, minimum):
+            return 1.0
+        return scale
         return fork, roi, mask, rect
 
     def detect(self, image: Optional[np.ndarray]) -> ForkDetection:
@@ -734,9 +789,21 @@ class FreeJunctionDetector:
         fork, _roi, _mask, _rect = self.analyze(image)
         return fork
 
-    def _locate(self, roi, mask, left, top, frame_width) -> ForkDetection:
-        """在已经算好的 ROI 掩码里找分叉（整列扫描 + 张开度判据）。"""
+    def _locate(
+        self, roi, mask, left, top, frame_width, factor: float = 1.0
+    ) -> ForkDetection:
+        """在已经算好的 ROI 掩码里找分叉（整列扫描 + 张开度判据）。
+
+        `factor` < 1 表示这张掩码是缩放过的：**像素阈值同比缩放**（判据全是相对量），
+        结果坐标再换算回整帧像素，所以对外看到的 `ForkDetection` 与不缩放时同义。
+        """
         settings = self.settings
+        try:
+            scale = float(factor)
+        except (TypeError, ValueError):
+            scale = 1.0
+        if not math.isfinite(scale) or scale <= 0.0:
+            scale = 1.0
         roi_height, roi_width = mask.shape[:2]
         blue_ratio = float(np.count_nonzero(mask)) / float(max(1, mask.size))
         empty = ForkDetection(valid=False, blue_ratio=blue_ratio, frame_width=frame_width)
@@ -744,9 +811,11 @@ class FreeJunctionDetector:
         # A2：整列扫描（v1 只看 50% 处那 7 行，远一点的岔路会整个漏掉）。
         # 具体实现在 `_fork_rows()`：先向量化筛掉无关行，只对候选行精算 —— 逐行
         # 调用 numpy 是实车 step() 超预算的主因（2026-09-16 19:58 那次运行）。
+        min_separation = float(settings.min_branch_separation_px) * scale
         rows = _fork_rows(
-            mask, settings.merge_gap_px, settings.min_run_px,
-            settings.min_branch_separation_px, settings.min_gap_over_tape,
+            mask, _scaled_px(settings.merge_gap_px, scale),
+            _scaled_px(settings.min_run_px, scale),
+            min_separation, settings.min_gap_over_tape,
         )
 
         if len(rows) < max(1, int(settings.min_fork_rows)):
@@ -766,23 +835,30 @@ class FreeJunctionDetector:
         # 当瞄准点等于"几乎直行" —— 2026-09-17 实车就是这么翻的：选了右支，但右支
         # 在分叉行的中心只比画面中心偏 18 px，yaw 只有 +2.5，车最后开进了左边那条
         # "有车"的分支。`split_x`（分左右走廊用）仍然是分叉行的中点。
-        split_x = int(round((first[0] + first[1] + last[0] + last[1]) / 4.0)) + left
-        left_x = int(round((top_first[0] + top_first[1]) / 2.0)) + left
-        right_x = int(round((top_last[0] + top_last[1]) / 2.0)) + left
-        confidence = min(
-            1.0, separation / max(1.0, float(settings.min_branch_separation_px) * 2.0)
-        )
+        # （下面 `to_frame` 把缩放图的坐标换算回整帧像素。）
+        def to_frame(value: float) -> int:
+            return int(round(float(value) / scale))
+
+        split_x = to_frame((first[0] + first[1] + last[0] + last[1]) / 4.0) + left
+        left_x = to_frame((top_first[0] + top_first[1]) / 2.0) + left
+        right_x = to_frame((top_last[0] + top_last[1]) / 2.0) + left
+        confidence = min(1.0, separation / max(1.0, min_separation * 2.0))
         return ForkDetection(
             valid=True,
-            split_row=split_row + top,
+            split_row=to_frame(split_row) + top,
             split_x=split_x,
             left_x=left_x,
             right_x=right_x,
-            gap_px=int(max(0, last[0] - first[1])),
-            separation_px=int(separation),
+            gap_px=int(max(0, last[0] - first[1]) / scale),
+            separation_px=int(round(separation / scale)),
             divergence=round(float(divergence), 3),
             confidence=confidence,
-            box=(max(0, left_x - 20), top, min(frame_width, right_x + 20), top + roi_height),
+            box=(
+                max(0, left_x - 20),
+                top,
+                min(frame_width, right_x + 20),
+                top + to_frame(roi_height),
+            ),
             blue_ratio=blue_ratio,
             frame_width=frame_width,
         )
@@ -1295,6 +1371,13 @@ class FreeJunctionTask:
         self._last_now = moment
         if frame is None or getattr(frame, "image", None) is None:
             return self._handle_missing_image(moment)
+        # 封锁期内（刚走完一个岔路 / 刚被人工或协调器踢出来）这一帧必定是
+        # "不接管"，而看一次画面（岔路检测）是整帧里最贵的一步 —— 那就别看。
+        # 实车日志里 `free_junction step was slow` 有相当一部分就出在这些帧上
+        # （2026-09-16 19:58 的 14.7s/15.8s、2026-09-17 11:43 的 18.9s）。
+        if self.state is JunctionState.IDLE and self._rearm_cooling(moment):
+            self._confirm_count = 0
+            return self._not_triggered("rearm gate")
 
         fork, roi, line, rect = self.detector.analyze(frame.image)
         self.last_detection = fork if fork.valid else None
@@ -1934,6 +2017,14 @@ class FreeJunctionTask:
             return False
         self._clear_count += 1
         return self._clear_count >= 2
+
+    def _rearm_cooling(self, now: float) -> bool:
+        """封锁闸门的**冷却期**内吗（这段时间看不到岔路也不许再接管）。
+
+        冷却期内 `step()` 直接返回，连画面都不看：反正结果一定是"不接管"，
+        而岔路检测是整帧最贵的一步。冷却结束后才开始要求"连续若干帧看不见岔路"。
+        """
+        return self._rearm_ready_at is not None and float(now) < self._rearm_ready_at
 
     def _arm_rearm(self) -> None:
         """拉起封锁闸门（A9 / A10）：冷却时间 + 等岔路从画面里消失。"""

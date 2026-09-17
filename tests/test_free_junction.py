@@ -887,6 +887,34 @@ class AimDirectionTests(unittest.TestCase):
         self.assertGreater(yaw * offset, 0.0, "对准和转弯的方向符号必须一致")
 
 
+    def test_no_detection_while_the_rearm_gate_is_cooling(self):
+        """封锁冷却期内**连画面都不看**：这些帧一定是"不接管"，却白花最贵的一步。
+
+        实车日志里 `free_junction step was slow` 有相当一部分就落在"刚走完岔路、
+        还在冷却"的那些帧上（2026-09-16 的 14.7/15.8s、2026-09-17 的 18.9s）。
+        """
+        task = FreeJunctionTask()
+        calls = []
+        original = task.detector.analyze
+
+        def counting(image):
+            calls.append(1)
+            return original(image)
+
+        task.detector.analyze = counting
+        task.reset()                      # 拉起封锁闸门（冷却 rearm_cooldown 秒）
+        now = 1.0
+        for index in range(10):
+            update = task.step(FramePacket(fork_frame(car_left=True), index + 1, now), now)
+            self.assertIs(update.status, TaskStatus.NOT_TRIGGERED)
+            now += 0.05
+        self.assertEqual(calls, [], "冷却期内不该跑岔路检测")
+
+        # 冷却结束后必须重新看画面，不能一直瞎着
+        task.step(FramePacket(fork_frame(car_left=True), 100, 3.0), 3.0)
+        self.assertTrue(calls, "冷却结束后必须重新检测岔路")
+
+
 class HarnessIntegrationTests(unittest.TestCase):
     """把模块接进真实的 LineFollower + TaskCoordinator + MotionOutput 跑一遍。"""
 
