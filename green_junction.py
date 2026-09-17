@@ -197,6 +197,7 @@ class LightReading:
     color: LightColor = LightColor.UNKNOWN
     branch: Optional[Branch] = None
     confidence: float = 0.0
+    box: Optional[Tuple[int, int, int, int]] = None
 
 
 #: 灯判据的读取接口。3 号/1 号把它的函数注入进来即可，不需要本模块依赖 3 号的文件。
@@ -1268,11 +1269,13 @@ class LampSpotter:
                 )
                 if confidence < settings.lamp_min_confidence:
                     continue
+                box_x, box_y, box_w, box_h = cv2.boundingRect(contour)
                 found.append(
                     LightReading(
                         color=light_colour,
                         branch=Branch.LEFT if center[0] < center_x else Branch.RIGHT,
                         confidence=confidence,
+                        box=(box_x, box_y, box_x + box_w, box_y + box_h),
                     )
                 )
         found.sort(key=lambda item: -item.confidence)

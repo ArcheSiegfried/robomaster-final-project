@@ -121,10 +121,10 @@ class TrafficLightConfig:
     red_priority: bool = True
 
     # Scoring-image config: the final score counts saved images, e.g.
-    # "Team 03 detects a red light and stops the robot". One screenshot is
+    # "Team 10 detects a red light and stops the robot". One screenshot is
     # requested when the red light is confirmed; it never gates the state
     # machine (a failed write must not turn a red light into a green).
-    team_number: str = "03"
+    team_number: str = "10"
     max_evidence_attempts: int = 2
 
     # Confirmation policy. Asymmetric by design: stop fast (2 frames, ~0.1 s),

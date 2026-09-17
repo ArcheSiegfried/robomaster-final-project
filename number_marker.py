@@ -92,7 +92,7 @@ class NumberMarkerConfig:
     return_yaw_rate: float = 35.0
     max_return_degrees: float = 75.0
     max_return_seconds: float = 3.0
-    team_number: Optional[str] = "03"
+    team_number: Optional[str] = "10"
 
 
 @dataclass(frozen=True)

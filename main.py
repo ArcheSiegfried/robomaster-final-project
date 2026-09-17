@@ -7,7 +7,7 @@ import cv2
 from camera_source import LatestFrameSource
 from config import CONFIG
 from coordinator import LINE_FOLLOWING, RELEASING, TASK_ACTIVE, TaskCoordinator
-from evidence import DEFAULT_CAPTURE_DIRECTORY
+from evidence import DEFAULT_CAPTURE_DIRECTORY, IntegratedScoreEvidence
 from gimbal_output import GimbalOutput
 from marker_source import MarkerObservationSource
 from motion_output import MotionOutput
@@ -622,6 +622,7 @@ def main(
             task_order=tuple(task.name for task in coordinator.motion_tasks),
         )
         sink = _find_evidence_sink(coordinator)
+        score_evidence = IntegratedScoreEvidence()
         run_directory = getattr(sink, "run_directory", None)
         if run_directory is not None:
             console.note(
@@ -663,6 +664,11 @@ def main(
                 # Final 的得分截图链：任务交出请求 -> 证据层画框写字存盘 ->
                 # 回传真实结果。放在 step() 之后，任务在等回执期间会保持接管。
                 saved = service_task_evidence(coordinator)
+                failures_before = len(score_evidence.failures)
+                saved += score_evidence.process(packet, decision, coordinator, sink)
+                for failure in score_evidence.failures[failures_before:]:
+                    console.note("!! 得分截图失败：" + failure)
+                    console.note(coordinator.human_stop(now))
                 # 运行记录：把这一帧的接管/释放/限幅/异常写进本次运行的 report.md。
                 record_run_events(coordinator, decision, now)
                 # 终端反馈：状态变化 + 心跳。丢线、接管、异常都会打出来。
