@@ -91,6 +91,19 @@ A17           **为什么灯判据归本模块**：2026-09-16 团队把 ``traffi
               (1) 一次扫描**两盏都报**（它只报一盏且红优先）；
               (2) **从不为了红灯停车/占住控制权** —— 只有真的看到绿灯才接管；
               (3) 只在**检测到岔路的帧**才调用，不给主循环加每帧一次的灯检测。
+A18           官方规则（2026-09-16）：岔道口可以**一红一绿**、也可以**只放红灯**或
+              **只放绿灯**。所以岔路选道判据补一条：**一个绿灯都没有、但知道某一边
+              是红灯** → 红的那边不能走，走另一边（``red_blocks_branch``，默认开）；
+              两边都红 → 不走。注意这条只对"这个岔路口从头到尾没见过绿灯"成立：
+              先看到绿灯、后来只剩红灯时**不许顺手猜另一边**，而是停车（FAILED）。
+A19           **自选地点的"红灯停绿灯行"**——官方规则里这是**第二个记分任务**
+              （与岔道口选道分开记分）。实现：没有岔路时，若 ``stop_on_red`` 打开、
+              红灯连续 ``red_stop_confirm_frames`` 帧、且**画面里没有绿灯** →
+              接管 + 原地停（``HOLD``），看到绿灯就交回巡线（``COMPLETED``）；
+              等超过 ``red_stop_max_hold`` 秒 → FAILED 停车。
+              **默认 ``stop_on_red=False``**：默认开着会把"误判出来的红"变成路中间
+              停车，正是 ``traffic_light`` 被删的原因（``6dc2c1f``）。要在实车上跑
+              那一项时显式打开（自测程序里有 ``--red-stop`` / 菜单第 4 项）。
 ============  ==========================================================
 
 修订说明（2026-09-15 实车测试报告）：本次改了三处，全部只在本文件里，
@@ -118,6 +131,16 @@ A17           **为什么灯判据归本模块**：2026-09-16 团队把 ``traffi
 6. 适用性再收紧一档（A14）：**只有真的拿到绿灯读数才接管**。只有红灯时本模块
    完全不接管（岔路交给后面的模块），绝不重演"为了红灯原地锁停"那件事；
    只有在**已经接管之后**灯才变红的情况下，才会原地停 + 超时 FAILED。
+
+修订说明（2026-09-16 官方规则补充：红绿灯规则）：
+
+7. 官方明确：岔道口可以"一红一绿 / 只放绿灯 / 只放红灯"，**另外**还要在**自选地点**
+   实现"红灯停绿灯行"，**两个任务分别记分**。于是：
+   * 岔路选道补 A18（只放红灯 → 红的那边不能走，走另一边）；
+   * 新增 A19 与 ``HOLD`` 状态：自选地点的红灯停、绿灯行（``stop_on_red``），
+     默认关闭，实测那一条要显式打开；
+   * 被删掉的 ``traffic_light`` 那套"红灯锁停"在这里以**受控方式**回来了：
+     只在显式开启、只在没有岔路、只在没有绿灯同时可见、且有确认帧数与等待上限时生效。
 """
 
 from __future__ import annotations
@@ -167,6 +190,7 @@ class JunctionState(Enum):
     DECIDE = "decide"              # 已确认岔路，等判据
     TURN = "turn"                  # 按选中的分支转向
     SETTLE = "settle"              # 转向结束，等线回到画面中央
+    HOLD = "hold"                  # 自选地点的"红灯停"：原地等绿灯（A19）
     COMPLETED = "completed"        # 干完了，交回巡线
     FAILED = "failed"              # 判据不成立/超时，停车
 
@@ -574,6 +598,19 @@ class JunctionConfig:
     lamp_min_confidence: float = 0.0
     #: 同一个"哪边是绿灯"要连续几帧都成立才转身（单帧闪烁不算；0/1 = 关闭）。
     light_confirm_frames: int = 2
+    #: 岔路口只放红灯、另一边没灯时：把红的那边当"不能走"，走另一边（A18）。
+    #: 依据 2026-09-16 官方规则说明：岔道口可以一红一绿，也可以只放红 / 只放绿。
+    red_blocks_branch: bool = True
+    #: **自选地点的"红灯停绿灯行"**（A19）——官方规则里这是**第二个记分任务**。
+    #: 默认 **关**：默认开着会把"误判出来的红"变成路中间停车，那正是当初
+    #: ``traffic_light`` 模块被删掉的原因（见 ``6dc2c1f``）。要跑那一项时显式打开。
+    stop_on_red: bool = False
+    #: 红灯连续几帧才认（防单帧误判；被删掉那个模块用的是 2 帧）。
+    red_stop_confirm_frames: int = 2
+    #: 红灯最长等多久（秒）：超时 → FAILED 停车，不会无限等下去。
+    red_stop_max_hold: float = 20.0
+    #: 等红灯期间看到绿灯就交回巡线（COMPLETED）。
+    red_stop_release_on_green: bool = True
 
     # --- 确认与再触发（见 A8、A9） ---
     confirm_frames: int = 3          # 连续几帧都看到才算真岔路
@@ -1359,11 +1396,15 @@ def evaluate_branches(
             return _by_fallback_rule(branches, settings)
         if fallback == "red":
             return None, "red light"
-        return None, "no light probe and fallback_color is none"
+        return None, "no usable light reading; fallback_color is %r" % fallback
+
+    red_sides = []
+    for item in reds:
+        if item.branch is not None and item.branch not in red_sides:
+            red_sides.append(item.branch)
 
     # 2) 只看到绿灯、不知道哪边，但知道某一边是红的 → 走另一边（A16）
     if greens:
-        red_sides = [item.branch for item in reds if item.branch is not None]
         if len(red_sides) == 1:
             other = Branch.RIGHT if red_sides[0] is Branch.LEFT else Branch.LEFT
             chosen = next((branch for branch in branches if branch.side is other), None)
@@ -1374,11 +1415,24 @@ def evaluate_branches(
                 )
         return _by_fallback_rule(branches, settings)
 
-    # 3) 没看到绿灯
+    # 3) 一个绿灯都没有，但知道某一边是红灯 → 红的那边不能走，走另一边（A18）
+    #    官方规则允许岔道口"只放红灯"，这时选道判据就是"避开红的那边"。
+    if reds and settings.red_blocks_branch:
+        if len(red_sides) == 1:
+            other = Branch.RIGHT if red_sides[0] is Branch.LEFT else Branch.LEFT
+            chosen = next((branch for branch in branches if branch.side is other), None)
+            if chosen is not None:
+                return chosen, "%s branch is red; take the other one" % red_sides[0].value
+        if len(red_sides) >= 2:
+            return None, "both branches are red"
+        return _by_fallback_rule(branches, settings)
+
+    # 4) 没看到绿灯
     if reds:
-        sides = [item.branch.value for item in reds if item.branch is not None]
-        if sides:
-            return None, "red light on the %s branch" % "/".join(sides)
+        if red_sides:
+            return None, "red light on the %s branch" % "/".join(
+                branch.value for branch in red_sides
+            )
         return None, "red light"
     return None, "light color unknown"
 
@@ -1430,6 +1484,10 @@ class GreenJunctionTask:
         self._drove_past_frames = 0
         self._rule_side: Optional[Branch] = None
         self._rule_side_count = 0
+        self._red_streak = 0
+        self._hold_started_at: Optional[float] = None
+        self._saw_green = False
+        self._last_all_readings: List[LightReading] = []
         self._idle_since: Optional[float] = None
         self._state_since: Optional[float] = None
         self._last_seen_at: Optional[float] = None
@@ -1442,7 +1500,12 @@ class GreenJunctionTask:
     @property
     def active(self) -> bool:
         """``True`` 表示本模块正在接管（coordinator 据此保持 / 交出控制权）。"""
-        return self.state in (JunctionState.DECIDE, JunctionState.TURN, JunctionState.SETTLE)
+        return self.state in (
+            JunctionState.HOLD,
+            JunctionState.DECIDE,
+            JunctionState.TURN,
+            JunctionState.SETTLE,
+        )
 
     @property
     def finished(self) -> bool:
@@ -1470,6 +1533,10 @@ class GreenJunctionTask:
         self._drove_past_frames = 0
         self._rule_side = None
         self._rule_side_count = 0
+        self._red_streak = 0
+        self._hold_started_at = None
+        self._saw_green = False
+        self._last_all_readings = []
         self._idle_since = None
         self._state_since = None
         self._last_seen_at = None
@@ -1629,20 +1696,33 @@ class GreenJunctionTask:
 
         2026-09-16 晚些时候团队又删掉了 ``traffic_light``（``6dc2c1f``），理由是
         "它会为了红灯原地锁停、浪费跑圈时间"。所以这里再收紧一档：
-        **必须真的是绿灯才算有判据**（红灯单独出现不算）。
-        红灯的信息仍然有用（"这一边不能走"），但只用在**已经接管之后**的
-        :func:`evaluate_branches` 里 —— 一个绿灯证据都没有时，本模块不接管，
-        岔路交给后面的模块，绝不为红灯把车按在原地。
+        **必须真的有灯的证据才算有判据**：
+
+        * 有绿灯 → 算（要去绿灯那边）；
+        * 只有红灯、但知道在哪一边，且 ``red_blocks_branch`` → 也算
+          （"红的那边不能走"，官方规则允许岔道口只放红灯，A18）；
+        * 只有红灯、又在**没有岔路**的地方看到，只有显式打开 ``stop_on_red``
+          才接管去执行"红灯停绿灯行"（A19）——默认关，避免误判锁停。
         """
         if not self.settings.require_rule_source:
             return True
         readings = self._rule_reading(frame, now)
         self._remember_readings(readings)
-        return any(item.color is LightColor.GREEN for item in readings)
+        for item in readings:
+            if item.color is LightColor.GREEN:
+                return True
+            if (
+                item.color is LightColor.RED
+                and item.branch is not None
+                and self.settings.red_blocks_branch
+            ):
+                return True
+        return False
 
     def _remember_readings(self, readings: List[LightReading]) -> None:
         """存下这一帧看到的灯，给日志/evidence 用（A15：可能是左右两盏）。"""
         self.last_readings = list(readings)
+        self._last_all_readings = list(readings)
         self.last_reading = readings[0] if readings else None
 
     def _line_centered(self, frame: FramePacket, now: float) -> Tuple[bool, str]:
@@ -1711,6 +1791,8 @@ class GreenJunctionTask:
             return self._step_idle(detection, frame, now)
         if self.state is JunctionState.READY:
             return self._step_ready(detection, now)
+        if self.state is JunctionState.HOLD:
+            return self._step_hold(frame, now)
         if self.state is JunctionState.DECIDE:
             return self._step_decide(detection, frame, now)
         if self.state is JunctionState.TURN:
@@ -1724,6 +1806,57 @@ class GreenJunctionTask:
             return self._failed("frame image missing while owning control")
         return self._not_triggered("no frame")
 
+    # -- A19：自选地点的"红灯停绿灯行" --------------------------------------
+
+    def _read_lights(self, frame: FramePacket, now: float):
+        """读一次灯，返回 ``(有绿灯, 有红灯)``。"""
+        readings = self._rule_reading(frame, now)
+        self._remember_readings(readings)
+        has_green = any(item.color is LightColor.GREEN for item in readings)
+        has_red = any(item.color is LightColor.RED for item in readings)
+        return has_green, has_red
+
+    def _check_red_stop(self, frame: FramePacket, now: float) -> TaskUpdate:
+        """没有岔路时的那条路：红灯停、绿灯行（只有 ``stop_on_red`` 打开才做）。
+
+        * 看到绿灯 → 什么都不做（绿灯行），交给巡线继续开；
+        * 连续 ``red_stop_confirm_frames`` 帧看到红灯、而且**没有绿灯** → 接管 + 原地停；
+        * 默认 ``stop_on_red=False``：一个红读数都不会让车停下来。
+        """
+        settings = self.settings
+        if not settings.stop_on_red:
+            self._red_streak = 0
+            return self._not_triggered("no junction")
+        has_green, has_red = self._read_lights(frame, now)
+        if has_green:
+            self._red_streak = 0
+            return self._not_triggered("green light; go on")
+        if not has_red:
+            self._red_streak = 0
+            return self._not_triggered("no junction")
+        self._red_streak += 1
+        need = max(1, int(settings.red_stop_confirm_frames))
+        if self._red_streak < need:
+            return self._not_triggered("red seen; confirming %d/%d" % (self._red_streak, need))
+        self.chosen_branch = None
+        self._hold_started_at = now
+        self._run_started_at = now
+        self._enter(JunctionState.HOLD, now)
+        return self._running(now, "red light: holding (no green)")
+
+    def _step_hold(self, frame: FramePacket, now: float) -> TaskUpdate:
+        """红灯停住，等绿灯（A19）。总时长有硬上限，超时 FAILED 停车。"""
+        settings = self.settings
+        if self._run_started_at is not None and now - self._run_started_at > settings.total_timeout:
+            return self._failed("task total timeout at red light")
+        has_green, has_red = self._read_lights(frame, now)
+        held = 0.0 if self._hold_started_at is None else max(0.0, now - self._hold_started_at)
+        if has_green and settings.red_stop_release_on_green:
+            return self._completed("green light after %.1fs red hold; releasing" % held)
+        if held > settings.red_stop_max_hold:
+            return self._failed("red light held too long (%.0fs)" % held)
+        return self._running(now, "holding at red light (%.1fs)" % held)
+
     def _step_idle(
         self, detection: JunctionDetection, frame: FramePacket, now: float
     ) -> TaskUpdate:
@@ -1735,7 +1868,8 @@ class GreenJunctionTask:
             return self._not_triggered("rearm cooldown")
         if not detection.valid:
             self._confirm_count = 0
-            return self._not_triggered("no junction")
+            # 没有岔路时：如果开了"自选地点红灯停绿灯行"（A19），这里检查红灯。
+            return self._check_red_stop(frame, now)
         # 看到岔路形状了，先确认这一帧到底有没有能用的灯判据（A14）。
         # 放在"检测到岔路"之后是为了省掉每帧一次的灯检测：只有真有岔路的帧才去问灯。
         if not self._rule_source_available(frame, now):
@@ -1814,6 +1948,12 @@ class GreenJunctionTask:
 
         readings = self._read_probe(frame, now)
         self._remember_readings(readings)
+        # A18 只对"这个岔路口从头到尾没见过绿灯"成立（官方允许只放红灯）。
+        # 如果先看到过绿灯、后来绿灯没了只剩红灯，那不许顺手"猜另一边" —— 停车更安全。
+        if self._saw_green:
+            readings = [item for item in readings if item.color is not LightColor.RED]
+        elif any(item.color is LightColor.GREEN for item in self._last_all_readings):
+            self._saw_green = True
         chosen, reason = evaluate_branches(detection.branches, readings, settings)
         if chosen is None:
             self._rule_side = None
