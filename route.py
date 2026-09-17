@@ -30,7 +30,6 @@ from route_detector import (
     RoutePathObservation,
     RouteVision,
 )
-from route_distance import load_optional_calibration
 
 
 KIND = "route"
@@ -39,6 +38,7 @@ END_APPROACH = "end_approach"
 CORNERING = "cornering"
 RAISING_VIEW = "raising_view"
 BRIDGING = "bridging"
+LOW_APPROACH = "low_approach"
 SEARCHING = "searching"
 ALIGNING = "aligning"
 CENTERING = "centering"
@@ -62,20 +62,22 @@ END_APPROACH_MAX_YAW = 16.0
 VIEW_SETTLE_MARGIN_SECONDS = 0.12
 TOTAL_RECOVERY_SECONDS = 19.7
 BRIDGE_MAX_SECONDS = 3.0
-BRIDGE_METRIC_MAX_SECONDS = 5.0
 # Real-car feedback showed that the previous 0.12 m/s request could fail to
 # overcome the stopped chassis' static friction.  Keep this well inside the
 # external-task envelope, but give the bounded crossing a usable start speed.
 BRIDGE_MIN_SECONDS = 0.80
 BRIDGE_FORWARD_SPEED = 0.15
-BRIDGE_MIDDLE_SPEED = 0.12
-BRIDGE_NEAR_SPEED = 0.08
-BRIDGE_MIDDLE_DISTANCE = 0.15
-BRIDGE_NEAR_DISTANCE = 0.05
-BRIDGE_TARGET_TOLERANCE = 0.015
-BRIDGE_BLIND_MAX_DISTANCE = 0.12
-# Safe fallback when the local metric calibration is absent or invalid.
-BRIDGE_POST_LOCK_DISTANCE = 0.05
+# The endpoint is followed in the *low* view. These are image-space gates,
+# not a claim to measure centimetres from a monocular camera.
+LOW_APPROACH_MAX_SECONDS = 4.0
+LOW_ENDPOINT_LOSS_SECONDS = 0.70
+# Stop before the skeleton endpoint reaches the 28 px image-border gate.
+# This is a visual event threshold to tune in real tests, not a distance scale.
+LOW_TURN_ROW_RATIO = 0.89
+LOW_SLOW_ROW_RATIO = 0.78
+LOW_APPROACH_SPEED = 0.11
+LOW_NEAR_SPEED = 0.07
+LOW_TURN_CONFIRM_FRAMES = 3
 FRAGMENT_LOSS_SECONDS = 0.35
 
 SEARCH_YAW_SPEED = 45.0
@@ -154,10 +156,6 @@ class RouteTask:
         self._search_pitch = float(
             getattr(self.settings, "gimbal_search_pitch", CONFIG.gimbal_search_pitch)
         )
-        (
-            self._distance_calibration,
-            self._distance_calibration_status,
-        ) = load_optional_calibration(self._search_pitch)
         self._search_yaw = float(
             getattr(self.settings, "gimbal_yaw", CONFIG.gimbal_yaw)
         )
@@ -214,9 +212,10 @@ class RouteTask:
         self._side_hint = 0.0
         self._side_hint_frames = 0
         self._side_hint_last_sequence: Optional[int] = None
-        self._bridge_lock_forward: Optional[float] = None
-        self._bridge_target_forward: Optional[float] = None
-        self._bridge_metric_active = False
+        self._low_missing_at: Optional[float] = None
+        self._low_turn_frames = 0
+        self._low_turn_last_sequence: Optional[int] = None
+        self._low_target_tangent: Optional[float] = None
         self._reacquire_view_already_low = False
 
     @property
@@ -274,9 +273,10 @@ class RouteTask:
         self._side_hint = 0.0
         self._side_hint_frames = 0
         self._side_hint_last_sequence = None
-        self._bridge_lock_forward = None
-        self._bridge_target_forward = None
-        self._bridge_metric_active = False
+        self._low_missing_at = None
+        self._low_turn_frames = 0
+        self._low_turn_last_sequence = None
+        self._low_target_tangent = None
         self._reacquire_view_already_low = False
         self.last_detection = VisualDetection.no_result(KIND)
         self._line_detector.reset()
@@ -498,6 +498,14 @@ class RouteTask:
         # the real, closer endpoint from being selected.
         if endpoint.branch_length < MIN_LOCK_BRANCH_PIXELS:
             return False
+        if (
+            self.state == LOW_APPROACH
+            and self._low_target_tangent is not None
+            and self._directed_angle_difference(
+                endpoint.tangent_deg, self._low_target_tangent
+            ) > REACQUIRE_MAX_ANGLE_JUMP
+        ):
+            return False
         # A new target must first present a physical internal endpoint.  Once
         # that same target has been tracked, its endpoint may legitimately
         # leave through the bottom edge while the chassis docks onto it.
@@ -639,45 +647,89 @@ class RouteTask:
             return False, "near candidate rejected before clearing old route"
         return True, "candidate confirmed ahead of old-route gate"
 
-    def _calibrated_remaining_distance(self) -> Optional[float]:
-        """Return a measured one-axis remainder for a stable route endpoint."""
-        if self._distance_calibration is None or self._candidate is None:
-            return None
-        endpoint = self._candidate.entry_endpoint
-        if (
-            endpoint is None
-            or not endpoint.internal
-            or self._candidate_frames < CANDIDATE_CONFIRM_FRAMES
-        ):
-            return None
-        return self._distance_calibration.estimate_remaining(
-            self._candidate.bottom_ratio
+    def _start_low_approach(self, now: float) -> None:
+        """Stop, lower the shared camera, then reacquire the same gap end."""
+        self._low_target_tangent = (
+            None if self._candidate is None else self._candidate.angle_deg
         )
+        self.state = LOW_APPROACH
+        self._phase_started_at = now
+        self._low_missing_at = None
+        self._low_turn_frames = 0
+        self._low_turn_last_sequence = None
+        # The raised and lowered views have different image coordinates.
+        # Keeping the old pixel tracker would reject the real endpoint.
+        self._candidate = None
+        self._candidate_frames = 0
+        self._candidate_seen_far = False
+        self._candidate_near = False
+        self._candidate_center = None
+        self._candidate_angle = None
+        self._candidate_last_at = None
+        self._candidate_last_sequence = None
 
-    def _update_bridge_metric_target(self, remaining: float) -> None:
-        """Fuse each visible endpoint measurement into one bounded target."""
-        if self._bridge_lock_forward is None:
-            self._bridge_lock_forward = self._pose_forward
-        proposed = self._pose_forward + max(0.0, float(remaining))
-        maximum = self._bridge_lock_forward + 0.45
-        proposed = min(proposed, maximum)
-        if self._bridge_target_forward is None:
-            self._bridge_target_forward = proposed
-        else:
-            # Pixel endpoints jitter by several rows.  Smooth the implied
-            # absolute turn point while still following real approach motion.
-            self._bridge_target_forward = (
-                0.65 * self._bridge_target_forward + 0.35 * proposed
+    def _step_low_approach(self, frame: FramePacket, now: float) -> TaskUpdate:
+        elapsed = now - float(self._phase_started_at)
+        if elapsed < self._view_settle_seconds:
+            return self._line_view_running(
+                now, "lowering camera; stopped before endpoint approach"
             )
-        self._bridge_metric_active = True
+        if elapsed >= LOW_APPROACH_MAX_SECONDS:
+            return self._finish(
+                TaskStatus.FAILED, "low-view endpoint approach timed out"
+            )
 
-    @staticmethod
-    def _bridge_approach_speed(remaining: float) -> float:
-        if remaining <= BRIDGE_NEAR_DISTANCE:
-            return BRIDGE_NEAR_SPEED
-        if remaining <= BRIDGE_MIDDLE_DISTANCE:
-            return BRIDGE_MIDDLE_SPEED
-        return BRIDGE_FORWARD_SPEED
+        self._observe_candidate(frame, now)
+        candidate = self._candidate
+        endpoint = None if candidate is None else candidate.entry_endpoint
+        confirmed = (
+            candidate is not None
+            and endpoint is not None
+            and endpoint.internal
+            and endpoint.branch_length >= MIN_LOCK_BRANCH_PIXELS
+            and self._candidate_frames >= CANDIDATE_CONFIRM_FRAMES
+        )
+        if not confirmed:
+            if self._low_missing_at is None:
+                self._low_missing_at = now
+            if now - self._low_missing_at >= LOW_ENDPOINT_LOSS_SECONDS:
+                return self._finish(
+                    TaskStatus.FAILED,
+                    "gap endpoint not confirmed in low view; stopped",
+                )
+            return self._line_view_running(
+                now, "waiting for the same physical endpoint in low view"
+            )
+
+        self._low_missing_at = None
+        ratio = candidate.bottom_ratio
+        if frame.sequence != self._low_turn_last_sequence:
+            self._low_turn_frames = (
+                self._low_turn_frames + 1
+                if ratio >= LOW_TURN_ROW_RATIO else 0
+            )
+            self._low_turn_last_sequence = frame.sequence
+        if self._low_turn_frames >= LOW_TURN_CONFIRM_FRAMES:
+            self._start_align(frame, now)
+            self._line_detector.reset()
+            # The camera is already down; do not wait through another gimbal
+            # transition or rotate on the raised-view endpoint coordinates.
+            self._align_phase = "base_rotate"
+            self._align_phase_started_at = now
+            return self._line_view_running(
+                now, "low-view gap endpoint reached turn band; starting turn"
+            )
+        speed = (
+            LOW_NEAR_SPEED if ratio >= LOW_SLOW_ROW_RATIO
+            else LOW_APPROACH_SPEED
+        )
+        return self._line_view_motion(
+            now,
+            MotionCommand(forward=speed),
+            f"following low-view gap endpoint at row {ratio:.2f}; "
+            f"turn confirmation {self._low_turn_frames}/{LOW_TURN_CONFIRM_FRAMES}",
+            candidate.detection,
+        )
 
     def _begin_end_approach(self, now: float) -> None:
         self.state = END_APPROACH
@@ -717,9 +769,10 @@ class RouteTask:
         self._side_hint = 0.0
         self._side_hint_frames = 0
         self._side_hint_last_sequence = None
-        self._bridge_lock_forward = None
-        self._bridge_target_forward = None
-        self._bridge_metric_active = False
+        self._low_missing_at = None
+        self._low_turn_frames = 0
+        self._low_turn_last_sequence = None
+        self._low_target_tangent = None
         self._line_detector.reset()
 
     def _begin_search(self, now: float) -> None:
@@ -887,14 +940,21 @@ class RouteTask:
         )
 
     def _line_view_motion(
-        self, now: float, motion: MotionCommand, message: str
+        self,
+        now: float,
+        motion: MotionCommand,
+        message: str,
+        detection: Optional[VisualDetection] = None,
     ) -> TaskUpdate:
         """Issue chassis motion while explicitly keeping the camera low."""
         self._record_motion(motion, now)
         return TaskUpdate(
             TaskStatus.RUNNING,
             motion=motion,
-            detection=VisualDetection.no_result(KIND),
+            detection=(
+                VisualDetection.no_result(KIND)
+                if detection is None else detection
+            ),
             message=message,
             gimbal=GimbalCommand(pitch=self._line_pitch, yaw=self._search_yaw),
         )
@@ -946,15 +1006,9 @@ class RouteTask:
     def _step_search(self, frame: FramePacket, now: float) -> TaskUpdate:
         ready, reason = self._candidate_ready(frame)
         if ready:
-            self._start_align(frame, now)
-            return self._running(now, STOP_COMMAND, reason, self._candidate.detection)
-        if self._side_hint_frames >= SIDE_HINT_CONFIRM_FRAMES:
-            self._start_align(frame, now)
-            return self._running(
-                now,
-                STOP_COMMAND,
-                "stable far-route side found; lowering before low-view turn",
-                self._candidate.detection if self._candidate is not None else None,
+            self._start_low_approach(now)
+            return self._line_view_running(
+                now, "search found physical gap endpoint; lowering to approach"
             )
 
         if self._search_target_index >= len(self._search_targets):
@@ -1448,92 +1502,12 @@ class RouteTask:
                 )
 
             ready, reason = self._candidate_ready(frame)
-            measured_remaining = self._calibrated_remaining_distance()
-            if ready and measured_remaining is not None:
-                self._update_bridge_metric_target(measured_remaining)
-            if (
-                ready
-                and bridge_elapsed >= BRIDGE_MIN_SECONDS
-                and self._bridge_target_forward is None
-            ):
-                if self._distance_calibration is not None:
-                    return self._finish(
-                        TaskStatus.FAILED,
-                        "confirmed endpoint is outside the measured distance table",
-                    )
-                self._bridge_lock_forward = self._pose_forward
-                self._bridge_target_forward = (
-                    self._pose_forward + BRIDGE_POST_LOCK_DISTANCE
-                )
-                self._bridge_metric_active = False
-            if self._bridge_target_forward is not None:
-                remaining = max(
-                    0.0, self._bridge_target_forward - self._pose_forward
-                )
-                tolerance = (
-                    BRIDGE_TARGET_TOLERANCE
-                    if self._bridge_metric_active
-                    else 0.005
-                )
-                if remaining > tolerance:
-                    if (
-                        self._bridge_metric_active
-                        and measured_remaining is None
-                        and remaining > BRIDGE_BLIND_MAX_DISTANCE
-                    ):
-                        return self._finish(
-                            TaskStatus.FAILED,
-                            "endpoint left calibrated view with too much "
-                            "blind travel remaining",
-                        )
-                    budget = (
-                        BRIDGE_METRIC_MAX_SECONDS
-                        if self._bridge_metric_active
-                        else BRIDGE_MAX_SECONDS
-                    )
-                    if bridge_elapsed >= budget:
-                        return self._finish(
-                            TaskStatus.FAILED,
-                            "measured blank crossing did not reach its bounded "
-                            "turn point",
-                        )
-                    speed = self._bridge_approach_speed(remaining)
-                    mode = "measured" if self._bridge_metric_active else "fallback"
-                    return self._running(
-                        now,
-                        MotionCommand(forward=speed),
-                        f"{mode} turn-point approach; remaining "
-                        f"{remaining:.2f}m at {speed:.2f}m/s",
-                        self._candidate.detection
-                        if self._candidate is not None
-                        else None,
-                    )
-                self._start_align(frame, now)
-                return self._running(
-                    now,
-                    STOP_COMMAND,
-                    (
-                        "measured turn point reached; lowering before turn"
-                        if self._bridge_metric_active
-                        else "fallback approach complete; lowering before turn; "
-                        + self._distance_calibration_status
-                    ),
-                    self._candidate.detection
-                    if self._candidate is not None
-                    else None,
+            if ready:
+                self._start_low_approach(now)
+                return self._line_view_running(
+                    now, "gap endpoint confirmed; lowering for visual approach"
                 )
             if bridge_elapsed >= BRIDGE_MAX_SECONDS:
-                if self._side_hint_frames >= SIDE_HINT_CONFIRM_FRAMES:
-                    self._start_align(frame, now)
-                    return self._running(
-                        now,
-                        STOP_COMMAND,
-                        "bridge ended with stable far-route side; lowering "
-                        "before low-view turn",
-                        self._candidate.detection
-                        if self._candidate is not None
-                        else None,
-                    )
                 self._begin_search(now)
                 return self._running(
                     now, STOP_COMMAND, "blank bridge budget ended; starting fan search"
@@ -1550,6 +1524,9 @@ class RouteTask:
 
         if self.state == SEARCHING:
             return self._step_search(frame, now)
+
+        if self.state == LOW_APPROACH:
+            return self._step_low_approach(frame, now)
 
         if self.state == ALIGNING:
             return self._step_align(line, frame, now)

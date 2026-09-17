@@ -16,7 +16,6 @@ screenshots/
 *.mov
 *.mp4
 *.mkv
-route_distance_calibration.json
 .env
 .env.*
 !.env.example
