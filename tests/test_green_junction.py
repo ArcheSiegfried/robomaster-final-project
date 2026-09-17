@@ -1401,11 +1401,11 @@ def one_lamp_frame(colour="red", x=100, y=100, radius=22):
     return image
 
 
-class RedStopTests(unittest.TestCase):
-    """A18/A19：官方规则说明（2026-09-16）里的两条。
+class RedBranchTests(unittest.TestCase):
+    """A18：官方规则（2026-09-16）——岔道口可以"一红一绿 / 只放红 / 只放绿"。
 
-    * 岔道口可以"一红一绿 / 只放红 / 只放绿" → 只放红灯时，红的那边不能走（A18）；
-    * 另外要在**自选地点**实现"红灯停绿灯行"，这是**第二个记分任务**（A19）。
+    只放红灯时：红的那边不能走，走另一边。
+    （"自选地点红灯停绿灯行"是另一个记分任务、由别人负责，本模块不做 —— A19。）
     """
 
     def test_red_only_fork_takes_the_other_branch(self):
@@ -1422,101 +1422,6 @@ class RedStopTests(unittest.TestCase):
         self.assertIn(TaskStatus.RUNNING, statuses)
         self.assertIs(task.chosen_branch, Branch.RIGHT)
         self.assertEqual(task.state, JunctionState.COMPLETED)
-
-    def test_stop_on_red_holds_then_releases_on_green(self):
-        """A19：自选地点——红灯停住，随后变绿就交回巡线。"""
-        settings = JunctionConfig(stop_on_red=True, red_stop_confirm_frames=2)
-        state = {"green": False}
-
-        def probe(frame, now):
-            if state["green"]:
-                return LightReading(color=LightColor.GREEN)
-            return LightReading(color=LightColor.RED)
-
-        task = GreenJunctionTask(settings=settings, light_probe=probe)
-        now = 200.0
-        # 第 1 帧：红灯刚出现，还在确认（red_stop_confirm_frames=2）→ 不接管
-        now += FRAME_DT
-        update = task.step(packet(line_frame(), 1, now), now)
-        self.assertEqual(update.status, TaskStatus.NOT_TRIGGERED)
-        self.assertIn("confirming", update.message)
-        # 第 2 帧：红灯连续两帧 → 接管 + 停住
-        now += FRAME_DT
-        update = task.step(packet(line_frame(), 2, now), now)
-        self.assertEqual(update.status, TaskStatus.RUNNING)
-        self.assertEqual(update.motion, STOP)
-        self.assertEqual(task.state, JunctionState.HOLD)
-        self.assertTrue(task.active)
-        # 还是红灯：一直停着
-        now += FRAME_DT
-        update = task.step(packet(line_frame(), 3, now), now)
-        self.assertEqual(update.status, TaskStatus.RUNNING)
-        self.assertEqual(update.motion, STOP)
-        # 变绿 → 交回巡线
-        state["green"] = True
-        now += FRAME_DT
-        update = task.step(packet(line_frame(), 4, now), now)
-        self.assertEqual(update.status, TaskStatus.COMPLETED)
-        self.assertEqual(update.motion, STOP)
-        self.assertIn("green light", update.message)
-
-    def test_red_stop_is_off_by_default(self):
-        """默认 ``stop_on_red=False``：没有岔路时一个红读数都不会让车停。"""
-        task = GreenJunctionTask(light_probe=lambda frame, now: LightReading(color=LightColor.RED))
-        now = 300.0
-        for index in range(15):
-            now += FRAME_DT
-            update = task.step(packet(line_frame(), index + 1, now), now)
-            self.assertEqual(update.status, TaskStatus.NOT_TRIGGERED)
-        self.assertEqual(task.state, JunctionState.IDLE)
-
-    def test_red_stop_never_holds_when_green_is_visible(self):
-        """红绿同时可见 = 绿灯行，绝不停（这条同时保护了"岔路口一红一绿"的场景）。"""
-        settings = JunctionConfig(stop_on_red=True, red_stop_confirm_frames=1)
-        task = GreenJunctionTask(
-            settings=settings,
-            light_probe=lambda frame, now: [
-                LightReading(color=LightColor.RED, branch=Branch.LEFT),
-                LightReading(color=LightColor.GREEN, branch=Branch.RIGHT),
-            ],
-        )
-        now = 400.0
-        for index in range(10):
-            now += FRAME_DT
-            update = task.step(packet(line_frame(), index + 1, now), now)
-            self.assertEqual(update.status, TaskStatus.NOT_TRIGGERED)
-        self.assertEqual(task.state, JunctionState.IDLE)
-
-    def test_junction_with_red_and_green_still_goes_green(self):
-        """开了 stop_on_red 也不会在岔路口停住：那里要按选道规则走绿灯那边。"""
-        settings = JunctionConfig(stop_on_red=True)
-        task = GreenJunctionTask(settings=settings)   # 内置认灯器读两盏
-        now = 500.0
-        for index in range(40):
-            now += FRAME_DT
-            update = task.step(packet(two_lamp_frame(green_on_left=False), index + 1, now), now)
-            if task.finished:
-                break
-        self.assertIs(task.chosen_branch, Branch.RIGHT)
-        self.assertEqual(task.state, JunctionState.COMPLETED)
-
-    def test_red_hold_times_out_and_stops(self):
-        settings = JunctionConfig(
-            stop_on_red=True, red_stop_confirm_frames=1, red_stop_max_hold=0.3
-        )
-        task = GreenJunctionTask(
-            settings=settings, light_probe=lambda frame, now: LightReading(color=LightColor.RED)
-        )
-        now = 600.0
-        update = None
-        for index in range(20):
-            now += FRAME_DT
-            update = task.step(packet(line_frame(), index + 1, now), now)
-            if task.finished:
-                break
-        self.assertEqual(task.state, JunctionState.FAILED)
-        self.assertEqual(update.motion, STOP)
-        self.assertIn("held too long", update.message)
 
 
 class CoordinatorHarnessTests(unittest.TestCase):
