@@ -498,8 +498,10 @@ class ForkDetection:
     """一帧的岔路检测结果。坐标都是**整幅图像**像素（与 `VisualDetection` 一致）。"""
 
     valid: bool
+    #: 分叉点所在的行（ROI 里最靠下的那行分叉）与它的横向中点，用来把走廊分左右。
     split_row: int = 0
     split_x: int = 0
+    #: **两条分支各自的方向** —— 取张开最大那一行（最上面那行）的段中心，对准/转弯时瞄它。
     left_x: int = 0
     right_x: int = 0
     gap_px: int = 0
@@ -752,16 +754,21 @@ class FreeJunctionDetector:
 
         # 分叉行 = 最靠下（y 最大）那一行；最上面一行用来验"越往上越张开"（A3）。
         split_row, first, last, separation = rows[-1]
-        top_row, _top_first, _top_last, top_separation = rows[0]
+        top_row, top_first, top_last, top_separation = rows[0]
         divergence = 0.0
         if separation > 0.0:
             divergence = top_separation / separation - 1.0
         if top_row >= split_row or divergence < settings.min_divergence_ratio:
             return empty
 
-        left_x = int(round((first[0] + first[1]) / 2.0)) + left
-        right_x = int(round((last[0] + last[1]) / 2.0)) + left
-        split_x = int(round((left_x + right_x) / 2.0))
+        # **`left_x` / `right_x` 要的是"两条分支各自往哪边走"，所以取最上面那一行
+        # （张开最大处）的段中心。** 分叉行上两条分支刚分开、几乎重合，拿它的中心
+        # 当瞄准点等于"几乎直行" —— 2026-09-17 实车就是这么翻的：选了右支，但右支
+        # 在分叉行的中心只比画面中心偏 18 px，yaw 只有 +2.5，车最后开进了左边那条
+        # "有车"的分支。`split_x`（分左右走廊用）仍然是分叉行的中点。
+        split_x = int(round((first[0] + first[1] + last[0] + last[1]) / 4.0)) + left
+        left_x = int(round((top_first[0] + top_first[1]) / 2.0)) + left
+        right_x = int(round((top_last[0] + top_last[1]) / 2.0)) + left
         confidence = min(
             1.0, separation / max(1.0, float(settings.min_branch_separation_px) * 2.0)
         )
@@ -1813,7 +1820,10 @@ class FreeJunctionTask:
                 yaw=_clamp(yaw, -settings.max_yaw, settings.max_yaw),
             )
         # EXIT：微微前进 + 顺线（很温柔），保证交回巡线时车头正对着线。
-        offset = self._tape_offset()
+        # 还看得见岔路时（说明车还压在岔路口上）继续盯**选中那条分支** ——
+        # 只看脚下那条胶带是不够的：那一刻脚下的可能还是主干，顺着它走会拐回原路
+        # （2026-09-17 实车就是"选了右支、脚下却顺着左边那条走掉了"）。
+        offset = self._turn_offset(self.last_detection)
         yaw = 0.0
         if offset is not None:
             yaw = _clamp(
@@ -1831,7 +1841,8 @@ class FreeJunctionTask:
         """对准阶段：往选中分支偏一点点，每帧只修一点（A8）。
 
         误差以**整幅图像宽度**归一化（和 `LineDetection.error` 同口径）：
-        目标在右半边 → 误差为正 → yaw 为正（正值右转）。
+        目标在参考点右边 → 误差为正 → yaw 为正（正值右转，与巡线控制器一致：
+        `LineController.track` 里 `target_yaw = kp * error`，而 `error` 是"线偏右为正"）。
         """
         settings = self.settings
         fork = self.last_detection
@@ -1839,8 +1850,25 @@ class FreeJunctionTask:
             return 0.0
         target = fork.left_x if self.chosen_branch is Branch.LEFT else fork.right_x
         half_width = max(1.0, fork.frame_width / 2.0)
-        error = (target - fork.frame_width / 2.0) / half_width
+        error = (target - self._aim_reference_x(fork)) / half_width
         return settings.approach_yaw_gain * error
+
+    def _aim_reference_x(self, fork: ForkDetection) -> float:
+        """瞄准时的参考点：**车头正下方那条胶带**（车实际压在哪根线上）。
+
+        为什么不用画面中心：车是沿着主干胶带往前走的，主干在画面里偏左/偏右都很正常。
+        用画面中心当参考，就会出现"选了右支、却因为整条岔路偏在画面左边而往左打方向"
+        —— 2026-09-17 实车正是这么开进了左边那条有车的分支。
+        换成"脚下这根线"之后，**右支永远在参考点右边**（选左支同理），符号不再是运气。
+
+        脚下看不到线（或压着两段线、正好在岔路口上）时，退到**分叉点**：
+        分叉点本身就在主干上，而"选中的那条分支一定在分叉点的某一侧"，
+        所以符号照样成立（退到画面中心就不行了，那一帧就会反过来打方向）。
+        """
+        offset = self._tape_offset()
+        if offset is None:
+            return float(fork.split_x)
+        return float(fork.frame_width) / 2.0 + offset * (float(fork.frame_width) / 2.0)
 
     def _branch_sign(self) -> float:
         if self.chosen_branch is None:
@@ -1886,7 +1914,8 @@ class FreeJunctionTask:
     def _turn_offset(self, fork: Optional[ForkDetection]) -> Optional[float]:
         """转弯阶段"还要往哪边转多少"（-1..1）。
 
-        * 还看得见岔路 → 用**选中那条分支**的偏角（分支还没摆到正前方就继续转）；
+        * 还看得见岔路 → 用**选中那条分支**相对"脚下那根线"的偏角
+          （和 `_approach_yaw` 同一个参考点，符号才靠得住）；
         * 岔路已经从画面里消失 → 用**车头前方那条胶带**的偏移（这时它就是分支的胶带）。
 
         为什么不能只看胶带：刚进转弯时车头前面那条是**主干**，正的、就在中央，
@@ -1895,7 +1924,7 @@ class FreeJunctionTask:
         if fork is not None and fork.valid and fork.frame_width > 0:
             target = fork.left_x if self.chosen_branch is Branch.LEFT else fork.right_x
             half = max(1.0, fork.frame_width / 2.0)
-            return (float(target) - fork.frame_width / 2.0) / half
+            return (float(target) - self._aim_reference_x(fork)) / half
         return self._tape_offset()
 
     def _fork_gone(self, fork: ForkDetection) -> bool:

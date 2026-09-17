@@ -828,6 +828,65 @@ class SpeedRegressionTests(unittest.TestCase):
             self.assertNotIn(state, seen, "%s 阶段不该再算判据" % state)
 
 
+class AimDirectionTests(unittest.TestCase):
+    """选完支之后**方向必须打对**（2026-09-17 实车翻车的那一条）。
+
+    那次日志里明明写着 `aligning with the right branch`，车却开进了左边那条
+    "有车"的分支，最后交回巡线时直接 `LINE_LOST`。两个原因，现在都改掉了：
+
+    1. `left_x` / `right_x` 原来取**分叉行**（两条分支刚分开、几乎重合）的中心，
+       所以"瞄准右支"实际瞄的是几乎正前方（实测 yaw 只有 +2.5，等于直行）；
+       现在取**张开最大那一行**的中心 —— 那才是"分支往哪走"。
+    2. 瞄准的参考点原来是**画面中心**，于是整条岔路偏在画面左边时，"右支"也落在
+       中心左边 → yaw 变成负的、往左打。现在参考点是**车头正下方那根线**
+       （车实际压在哪），右支永远在它右边。
+    """
+
+    def _aim(self, image, fixed_branch="right"):
+        settings = FreeJunctionConfig(decision_rule="fixed", fixed_branch=fixed_branch)
+        task = FreeJunctionTask(settings)
+        fork, _roi, _line, _rect = task.detector.analyze(image)
+        self.assertTrue(fork.valid, "这一帧应该认得出岔路")
+        task.last_detection = fork
+        task.chosen_branch = task._as_branch(fixed_branch)
+        return task, fork, task._approach_yaw()
+
+    def test_branch_targets_point_along_the_branches(self):
+        """瞄准点要指向"分支张开后"的方向，而不是分叉点上几乎重合的两点。"""
+        fork, _roi, _line, _rect = FreeJunctionDetector().analyze(fork_frame(car_left=True))
+        self.assertLess(fork.left_x, fork.split_x)
+        self.assertGreater(fork.right_x, fork.split_x)
+        self.assertGreater(
+            fork.right_x - fork.left_x, fork.separation_px * 1.5,
+            "两个瞄准点分得太开不够 —— 说明又回去用分叉行了",
+        )
+
+    def test_the_aim_is_strong_when_the_right_branch_is_chosen(self):
+        """选右支时不能只给一个"几乎直行"的 yaw（实车那次只有 +2.5）。"""
+        _task, _fork, yaw = self._aim(fork_frame(car_left=True))
+        self.assertGreater(yaw, 5.0, "选右支时的 yaw 太弱：%+.1f" % yaw)
+
+    def test_an_off_center_fork_still_aims_at_the_chosen_branch(self):
+        """整条岔路偏在画面左边时，选右支仍然要**往右**打。
+
+        参考点是"脚下那根线"，不是画面中心 —— 这一条正是实车翻车的情形。
+        """
+        image = fork_frame(x=180, tips=(60, 300))
+        _task, fork, yaw = self._aim(image, "right")
+        self.assertLess(fork.split_x, 320, "这一帧的岔路应该整体偏在画面左侧")
+        self.assertGreater(yaw, 0.0, "岔路偏左时不能反过来往左打：%+.1f" % yaw)
+        _task, _fork, left_yaw = self._aim(image, "left")
+        self.assertLess(left_yaw, 0.0, "选左支应该往左打：%+.1f" % left_yaw)
+
+    def test_the_turn_offset_uses_the_same_reference(self):
+        """转弯阶段和瞄准阶段必须用同一个参考点，否则两段会互相打架。"""
+        task, fork, yaw = self._aim(fork_frame(car_left=True))
+        offset = task._turn_offset(fork)
+        self.assertIsNotNone(offset)
+        self.assertGreater(offset, 0.0)
+        self.assertGreater(yaw * offset, 0.0, "对准和转弯的方向符号必须一致")
+
+
 class HarnessIntegrationTests(unittest.TestCase):
     """把模块接进真实的 LineFollower + TaskCoordinator + MotionOutput 跑一遍。"""
 
