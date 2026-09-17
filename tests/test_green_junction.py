@@ -117,6 +117,20 @@ def approach_frame(fork_y=290, far_y=120, reach=110):
     return image
 
 
+def rotated_fork_frame(fork_x=420, left_x=260, right_x=620, fork_y=290, far_y=120):
+    """**车已经转过去**的岔路：下面的腿偏在右侧（近处窄带不居中），
+    选中的左分支已经基本在正前方（≈ +2.4°）。
+
+    这就是 2026-09-17 22:20 实车 settle 阶段的样子：整个 Y 在画面里往右跑，
+    近处窄带误差 0.31（> near_error_deadband 0.20），"线回中央"永远等不到。
+    """
+    image = blank_frame()
+    cv2.line(image, (fork_x, fork_y), (fork_x, HEIGHT - 2), TAPE_BGR, TAPE_HALF * 2)
+    cv2.line(image, (fork_x, fork_y), (left_x, far_y), TAPE_BGR, TAPE_HALF * 2)
+    cv2.line(image, (fork_x, fork_y), (right_x, far_y), TAPE_BGR, TAPE_HALF * 2)
+    return image
+
+
 def green_lamp_frame(center=(500, 100), radius=22):
     """实车朝向的岔路 + 画面右上方一盏绿灯（给 3 号的检测器认）。"""
     image = approach_frame()
@@ -928,6 +942,56 @@ class StateMachineTests(unittest.TestCase):
         # 3) 一开始按满增益、越接近目标越小（缓出），且从不超过上限
         self.assertLessEqual(max(abs(y) for y in yaws), settings.max_turn_yaw + 1e-9)
         self.assertLess(abs(yaws[-1]), abs(yaws[0]), "接近目标时要缓出")
+
+    def test_settle_accepts_the_branch_being_ahead(self):
+        """A21b：岔路口上"线回中央"不成立，但"选中分支已在正前方"必须能收尾。
+
+        2026-09-17 22:20 实车：转向已经正常（0.5 秒、缓出到 -15°/s），可 settle
+        里整个 Y 形连通块在画面里往右跑（``e`` 从 +0.41 涨到 +0.76），
+        "线回中央"永远等不到 → ``line did not return after the turn`` 失败 →
+        交回巡线后车跟着看到的那条带走了右边。
+        """
+        frame = rotated_fork_frame()   # 左分支 ≈ +2.4°（正前方），近处窄带误差 0.31
+        settings = JunctionConfig(settle_timeout=3.0)
+        task = GreenJunctionTask(
+            settings=settings, light_probe=lambda frame, now: green(Branch.LEFT)
+        )
+        now = 1000.0
+        centered, why = task._line_centered(packet(frame, 1, now), now)
+        self.assertFalse(centered, "这张图必须让'线回中央'为假，否则测不到 A21b（%s）" % why)
+        for index in range(40):
+            now += FRAME_DT
+            task.step(packet(frame, index + 1, now), now, fake_line(error=0.9))
+            if task.state is JunctionState.COMPLETED:
+                break
+        self.assertIs(task.state, JunctionState.COMPLETED)
+        self.assertIn("branch ahead", task.last_message)
+
+    def test_settle_stops_turning_after_the_rotation_target(self):
+        """A21b：转到位之后 SETTLE 不许再带角速度 —— 实测它会把线越推越远。
+
+        22:20 那次 settle 全程 y = -10.3°/s，线在画面里从 e=+0.41 漂到 +0.76。
+        """
+        steep = approach_frame(fork_y=290, far_y=120, reach=300)   # 左分支 ≈ -18.7°
+        settings = JunctionConfig(turn_timeout=6.0, turn_min_duration=0.2, settle_timeout=3.0)
+        task = GreenJunctionTask(
+            settings=settings, light_probe=lambda frame, now: green(Branch.LEFT)
+        )
+        now = 1200.0
+        for index in range(40):
+            now += FRAME_DT
+            task.step(packet(steep, index + 1, now), now, fake_line(error=0.9))
+            if task.state is JunctionState.SETTLE:
+                break
+        self.assertIs(task.state, JunctionState.SETTLE)
+        rotated = abs(task._turn_rotated_deg)
+        for index in range(5):
+            now += FRAME_DT
+            update = task.step(packet(steep, 200 + index, now), now, fake_line(error=0.9))
+            if task.state is JunctionState.SETTLE:
+                self.assertEqual(update.motion.yaw, 0.0, "SETTLE 里不许继续转")
+                self.assertLessEqual(update.motion.forward, task.settings.forward_speed)
+        self.assertAlmostEqual(abs(task._turn_rotated_deg), rotated, places=6)
 
     def test_rotation_target_does_not_grow_in_settle(self):
         """转到目标之后就不要再自己加转：SETTLE 里只允许缓出的残余量。"""

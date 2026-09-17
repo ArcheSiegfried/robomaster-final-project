@@ -1369,6 +1369,10 @@ class LampSpotter:
 #: 太大会冲过目标，0.25 是拿实测 yaw 曲线配的。
 _TURN_EASE_FLOOR = 0.25
 
+#: 转到位之后 SETTLE 阶段的爬行速度系数（A21b）：只往前走一点点让线回到
+#: 近处视野里，绝不带角速度（带角速度实测会把线推出画面）。
+_SETTLE_CREEP = 0.3
+
 
 def _straightest(branches: Sequence[BranchGeometry]) -> Optional[BranchGeometry]:
     if not branches:
@@ -1693,6 +1697,17 @@ class GreenJunctionTask:
         if bearing is None:
             bearing = self.chosen_bearing_deg or 0.0
         target = float(bearing)
+        # 转到位之后**不再加转**（A21b，2026-09-17 22:20 实测）：残余角速度会让
+        # 线在画面里越跑越远（settle 期间 y 恒为 -10.3°/s，e 从 +0.41 涨到 +0.76），
+        # 于是"线回中央"永远等不到、白等到 settle_timeout 失败。
+        if not self._turn_still_needed():
+            creep = (
+                settings.forward_speed * _SETTLE_CREEP
+                if self.state is JunctionState.SETTLE
+                else 0.0
+            )
+            self._turn_last_at = now
+            return MotionCommand(forward=creep, lateral=0.0, yaw=0.0)
         gain_yaw = target * settings.yaw_gain
         limit = abs(settings.max_turn_yaw)
         gain_yaw = max(-limit, min(limit, gain_yaw))
@@ -2062,10 +2077,25 @@ class GreenJunctionTask:
             return self._failed("task total timeout while settling")
 
         centered, line_source = self._line_centered(frame, now)
-        stable = centered and self._turn_elapsed(now) >= settings.turn_min_duration
+        # A21b：岔路口上"线回中央"这个判据**根本不可能成立** —— 路口处整条 Y 形
+        # 是**一个**连通块（离线对照：`junction_frame` 的 conf=1.00 就是整块 Y），
+        # 近处窄带里也常是劈开的两条，所以 2026-09-17 22:20 那次 settle 整整
+        # 1.5 秒都等不到、最后 `line did not return after the turn` 失败。
+        # 因此这里补一条等价判据：**选中分支已经在车头正前方**（当前帧算出来的
+        # 偏角收敛到 branch_align_deg 以内）就算进了分支，交回巡线去跟。
+        live = self.chosen_bearing_deg
+        aligned = live is not None and abs(live) <= settings.branch_align_deg
+        stable = (
+            (centered or aligned)
+            and self._turn_elapsed(now) >= settings.turn_min_duration
+        )
         if stable:
             self._rearm_ready_at = now + settings.rearm_cooldown
-            return self._completed("junction passed; line reacquired (%s)" % line_source)
+            return self._completed(
+                "junction passed; %s"
+                % ("line reacquired (%s)" % line_source
+                   if centered else "branch ahead (%.1f deg)" % live)
+            )
 
         if self._elapsed(now) > settings.settle_timeout:
             return self._failed("line did not return after the turn (%s)" % line_source)
