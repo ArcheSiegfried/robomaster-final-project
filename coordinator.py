@@ -261,10 +261,43 @@ class TaskCoordinator:
             self._view_restore_failed = True
             self._view_ready_at = None
             return False
+        # 【v0.3 接口】出口可能只是把"回巡线视角"排进队列（上一个绝对动作还没跑完），
+        # 这时**不能**当成已恢复：保持"意图"，由每帧的 _poll_gimbal 补发，等出口自己
+        # 报告 at_line_view 之后才开始 settle 计时。老出口没有 at_line_view -> 视为已到位。
+        if not self._gimbal_at_line_view():
+            self._view_changed = True
+            self._view_ready_at = None
+            return True
         self._view_changed = False
         self._view_restore_failed = False
         self._view_ready_at = now + self.settings.gimbal_settle_seconds
         return True
+
+    def _gimbal_at_line_view(self) -> bool:
+        """出口是否真的停在巡线视角。老出口（无该属性）视为已到位，保持旧行为。"""
+        value = getattr(self.gimbal_output, "at_line_view", None)
+        if value is None:
+            return True
+        try:
+            return bool(value)
+        except Exception:
+            return True
+
+    def _poll_gimbal(self, errors) -> None:
+        """每帧推进一次云台出口（收割在飞动作 + 补发队列里的最新目标）。
+
+        【v0.3 接口】这一步必须**每帧、在任何状态分支之前**发生一次：出口在忙时只
+        排队不发送，如果没有周期性的 poll，队列里的"回巡线视角"就永远补发不出去，
+        车会一直停在 "waiting for gimbal to return to line view"（实车已复现）。
+        老出口没有 poll -> 什么都不做，行为与今天一致。绝不抛异常。
+        """
+        poll = getattr(self.gimbal_output, "poll", None)
+        if not callable(poll):
+            return
+        try:
+            poll()
+        except Exception as error:
+            errors.append(f"gimbal poll failed: {error}")
 
     # -- per-cycle entry point -----------------------------------------
     def step(self, frame: FramePacket, now: float) -> CoordinatorDecision:
@@ -272,6 +305,7 @@ class TaskCoordinator:
         delta = 0.0 if self._previous_frame_time is None else max(
             0.0, now - self._previous_frame_time)
         self._previous_frame_time = now
+        self._poll_gimbal(errors)
         self._observe(frame, now, errors)
 
         if self.active_task is not None:
@@ -496,6 +530,34 @@ class TaskCoordinator:
                 message="waiting for line-view restore",
                 errors=tuple(errors),
             )
+
+        # 【v0.3 接口】释放期间只做两件事，**不要每帧重发 restore**（那会在
+        # "已到位"和"重新发一次"之间无限循环，出口永远显示忙）：
+        #   1. 恢复请求在 _end_task 里已经发出（出口忙时它只是排进了队列），
+        #      由 step() 里的 _poll_gimbal 每帧把它补发出去；
+        #   2. 这里每帧检查出口是否真的回到了巡线视角，没到就继续停车等，
+        #      而且**有界**：超过 release_resume_timeout 转进既有的"需要人工复位"路径。
+        if self._view_changed:
+            self.output.hard_stop()
+            if self._gimbal_at_line_view():
+                self._view_changed = False
+                self._view_restore_failed = False
+                self._view_ready_at = now + self.settings.gimbal_settle_seconds
+            elif self._release_started is not None and (
+                now - self._release_started
+                > self.settings.tasks.release_resume_timeout
+            ):
+                self._view_restore_failed = True
+                errors.append("gimbal did not return to line view in time")
+            if self._view_changed:
+                return CoordinatorDecision(
+                    state=RELEASING,
+                    owner=self.output.owner,
+                    line=self.last_line_decision,
+                    command=STOP_COMMAND,
+                    message="waiting for gimbal to return to line view",
+                    errors=tuple(errors),
+                )
 
         if self._view_ready_at is not None and now < self._view_ready_at:
             self.output.hard_stop()
