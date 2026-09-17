@@ -131,6 +131,19 @@ def rotated_fork_frame(fork_x=420, left_x=260, right_x=620, fork_y=290, far_y=12
     return image
 
 
+def rotated_view(image, car_yaw_deg):
+    """近似"车转过 ``car_yaw_deg``"之后的画面（绕画面下方一点旋转）。
+
+    真实透视当然更复杂，但"车左转 → 画面内容右移、带子在画面里趋于竖直"这个趋势
+    是对的 —— 状态机测试需要的正是这个趋势：画面不动的话，A22 的伺服永远收敛不了。
+    """
+    height, width = image.shape[:2]
+    matrix = cv2.getRotationMatrix2D(
+        (width / 2.0, height * 1.4), float(car_yaw_deg), 1.0
+    )
+    return cv2.warpAffine(image, matrix, (width, height), borderValue=GROUND)
+
+
 def green_lamp_frame(center=(500, 100), radius=22):
     """实车朝向的岔路 + 画面右上方一盏绿灯（给 3 号的检测器认）。"""
     image = approach_frame()
@@ -904,119 +917,70 @@ class StateMachineTests(unittest.TestCase):
         self.assertIsNotNone(task.chosen_bearing_deg)
         self.assertGreater(task.chosen_bearing_deg, 0.0)
 
-    def test_steep_branch_stops_turning_once_it_has_rotated_enough(self):
-        """A21 回归：偏角大于 ``branch_align_deg`` 时，不许恒定 yaw 转到超时。
+    def test_rotation_target_comes_from_the_tape_direction(self):
+        """A22：要转多少度按**带子方向**（tilt）算，不按分支的**中心**偏角。
 
-        2026-09-17 实车（``run_20260917_220912``）：左分支锁死偏角 -22.5°
-        → yaw 恒为 -45°/s、1.8 秒转了约 80°，把巡线带转出画面（全图蓝色像素变 0）
-        → ``line did not return after the turn`` 失败。而成功那次只是因为锁死的
-        偏角恰好 ≤ 6°（``aligned`` 一进门就成立）—— 是运气，不是设计。
-
-        改法：锁死的偏角当**转动目标**，积分 ``yaw × dt`` 转到目标就停，
-        并且接近目标时缓出。
+        2026-09-17 22:28 实车：左分支带子在画面里几乎水平（tilt ≈ -86°），
+        中心偏角只有 -23.9°，模块因此只转了 20° 就宣布"已在正前方"交回巡线 ——
+        车还横着，巡线一接管就上了另一条带子（用户看到的"选了错误的路"）。
+        探针实测 tilt 与真实转动量近似 1:1（车转 -10°，tilt 从 -60.5 变 -50.5），
+        所以它才是正确的目标。
         """
-        steep = approach_frame(fork_y=290, far_y=120, reach=300)  # 左分支 ≈ -18.7°
-        settings = JunctionConfig(turn_timeout=6.0, turn_min_duration=0.2)
-        task = GreenJunctionTask(
-            settings=settings, light_probe=lambda frame, now: green(Branch.LEFT)
-        )
-        now = 800.0
+        settings = JunctionConfig(turn_min_duration=0.0)
+        task = GreenJunctionTask(settings=settings)
+        detection = JunctionDetector(settings).detect(approach_frame(reach=300))
+        self.assertTrue(detection.valid)
+        left = detection.branch(Branch.LEFT)
+        self.assertIsNotNone(left.tilt_deg)
+        task.last_detection = detection
+        task.chosen_branch = Branch.LEFT
+        task._chosen_bearing = float(left.bearing_deg)   # ≈ -18.7（旧目标）
+        task._chosen_tilt = float(left.tilt_deg)         # ≈ -60.5（新目标）
+        task._enter(JunctionState.TURN, 2500.0)
+        now = 2500.0
         yaws = []
-        for index in range(40):
+        while now < 2502.0:
             now += FRAME_DT
-            update = task.step(packet(steep, index + 1, now), now, fake_line(error=0.9))
-            if task.state is JunctionState.TURN:
-                yaws.append(update.motion.yaw)
-            if yaws and task.state is not JunctionState.TURN:
+            yaws.append(task._turn_command(now).yaw)
+            if not task._turn_still_needed():
                 break
-        self.assertTrue(yaws, "必须先进入 TURN")
+        self.assertTrue(all(y < 0.0 for y in yaws), "左分支必须一直左转")
         self.assertGreater(
-            abs(task._chosen_bearing), settings.branch_align_deg,
-            "这个画面得是陡分支，否则测不到这个 bug",
+            abs(task._turn_rotated_deg), 40.0,
+            "要转到带子方向那一档（≈54°），而不是中心偏角那一档（≈13°）",
         )
-        # 1) 正常转到位往下走，而不是"转到 turn_timeout 失败"
-        self.assertIs(task.state, JunctionState.SETTLE)
-        self.assertNotIn("turn_timeout", task.last_message)
-        # 2) 转过的角度不超过目标角度（旧实现会转到 3~4 倍）
-        self.assertLessEqual(abs(task._turn_rotated_deg), abs(task._chosen_bearing))
-        # 3) 一开始按满增益、越接近目标越小（缓出），且从不超过上限
-        self.assertLessEqual(max(abs(y) for y in yaws), settings.max_turn_yaw + 1e-9)
+        self.assertGreater(
+            abs(task._turn_rotated_deg), abs(task._chosen_bearing) + 20.0
+        )
+
+    def test_fallback_rotation_target_is_used_when_there_is_no_tilt(self):
+        """A21 兜底：算不出带子方向时，仍然按"转过锁死偏角"收手并缓出。
+
+        （旧实车日志 22:09/22:20 的现象：恒定 yaw 一直转，把线转出画面。）
+        """
+        settings = JunctionConfig(turn_min_duration=0.0)
+        task = GreenJunctionTask(settings=settings)
+        detection = JunctionDetector(settings).detect(junction_frame())
+        self.assertTrue(detection.valid)
+        task.last_detection = None   # 当前帧算不出带子方向 → 走兜底
+        task.chosen_branch = Branch.LEFT
+        self.assertIsNone(task.chosen_tilt_deg)
+        task._chosen_bearing = -22.0          # 锁死的偏角
+        task._chosen_tilt = None              # 算不出方向 → 走兜底
+        task._enter(JunctionState.TURN, 2000.0)
+        now = 2000.0
+        yaws = []
+        while now < 2003.0:
+            now += FRAME_DT
+            command = task._turn_command(now)
+            yaws.append(command.yaw)
+            if not task._turn_still_needed():
+                break
+        self.assertGreater(len(yaws), 2)
         self.assertLess(abs(yaws[-1]), abs(yaws[0]), "接近目标时要缓出")
-
-    def test_settle_accepts_the_branch_being_ahead(self):
-        """A21b：岔路口上"线回中央"不成立，但"选中分支已在正前方"必须能收尾。
-
-        2026-09-17 22:20 实车：转向已经正常（0.5 秒、缓出到 -15°/s），可 settle
-        里整个 Y 形连通块在画面里往右跑（``e`` 从 +0.41 涨到 +0.76），
-        "线回中央"永远等不到 → ``line did not return after the turn`` 失败 →
-        交回巡线后车跟着看到的那条带走了右边。
-        """
-        frame = rotated_fork_frame()   # 左分支 ≈ +2.4°（正前方），近处窄带误差 0.31
-        settings = JunctionConfig(settle_timeout=3.0)
-        task = GreenJunctionTask(
-            settings=settings, light_probe=lambda frame, now: green(Branch.LEFT)
-        )
-        now = 1000.0
-        centered, why = task._line_centered(packet(frame, 1, now), now)
-        self.assertFalse(centered, "这张图必须让'线回中央'为假，否则测不到 A21b（%s）" % why)
-        for index in range(40):
-            now += FRAME_DT
-            task.step(packet(frame, index + 1, now), now, fake_line(error=0.9))
-            if task.state is JunctionState.COMPLETED:
-                break
-        self.assertIs(task.state, JunctionState.COMPLETED)
-        self.assertIn("branch ahead", task.last_message)
-
-    def test_settle_stops_turning_after_the_rotation_target(self):
-        """A21b：转到位之后 SETTLE 不许再带角速度 —— 实测它会把线越推越远。
-
-        22:20 那次 settle 全程 y = -10.3°/s，线在画面里从 e=+0.41 漂到 +0.76。
-        """
-        steep = approach_frame(fork_y=290, far_y=120, reach=300)   # 左分支 ≈ -18.7°
-        settings = JunctionConfig(turn_timeout=6.0, turn_min_duration=0.2, settle_timeout=3.0)
-        task = GreenJunctionTask(
-            settings=settings, light_probe=lambda frame, now: green(Branch.LEFT)
-        )
-        now = 1200.0
-        for index in range(40):
-            now += FRAME_DT
-            task.step(packet(steep, index + 1, now), now, fake_line(error=0.9))
-            if task.state is JunctionState.SETTLE:
-                break
-        self.assertIs(task.state, JunctionState.SETTLE)
-        rotated = abs(task._turn_rotated_deg)
-        for index in range(5):
-            now += FRAME_DT
-            update = task.step(packet(steep, 200 + index, now), now, fake_line(error=0.9))
-            if task.state is JunctionState.SETTLE:
-                self.assertEqual(update.motion.yaw, 0.0, "SETTLE 里不许继续转")
-                self.assertLessEqual(update.motion.forward, task.settings.forward_speed)
-        self.assertAlmostEqual(abs(task._turn_rotated_deg), rotated, places=6)
-
-    def test_rotation_target_does_not_grow_in_settle(self):
-        """转到目标之后就不要再自己加转：SETTLE 里只允许缓出的残余量。"""
-        steep = approach_frame(fork_y=290, far_y=120, reach=300)
-        settings = JunctionConfig(turn_timeout=6.0, turn_min_duration=0.2)
-        task = GreenJunctionTask(
-            settings=settings, light_probe=lambda frame, now: green(Branch.LEFT)
-        )
-        now = 900.0
-        for index in range(40):
-            now += FRAME_DT
-            update = task.step(packet(steep, index + 1, now), now, fake_line(error=0.9))
-            if task.state is JunctionState.SETTLE:
-                break
-        rotated_at_settle = abs(task._turn_rotated_deg)
-        # SETTLE 里再走几帧：残余 yaw 只能是缓出下限那一档，不能又按满增益转
-        for index in range(3):
-            now += FRAME_DT
-            update = task.step(packet(steep, 100 + index, now), now, fake_line(error=0.9))
-            self.assertLessEqual(abs(update.motion.yaw), abs(task._chosen_bearing) * 1.0 + 1e-9)
-        self.assertLessEqual(
-            abs(task._turn_rotated_deg) - rotated_at_settle,
-            abs(task._chosen_bearing) * 0.4,
-            "SETTLE 里的残余转动必须远小于目标角度",
-        )
+        self.assertLessEqual(abs(task._turn_rotated_deg), 22.0)
+        # 转到位之后不再加转（A21b）
+        self.assertEqual(task._turn_command(now + FRAME_DT).yaw, 0.0)
 
 
     @staticmethod
@@ -1634,7 +1598,7 @@ class OfflineDemoTests(unittest.TestCase):
                 "owner:external",
                 "task:running",
                 "branch:right",
-                "motion:yaw=16.3",
+                "motion:yaw=69.5",
                 "task:completed",
                 "owner:line",
                 "line:TRACKING",

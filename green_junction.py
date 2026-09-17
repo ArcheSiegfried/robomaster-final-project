@@ -172,6 +172,7 @@ from enum import Enum
 from typing import Callable, List, Optional, Sequence, Tuple
 
 import inspect
+import math
 
 import cv2
 import numpy as np
@@ -702,6 +703,43 @@ class BranchGeometry:
     center: Tuple[float, float]
     bearing_deg: float      # 相对图像中心的偏角，右为正
     rows: int               # 参与统计的采样行数
+    #: 这条分支**带子的方向**在画面里偏离竖直的角度（0 = 车头已经和它平行）。
+    #: 符号：负 = 这条分支在左边（要左转），正 = 右边。见 A22。
+    #: 为什么不能只看 ``bearing_deg``：分支越横（越靠侧面），它的**中心**偏角越接近 0，
+    #: 而实际要转的角度越大 —— 2026-09-17 22:28 实车，左分支在画面里几乎是水平的
+    #: （(390,215)→(150,230)），中心偏角只有 -23.9°，模块转了 20° 就宣布"已在正前方"，
+    #: 结果车还横着，交回巡线后跟上了另一条带子。
+    tilt_deg: Optional[float] = None
+
+
+def _branch_tilt(
+    xs: Sequence[float],
+    ys: Sequence[float],
+    center_x: float,
+    frame_center: float,
+) -> Optional[float]:
+    """分支带子在画面里的**方向**（相对竖直的偏斜，度，带符号）。
+
+    用最小二乘拟合 ``x = a + b·y``：``b`` 就是这条线在画面里的斜率。
+    ``|b|`` 越大 = 线越横 = 车头与这条分支差得越多；``b≈0`` = 线在画面里竖直
+    = 车头已经和这条分支平行（这才是"对准了"的真正判据，而且不需要知道相机俯仰：
+    与相机光轴平行的地面直线，其消失点就在画面中线，成像是竖直的）。
+
+    符号取分支在画面左右哪一侧（中心偏角），**不用斜率的符号**：接近水平的分支
+    其斜率符号会指向反方向（实车那次左分支的斜率是负的），只有"在左/在右"可靠。
+    """
+    if len(xs) < 2 or len(xs) != len(ys):
+        return None
+    span = max(ys) - min(ys)
+    if span < 1.0:
+        return None
+    try:
+        slope = float(np.polyfit(np.asarray(ys, dtype=float), np.asarray(xs, dtype=float), 1)[0])
+    except Exception:
+        return None
+    tilt = abs(math.degrees(math.atan(slope)))
+    sign = -1.0 if center_x < frame_center else 1.0
+    return sign * min(tilt, 89.0)
 
 
 @dataclass(frozen=True)
@@ -1093,6 +1131,7 @@ class JunctionDetector:
                     center=(center_x, center_y),
                     bearing_deg=float(bearing),
                     rows=rows,
+                    tilt_deg=_branch_tilt(xs, ys, center_x, frame_center),
                 )
             )
         return result[0], result[1], "ok"
@@ -1543,6 +1582,7 @@ class GreenJunctionTask:
         self._rule_side: Optional[Branch] = None
         self._rule_side_count = 0
         self._chosen_bearing: Optional[float] = None
+        self._chosen_tilt: Optional[float] = None
         self._saw_green = False
         self._last_all_readings: List[LightReading] = []
         self._idle_since: Optional[float] = None
@@ -1576,6 +1616,34 @@ class GreenJunctionTask:
         branch = detection.branch(self.chosen_branch)
         return None if branch is None else branch.bearing_deg
 
+    @property
+    def chosen_tilt_deg(self) -> Optional[float]:
+        """**当前帧**算出的、选中分支带子的方向偏斜（A22）：0 = 车头已和它平行。
+
+        这是转向与"到位"判据的首选信号；看不到这条分支时返回 ``None``，
+        由调用方退回旧的中心偏角（:attr:`chosen_bearing_deg`）。
+        """
+        detection = self.last_detection
+        if detection is None or self.chosen_branch is None:
+            return None
+        branch = detection.branch(self.chosen_branch)
+        return None if branch is None else branch.tilt_deg
+
+    def _aligned_now(self) -> Tuple[bool, str]:
+        """车头是否已经和选中的分支平行（走得了这条分支）。
+
+        优先用**带子的方向**（tilt）—— 这才是"平行"的定义；只有算不出方向
+        （带子行数不够等）才退回旧的中心偏角判据。
+        """
+        limit = abs(self.settings.branch_align_deg)
+        tilt = self.chosen_tilt_deg
+        if tilt is not None:
+            return abs(tilt) <= limit, "tilt %+.1f deg" % tilt
+        bearing = self.chosen_bearing_deg
+        if bearing is not None:
+            return abs(bearing) <= limit, "bearing %+.1f deg" % bearing
+        return False, "no branch geometry"
+
     def reset(self) -> None:
         """回到初始状态，供 coordinator 在复位时调用。"""
         self.state = JunctionState.IDLE
@@ -1591,6 +1659,7 @@ class GreenJunctionTask:
         self._rule_side = None
         self._rule_side_count = 0
         self._chosen_bearing = None
+        self._chosen_tilt = None
         self._saw_green = False
         self._last_all_readings = []
         self._idle_since = None
@@ -1705,7 +1774,36 @@ class GreenJunctionTask:
         bearing = self._chosen_bearing
         if bearing is None:
             bearing = self.chosen_bearing_deg or 0.0
+        # 兜底路径的转向量也优先按"带子方向"来（锁定值，A22）。
+        if self._chosen_tilt is not None:
+            bearing = math.copysign(abs(float(self._chosen_tilt)), float(bearing))
         target = float(bearing)
+        # A22：有"带子方向"就用它做**伺服** —— 一直转到这条分支的带子在画面里
+        # 接近竖直（车头与带子平行）为止。tilt 是当前帧算出来的，所以车转过去的
+        # 过程中它会自己收敛到 0，转多少度由几何自己决定，不需要估。
+        live_tilt = self.chosen_tilt_deg
+        if live_tilt is not None and self.state in (JunctionState.TURN, JunctionState.SETTLE):
+            yaw = float(live_tilt) * settings.yaw_gain
+            limit = abs(settings.max_turn_yaw)
+            yaw = max(-limit, min(limit, yaw))
+            # 伺服路径同样要把"转过的角度"记下来：检测中途丢了（live tilt 变 None）
+            # 时靠它接着按差值收手，不然会退回一个过小的目标（A22）。
+            if self._turn_last_at is not None:
+                dt = now - self._turn_last_at
+                if 0.0 <= dt <= 0.25:
+                    self._turn_rotated_deg += yaw * dt
+            self._turn_last_at = now
+            if abs(live_tilt) <= settings.branch_align_deg:
+                creep = (
+                    settings.forward_speed * _SETTLE_CREEP
+                    if self.state is JunctionState.SETTLE
+                    else 0.0
+                )
+                return MotionCommand(forward=creep, lateral=0.0, yaw=0.0)
+            ratio = 0.0 if limit <= 0.0 else min(1.0, abs(yaw) / limit)
+            return MotionCommand(
+                forward=settings.forward_speed * ratio, lateral=0.0, yaw=yaw
+            )
         # 转到位之后**不再加转**（A21b，2026-09-17 22:20 实测）：残余角速度会让
         # 线在画面里越跑越远（settle 期间 y 恒为 -10.3°/s，e 从 +0.41 涨到 +0.76），
         # 于是"线回中央"永远等不到、白等到 settle_timeout 失败。
@@ -1741,11 +1839,24 @@ class GreenJunctionTask:
             yaw=yaw,
         )
 
+    def _rotation_target_deg(self) -> float:
+        """这一段转向的目标角度（A21/A22）。
+
+        优先用决策时锁下的分支**带子方向**（tilt）：探针实测它与车辆真实转动量
+        近似 1:1（车转 -10°，左分支 tilt 从 -60.5° 变 -50.5°），而分支**中心**偏角
+        严重低估（同一画面只有 -18.7°）。锁死的量在岔路检测中途丢失时仍然可用 ——
+        这正是 22:28 那次"只转 20° 就交回巡线"的兜底修正。
+        """
+        if self._chosen_tilt is not None:
+            return abs(float(self._chosen_tilt))
+        if self._chosen_bearing is not None:
+            return abs(float(self._chosen_bearing))
+        return 0.0
+
     def _turn_still_needed(self) -> bool:
         """还要不要继续转（A21）：转过目标角度减去 ``branch_align_deg`` 就够了。"""
-        target = 0.0 if self._chosen_bearing is None else abs(float(self._chosen_bearing))
         margin = max(0.0, float(self.settings.branch_align_deg))
-        return abs(self._turn_rotated_deg) < max(0.0, target - margin)
+        return abs(self._turn_rotated_deg) < max(0.0, self._rotation_target_deg() - margin)
 
     def _read_probe(self, frame: FramePacket, now: float) -> List[LightReading]:
         """这一帧的灯读数（0 / 1 / 2 盏都合法，见 A6/A15/A17）。
@@ -2027,6 +2138,8 @@ class GreenJunctionTask:
         # 把选中分支的偏角锁在这里：每帧重算的话，岔路几何一跳 yaw 就跟着跳
         # （2026-09-16 实测：yaw 在 -14 与 +36 之间来回，车会抖着转）。
         self._chosen_bearing = float(chosen.bearing_deg)
+        # A22：真正决定"要转多少"的是分支**带子的方向**（tilt），不是它的中心偏角。
+        self._chosen_tilt = chosen.tilt_deg
         self._enter(JunctionState.TURN, now)
         return self._running(
             now,
@@ -2051,22 +2164,24 @@ class GreenJunctionTask:
                 return self._failed("lost the junction while turning")
 
         centered, line_source = self._line_centered(frame, now)
-        # 三种"转到位"都算（A21）：
+        # 三种"转到位"都算（A21/A22）：
         #   1) 线回到画面中央（最可靠，能看见就直接用）；
-        #   2) **当前**这一帧算出来的分支偏角已经收敛（不是锁死的那个常量！）；
-        #   3) 已经转过的角度达到"锁死偏角 - branch_align_deg"（线看不见时的兜底）。
-        live = self.chosen_bearing_deg
-        aligned = live is not None and abs(live) <= settings.branch_align_deg
-        rotated = not self._turn_still_needed()
+        #   2) 选中分支的**带子方向**已经在画面里竖直（车头与它平行）；
+        #   3) 只有算不出带子方向时，才允许"已转过锁死的偏角"当兜底 ——
+        #      算得出方向时它不能当退出条件，否则又会出现"A22 那次转了 20° 就
+        #      宣布已在正前方、其实还横着"的错。
+        aligned, aligned_why = self._aligned_now()
+        # 只有当**当前帧再也算不出带子方向**（检测丢了）时，才允许"转过目标角度"
+        # 当退出条件；方向还看得见时，唯一标准就是那条带子竖直了。
+        rotated = self.chosen_tilt_deg is None and not self._turn_still_needed()
         settled = (
             self._turn_elapsed(now) >= settings.turn_min_duration
             and (centered or aligned or rotated)
         )
         if settled:
             self._enter(JunctionState.SETTLE, now)
-            whose = "line" if centered else (
-                "bearing %.1f deg" % live if aligned else "rotated %.1f deg" % self._turn_rotated_deg
-            )
+            whose = "line" if centered else (aligned_why if aligned
+                                             else "rotated %.1f deg" % self._turn_rotated_deg)
             return self._running(
                 now,
                 "branch entered, checking line stability (%s)" % whose,
@@ -2093,7 +2208,7 @@ class GreenJunctionTask:
         # 因此这里补一条等价判据：**选中分支已经在车头正前方**（当前帧算出来的
         # 偏角收敛到 branch_align_deg 以内）就算进了分支，交回巡线去跟。
         live = self.chosen_bearing_deg
-        aligned = live is not None and abs(live) <= settings.branch_align_deg
+        aligned, aligned_why = self._aligned_now()
         stable = (
             (centered or aligned)
             and self._turn_elapsed(now) >= settings.turn_min_duration
@@ -2103,7 +2218,7 @@ class GreenJunctionTask:
             return self._completed(
                 "junction passed; %s"
                 % ("line reacquired (%s)" % line_source
-                   if centered else "branch ahead (%.1f deg)" % live)
+                   if centered else "branch aligned (%s)" % aligned_why)
             )
 
         if self._elapsed(now) > settings.settle_timeout:
