@@ -58,6 +58,7 @@ python main.py
 - [LEAD_AGENT_GUIDE.md](LEAD_AGENT_GUIDE.md)：负责人日常组织、合并和代码 Agent 使用指令。
 - [DELIVERABLES.md](DELIVERABLES.md)：开发过程应保留的最终交付材料。
 - [VERIFICATION.md](VERIFICATION.md)：实际执行过的离线验证及其边界。
+- [FORK_MODE.md](FORK_MODE.md)：当前只启用“岔路单侧绿灯，选择绿灯侧”的场地布置及安全边界。
 - [.github/pull_request_template.md](.github/pull_request_template.md)：PR 必填检查项。
 
 协作流固定为：`任务分支 → PR 到 integration → 离线/实车联调 → integration 合入 main → 稳定标签`。普通成员不得直接向 `main` 或 `integration` 推送业务修改。
