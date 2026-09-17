@@ -26,12 +26,16 @@ from free_junction import (  # noqa: E402
     BLOCKAGE_BOTH,
     BLOCKAGE_LEFT,
     BLOCKAGE_NONE,
+    BLOCKAGE_RIGHT,
     Branch,
+    ForkDetection,
     FreeJunctionConfig,
     FreeJunctionDetector,
     FreeJunctionTask,
     JunctionState,
     VehicleDetector,
+    _fork_rows,
+    _separated_runs,
 )
 from models import FramePacket, TaskStatus  # noqa: E402
 
@@ -55,9 +59,11 @@ class FreeJunctionContractTests(unittest.TestCase):
 # 合成帧与真机同坐标系：360x640 BGR，蓝色胶带 HSV 约 (120,255,255)。
 # 默认 ROI 是 x 6%~94%、y 54%~96% → x 38~601、y 194~345。
 #
-# v2 的判据换了（见 free_junction.py 的 A5/A6）：
-#   "拥堵" = 那条分支的走廊里停着一辆同型小车（结构判据，不看颜色）。
-# 所以下面的"车"都画成**硬边缘的深色车体 + 亮顶盖**，而不是 v1 那种一片暗色块。
+# v2/v3 的判据（见 free_junction.py 的 A5/A6）：
+#   "拥堵" = 那条分支的走廊里停着一辆**大疆 RoboMaster S1 / EP 小车**。
+#   判据就是这辆车的样貌：**深色车体 + 高饱和彩色装甲/灯**（真车实测：
+#   车 深色 0.61~0.70 / 彩色 0.25~0.34，空地彩色 0.000）。
+# 所以下面的"车"都画成**深色车体 + 两侧彩色装甲**，而不是 v1 那种一片暗色块。
 #
 # 覆盖（对应 TASKS.md 的"三类场景各自触发/完成/失败可说明"）：
 #   [x] 岔路判据：与"只有一条线"、与"被竖直噪声切开的粗带"区分；远的/偏的岔路也要能认出来
@@ -71,18 +77,28 @@ class FreeJunctionContractTests(unittest.TestCase):
 BLUE = (255, 0, 0)          # BGR 里的纯蓝
 FLOOR = 210                 # 浅色地面
 CAR_BODY = (55, 55, 55)     # 车体：深色、硬边缘
-CAR_TOP = (150, 150, 150)   # 顶盖亮条：让候选框内部也有结构
+CAR_TOP = (150, 150, 150)   # 顶盖亮条
+CAR_ARMOR_RED = (0, 0, 255)    # 装甲/灯：高饱和彩色（S1/EP 的特征之一）
+CAR_ARMOR_GREEN = (0, 255, 0)  # 另一种装甲色（故意不用蓝：蓝是胶带的颜色）
 
-#: 停在左/右分支上的"车"（画面坐标）。都落在走廊偏下的位置，且不压住分叉行。
-CAR_LEFT_BOX = (220, 230, 300, 285)
-CAR_RIGHT_BOX = (340, 230, 420, 285)
+#: 停在左/右分支上的"车"（画面坐标）。尺寸**按真车比例**来：
+#: 2026-09-16 真车画面里那辆车在检测区域里约占 宽0.39 / 高0.36，这里取 120x100
+#: （检测区域约 282x273）→ 比例接近，才测得出闸门该不该过。
+CAR_LEFT_BOX = (150, 150, 270, 250)
+CAR_RIGHT_BOX = (370, 150, 490, 250)
 
 
 def draw_car(image, box):
-    """画一辆"停着的同型小车"：深色车体 + 亮顶盖，边缘很硬。"""
+    """画一辆"停着的同型小车"：**深色车体 + 两侧高饱和彩色装甲**。
+
+    这两条正是 2026-09-16 从真车画面上量出来的 S1/EP 特征
+    （车：深色 0.61~0.70、高饱和彩色 0.25~0.34；空地：0.000）。
+    装甲故意用**红/绿**（不用蓝）：蓝色是胶带的颜色，会被判据当成胶带抠掉。
+    """
     x0, y0, x1, y1 = box
     cv2.rectangle(image, (x0, y0), (x1, y1), CAR_BODY, -1)
-    cv2.rectangle(image, (x0 + 5, y0 + 5), (x1 - 5, y0 + 15), CAR_TOP, -1)
+    cv2.rectangle(image, (x0 + 2, y0 + 2), (x0 + 14, y1 - 2), CAR_ARMOR_RED, -1)      # 左装甲
+    cv2.rectangle(image, (x1 - 14, y0 + 2), (x1 - 2, y1 - 2), CAR_ARMOR_GREEN, -1)    # 右装甲
 
 
 def fork_frame(car_left=False, car_right=False, stem_top=300, tips=(200, 440), x=320):
@@ -99,10 +115,28 @@ def fork_frame(car_left=False, car_right=False, stem_top=300, tips=(200, 440), x
 
 
 def noise_split_frame():
-    """一条很宽的带子被"竖直噪声"等宽切开：上下间距完全一样，不是岔路。"""
+    """一条很宽的带子被"竖直噪声"等宽切开：上下间距完全一样，不是岔路。
+
+    注意 `cv2.rectangle` 的颜色必须写成**三元组**：给标量 `FLOOR`（一个 int）时，
+    OpenCV 只往第一个通道写，填出来是 `[210,0,0]` —— 那**仍然是蓝色**（HSV 在蓝线
+    区间内），于是"被切开的带子"根本没被切开，这条测试就成了空转（2026-09-17 发现）。
+    """
     image = np.full((360, 640, 3), FLOOR, np.uint8)
     cv2.rectangle(image, (290, 194), (350, 350), BLUE, -1)
-    cv2.rectangle(image, (305, 194), (335, 350), FLOOR, -1)
+    cv2.rectangle(image, (305, 194), (335, 350), (FLOOR, FLOOR, FLOOR), -1)
+    return image
+
+
+def edge_fork_frame():
+    """右分支一直伸到 ROI 右边缘之外。
+
+    加速版的整列扫描最初就是漏了这种"某一段贴着边缘"的行（数段数时少算一段），
+    真车画面里踩到过：同一帧旧版认得出岔路、新版认不出。这个帧专门守这个 bug。
+    """
+    image = np.full((360, 640, 3), FLOOR, np.uint8)
+    cv2.rectangle(image, (548, 300), (572, 350), BLUE, -1)
+    cv2.line(image, (560, 300), (200, 190), BLUE, 18)
+    cv2.line(image, (560, 300), (700, 170), BLUE, 18)
     return image
 
 
@@ -124,6 +158,22 @@ def run_task(task, image, frames=400, dt=0.05, start=1.0):
     records = run_with_states(task, image, frames=frames, dt=dt, start=start)
     updates = [update for _state, update, _now in records]
     return updates, (records[-1][2] if records else start)
+
+
+def drive_sequence(task, phases, dt=0.05, start=1.0):
+    """按顺序喂不同的画面：phases = [(图, 帧数), ...]，记下 (状态, 更新, 时间)。"""
+    records = []
+    now = start
+    sequence = 1
+    for image, count in phases:
+        for _ in range(count):
+            update = task.step(FramePacket(image, sequence, now), now)
+            records.append((task.state, update, now))
+            sequence += 1
+            now += dt
+            if update.status in (TaskStatus.COMPLETED, TaskStatus.FAILED):
+                return records
+    return records
 
 
 def turn_yaws(records):
@@ -213,12 +263,121 @@ class VehicleDetectorTests(unittest.TestCase):
         blocked, _score, _box = VehicleDetector().detect(region, None)
         self.assertFalse(blocked)
 
+    def test_a_clean_tape_is_not_a_vehicle(self):
+        """**2026-09-16 真车 bug 的回归测试**：干净的蓝带不许被当成一辆车。
+
+        当时的现象：左侧分支停着一辆车（真堵），右侧空着；模块却报"右侧有车"，
+        于是选了左边那条堵的。根因是胶带边缘的抗锯齿像素不在 HSV 掩码里，
+        抹不干净 → Canny 把胶带自己的轮廓当成"硬边物体" → 外接框过了形状判据。
+        修法：找车之前把蓝带按 `tape_clear_px` 膨胀后再抹平（见 structure_mask）。
+        """
+        region = np.full((150, 280, 3), FLOOR, np.uint8)
+        cv2.line(region, (40, 149), (200, 0), BLUE, 16)          # 斜穿走廊的一条胶带
+        region = cv2.GaussianBlur(region, (5, 5), 0)             # 真实相机感：边缘是软的
+        detector = FreeJunctionDetector()
+        line = detector.blue_mask(region)
+        self.assertGreater(float(line.mean()), 0.0, "掩码应该有东西")
+        blocked, score, box = VehicleDetector().detect(region, line)
+        self.assertFalse(
+            blocked,
+            "干净的蓝带自己就被判成车了（真车上会因此选错边）：证据=%.3f 框=%s"
+            % (score, box),
+        )
+
+    def test_a_plain_dark_block_is_not_a_robot(self):
+        """**要求 2 的回归测试**：光"深色一大块"不算堵，必须是 S1/EP 那种
+        "深色车体 + 高饱和彩色装甲/灯"。
+
+        真车实测：空地的高饱和像素占比是 **0.000**，花岗岩地砖、影子、暗墙都进不来。
+        """
+        settings = FreeJunctionConfig()
+        detector = FreeJunctionDetector(settings)
+        vehicle = VehicleDetector(settings)
+        region = np.full((150, 280, 3), FLOOR, np.uint8)
+        cv2.rectangle(region, (70, 40), (210, 120), CAR_BODY, -1)     # 只有深色，没有彩色
+        blocked, score, box = vehicle.detect(region, detector.blue_mask(region))
+        self.assertFalse(blocked, "只有深色、没有彩色装甲，不该判成车: %s %s" % (score, box))
+
+        # 同一块地方，加上两条高饱和彩色装甲 → 应该判成车
+        draw_car(region, (70, 40, 210, 120))
+        blocked2, score2, box2 = vehicle.detect(region, detector.blue_mask(region))
+        self.assertTrue(blocked2, "深色车体 + 彩色装甲应该判成车，实际 %s %s" % (score2, box2))
+
     def test_skin_like_blob_is_rejected(self):
         """手/皮肤色占比过半的候选丢掉（同 obstacle.py 的现场教训）。"""
         region = np.full((200, 200, 3), FLOOR, np.uint8)
         cv2.rectangle(region, (60, 120), (150, 190), (120, 150, 200), -1)  # 肤色 BGR
         blocked, _score, _box = VehicleDetector().detect(region, None)
         self.assertFalse(blocked)
+
+
+    def test_a_wall_band_with_a_bit_of_colour_is_not_a_vehicle(self):
+        """**换场地后的误报**（2026-09-17 19:05/19:06）：墙 + 墙脚阴影带 + 木门。
+
+        那条暗带会横跨整条走廊，木门的彩色把它"点亮" → 原来过了闸门，
+        于是空的那一侧也被判成"有车"，日志里出现 `both branches blocked`。
+        实测：真车候选面积占比 ≤ 0.66，这条误报 0.84~0.85 —— 用面积上限挡掉。
+        """
+        settings = FreeJunctionConfig()
+        detector = FreeJunctionDetector(settings)
+        vehicle = VehicleDetector(settings)
+        region = np.full((136, 300, 3), FLOOR, np.uint8)
+        # 暗带占走廊的大部分（宽 250 × 高 130 / 300×136 ≈ 0.80），只有一小块彩色
+        cv2.rectangle(region, (10, 5), (260, 135), CAR_BODY, -1)
+        cv2.rectangle(region, (200, 40), (250, 90), CAR_ARMOR_RED, -1)   # 木门那点彩色
+        blocked, score, box = vehicle.detect(region, detector.blue_mask(region))
+        self.assertFalse(
+            blocked,
+            "墙裙那条大暗带被当成车了（真车面积上限 0.75）：证据=%.3f 框=%s" % (score, box),
+        )
+
+        # 同一块地方，把它缩成"车那么大"（占走廊约 0.3）→ 应该判成车
+        small = np.full((136, 300, 3), FLOOR, np.uint8)
+        cv2.rectangle(small, (60, 40), (170, 110), CAR_BODY, -1)
+        cv2.rectangle(small, (64, 44), (76, 106), CAR_ARMOR_RED, -1)
+        cv2.rectangle(small, (154, 44), (166, 106), CAR_ARMOR_GREEN, -1)
+        blocked2, score2, box2 = vehicle.detect(small, detector.blue_mask(small))
+        self.assertTrue(blocked2, "车那么大的深色块+装甲应该判成车：%s %s" % (score2, box2))
+
+    def test_a_large_blob_is_a_vehicle_only_with_enough_colour_on_it(self):
+        """大块候选（面积 ≥ 0.5）要"彩色够多"才算车 —— 车和墙连成一块时也要认得出。
+
+        这条规则是为了同时满足两头（2026-09-17 换场地后实测）：
+          * 墙裙那条大暗块：彩色 0.074 → **挡掉**；
+          * 车和墙连成一块的真检测：彩色 0.22~0.27、面积 0.7~0.8 → **照旧认出**。
+
+        注意"彩色"用的是**细灯条**：真车（S1/EP）的装甲灯就是细条/小块，
+        掩码只把离深色车体一个核半径以内的彩色像素并进来，所以大面积纯色块的
+        内部不会被计入 —— 这是照着实物标定的，不是缺陷。
+        """
+        settings = FreeJunctionConfig()
+        detector = FreeJunctionDetector(settings)
+        vehicle = VehicleDetector(settings)
+
+        def bars(image, y0, y1, colour, thickness=6):
+            for y in range(y0, y1, 22):
+                cv2.rectangle(image, (20, y), (250, y + thickness), colour, -1)
+
+        # 大块 + 细灯条够多（≈车和墙连成一块）→ 判成车
+        merged = np.full((136, 300, 3), FLOOR, np.uint8)
+        cv2.rectangle(merged, (5, 5), (265, 130), CAR_BODY, -1)
+        bars(merged, 14, 128, CAR_ARMOR_RED)
+        bars(merged, 25, 128, CAR_ARMOR_GREEN)
+        blocked, score, box = vehicle.detect(merged, detector.blue_mask(merged))
+        self.assertTrue(
+            blocked,
+            "车和墙连成一块的大候选（彩色够多）不该被挡：证据=%.3f 框=%s" % (score, box),
+        )
+
+        # 同样大的块，但彩色只有一小条（≈墙裙 + 木门）→ 不是车
+        wall = np.full((136, 300, 3), FLOOR, np.uint8)
+        cv2.rectangle(wall, (5, 5), (265, 130), CAR_BODY, -1)
+        cv2.rectangle(wall, (232, 40), (256, 46), CAR_ARMOR_RED, -1)
+        blocked2, score2, box2 = vehicle.detect(wall, detector.blue_mask(wall))
+        self.assertFalse(
+            blocked2,
+            "大块但彩色很少（墙裙+门）不该判成车：证据=%.3f 框=%s" % (score2, box2),
+        )
 
 
 class ChoosingBranchTests(unittest.TestCase):
@@ -346,24 +505,51 @@ class OwnershipAndTimingTests(unittest.TestCase):
         self.assertIn("time budget", task.last_message)
         self.assertEqual(updates[-1].motion.forward, 0.0)
 
-    def test_lost_line_while_owning_control_stops_the_car(self):
+    def test_lost_line_while_deciding_stops_the_car(self):
+        """原地等判据的时候整条线不见了 → 停车认输（这一段必须看得见线）。"""
+        settings = FreeJunctionConfig(decide_timeout=2.0)
+        task = FreeJunctionTask(settings=settings)
+        blank = np.full((360, 640, 3), FLOOR, np.uint8)
+        records = drive_sequence(
+            task, [(fork_frame(car_left=True, car_right=True), 10), (blank, 20)]
+        )
+        updates = [update for _state, update, _now in records]
+        self.assertIs(updates[-1].status, TaskStatus.FAILED)
+        self.assertIn("line lost", task.last_message)
+        self.assertEqual(updates[-1].motion.forward, 0.0)
+
+    def test_lost_line_during_the_turn_does_not_stop_the_car(self):
+        """**2026-09-16 真车 bug 的回归测试**：转弯/出岔路时胶带跑出 ROI 不算丢线。
+
+        当时的现象：两次都在 TURN/EXIT 里走了 0.8 秒就 FAILED 停在岔路口中间。
+        车头一转，胶带本来就可能不在画面里了 —— 那不是"线没了"，不该停车。
+        """
         task = FreeJunctionTask()
         blank = np.full((360, 640, 3), FLOOR, np.uint8)
-        image = fork_frame(car_left=True)
-        now = 1.0
-        for index in range(8):
-            task.step(FramePacket(image, index + 1, now), now)
-            now += 0.05
-        self.assertTrue(task.active, "前几帧应该已经接管")
-        last = None
-        for index in range(10):
-            last = task.step(FramePacket(blank, 100 + index, now), now)
-            now += 0.05
-            if last.status is TaskStatus.FAILED:
-                break
-        self.assertIs(last.status, TaskStatus.FAILED)
-        self.assertIn("line lost", task.last_message)
-        self.assertEqual(last.motion.forward, 0.0)
+        records = drive_sequence(task, [(fork_frame(car_left=True), 30), (blank, 80)])
+        updates = [update for _state, update, _now in records]
+        self.assertIs(updates[-1].status, TaskStatus.COMPLETED)
+        self.assertNotIn("line lost", task.last_message)
+
+    def test_turn_ends_early_once_the_tape_is_back_in_the_centre(self):
+        """线已经回到车头正前方 → 转向提前收工，不在原地多拧几十度。"""
+        task = FreeJunctionTask()
+        records = drive_sequence(
+            task, [(fork_frame(car_left=True), 30), (line_frame(), 40)]
+        )
+        turn_at = exit_at = None
+        for state, _update, now in records:
+            if state is JunctionState.TURN and turn_at is None:
+                turn_at = now
+            if state is JunctionState.EXIT and exit_at is None:
+                exit_at = now
+        self.assertIsNotNone(turn_at, "应该进入转向阶段")
+        self.assertIsNotNone(exit_at, "应该进入出岔路阶段")
+        self.assertLess(
+            exit_at - turn_at,
+            task.settings.turn_seconds,
+            "线已经回中央了，还在按时间把角度转满",
+        )
 
     def test_missing_frame_while_owning_control_fails(self):
         task = FreeJunctionTask()
@@ -475,6 +661,522 @@ class ReArmTests(unittest.TestCase):
             now += 0.05
             again.append(task.step(FramePacket(image, 700 + index, now), now).status)
         self.assertIn(TaskStatus.RUNNING, again, "下一个岔路应该还能接管")
+
+
+class _FakeCandidate(object):
+    """模仿 `number_marker.MarkerCandidate` 的鸭子类型对象（只带本模块要用的字段）。"""
+
+    def __init__(self, center, width, height, observed_at=None, target_id=""):
+        self.center = center
+        self.width = width
+        self.height = height
+        self.observed_at = observed_at
+        self.target_id = target_id
+
+
+class OfficialSdkCriterionTests(unittest.TestCase):
+    """**官方 SDK 识别结果当判据**（`blockage_source="sdk"`）。
+
+    官方读数走的是 `main.py` 的 `feed_marker_observations()` → 任务上的
+    `update_candidates()`（和 6 号 `number_marker` 同一条通路），
+    本模块只消费纯数据、不碰 SDK。所以这里全部用假读数离线验证。
+
+    重点证明一件事：**这条路上判据只有官方读数** ——
+    画面里没有车（`fork_frame()`）也能判对，画面里画了车也不作数。
+    """
+
+    def _task(self, **overrides):
+        settings = FreeJunctionConfig(blockage_source="sdk", **overrides)
+        return FreeJunctionTask(settings)
+
+    def _replay(self, task, image, sightings, frames=200, dt=0.05, start=1.0):
+        """和 main.py 同序：**每帧先把官方读数推给任务，再 step**。"""
+        records = []
+        now = start
+        for index in range(frames):
+            task.update_candidates(sightings, now=now)
+            update = task.step(FramePacket(image, index + 1, now), now)
+            records.append((task.state, update, now))
+            now += dt
+            if update.status in (TaskStatus.COMPLETED, TaskStatus.FAILED):
+                break
+        return records
+
+    def test_official_reading_on_the_left_takes_the_right_branch(self):
+        """官方在左分支报出一辆车 —— 画面里**没有**画车，照样走右边。"""
+        task = self._task()
+        records = self._replay(task, fork_frame(), [(0.20, 0.40, 0.18, 0.26)])
+        updates = [update for _state, update, _now in records]
+        self.assertIs(updates[-1].status, TaskStatus.COMPLETED)
+        self.assertIs(task.chosen_branch, Branch.RIGHT)
+        self.assertEqual(task.last_blockage.source, "sdk")
+        self.assertIn("official detector", task.last_reason)
+        self.assertTrue(all(yaw > 0 for yaw in turn_yaws(records)), turn_yaws(records))
+
+    def test_official_reading_on_the_right_takes_the_left_branch(self):
+        task = self._task()
+        records = self._replay(task, fork_frame(), [(320.0, 180.0, 120.0, 90.0)])
+        updates = [update for _state, update, _now in records]
+        self.assertIs(updates[-1].status, TaskStatus.COMPLETED)
+        self.assertIs(task.chosen_branch, Branch.LEFT)
+        self.assertTrue(all(yaw < 0 for yaw in turn_yaws(records)), turn_yaws(records))
+
+    def test_the_picture_is_not_a_criterion_in_this_mode(self):
+        """画面上有车（画面判据会判"堵"），但官方没读数 → **不接管**。
+
+        这就是要求里"不要拿长宽高/颜色/形状当判据"的回归测试。
+        """
+        task = self._task()
+        for _state, update, _now in self._replay(task, fork_frame(car_left=True), (), frames=60):
+            self.assertIs(update.status, TaskStatus.NOT_TRIGGERED)
+
+    def test_snapshot_expiry_does_not_revive_the_criterion(self):
+        """过期的官方读数不能被当成判据（宁可没有判据，也不拿旧读数选路）。"""
+        task = self._task()
+        now = 1.0
+        stale = [(0.20, 0.40, 0.18, 0.26)]
+        for index in range(40):
+            task.update_candidates(stale, now=now - 1.0)      # 时间戳整整旧了 1 秒
+            update = task.step(FramePacket(fork_frame(), index + 1, now), now)
+            self.assertIs(update.status, TaskStatus.NOT_TRIGGERED)
+            now += 0.05
+        # 换成新鲜读数 → 立刻恢复正常
+        records = self._replay(task, fork_frame(), stale, start=now, frames=200)
+        self.assertIs(records[-1][1].status, TaskStatus.COMPLETED)
+
+    def test_reading_outside_the_corridor_band_is_ignored(self):
+        """带外（画面最下方的自家车头 / 最上方的背景 / ROI 之外）的读数不算数。"""
+        outside = [
+            (0.20, 0.95, 0.18, 0.10),     # 太靠下：自家车头那一带
+            (0.20, 0.02, 0.18, 0.06),     # 太靠上：背景
+            (0.01, 0.40, 0.02, 0.10),     # 落在岔路 ROI 横向范围之外
+        ]
+        for sighting in outside:
+            task = self._task()
+            records = self._replay(task, fork_frame(), [sighting], frames=40)
+            self.assertIs(
+                records[-1][1].status, TaskStatus.NOT_TRIGGERED,
+                "带外的读数不该成为判据: %s" % (sighting,),
+            )
+
+    def test_readings_on_both_sides_fail_instead_of_guessing(self):
+        task = self._task()
+        records = self._replay(
+            task, fork_frame(), [(0.20, 0.40, 0.18, 0.26), (0.80, 0.40, 0.18, 0.26)]
+        )
+        self.assertIs(records[-1][1].status, TaskStatus.FAILED)
+        self.assertIn("both branches", task.last_reason)
+
+    def test_normalized_and_pixel_readings_agree(self):
+        """归一化坐标和像素坐标说的是同一件事（SDK 文档没写用哪种，两种都要认）。"""
+        pixel = self._task()
+        pixel_records = self._replay(pixel, fork_frame(), [(128.0, 144.0, 115.0, 94.0)])
+        normalized = self._task()
+        normalized_records = self._replay(
+            normalized, fork_frame(), [(0.20, 0.40, 0.18, 0.26)]
+        )
+        for records in (pixel_records, normalized_records):
+            self.assertIs(records[-1][1].status, TaskStatus.COMPLETED)
+        self.assertIs(pixel.chosen_branch, Branch.RIGHT)
+        self.assertIs(normalized.chosen_branch, Branch.RIGHT)
+        self.assertEqual(pixel.last_sdk_mode, "pixels")
+        self.assertEqual(normalized.last_sdk_mode, "normalized")
+
+    def test_pushed_shapes_are_all_understood(self):
+        """三种推送写法都认：`(x,y,w,h)`、`(x,y,w,h,标签)`、`MarkerCandidate` 那样的对象。"""
+        for label, sighting in (
+            ("4 元组（机器人识别）", (0.20, 0.40, 0.18, 0.26)),
+            ("5 元组（视觉标签）", (0.20, 0.40, 0.18, 0.26, "3")),
+            ("对象（number_marker 的候选）", _FakeCandidate((0.20, 0.40), 0.18, 0.26, 1.0, "3")),
+        ):
+            task = self._task()
+            records = self._replay(task, fork_frame(), [sighting])
+            self.assertIs(
+                records[-1][1].status, TaskStatus.COMPLETED,
+                "这种推送写法没被认出来: %s" % label,
+            )
+            self.assertIs(task.chosen_branch, Branch.RIGHT, label)
+
+    def test_the_default_source_prefers_the_official_reading(self):
+        """**默认配置下官方 SDK 的读数说了算**（要求：判据用官方机器人识别）。
+
+        画面里"左支有车"、官方读数却说右边有车 —— 默认必须听**官方**的
+        （走左边），而且读数来源标成 `sdk`。
+        """
+        task = FreeJunctionTask()                    # 默认 blockage_source="sdk_or_vision"
+        self.assertEqual(task.settings.blockage_source, "sdk_or_vision")
+        records = self._replay(task, fork_frame(car_left=True), [(0.80, 0.40, 0.18, 0.26)])
+        self.assertIs(records[-1][1].status, TaskStatus.COMPLETED)
+        self.assertIs(task.chosen_branch, Branch.LEFT)
+        self.assertEqual(task.last_blockage.source, "sdk")
+        self.assertGreater(task.official_sightings, 0)
+
+    def test_the_default_falls_back_and_says_so_when_the_sdk_is_silent(self):
+        """官方读数一直没到（集成层还没订阅 robot 识别）时：退回画面判据，并**写在 message 里**。
+
+        实车上就靠这句话判断"集成层到底接没接"：
+        看到 `official robot detection unavailable` = 现在用的是画面判据兜底。
+        """
+        for source in ("sdk_or_vision", "sdk"):
+            task = FreeJunctionTask(FreeJunctionConfig(blockage_source=source))
+            self.assertIn("official robot detection unavailable", task._official_note())
+            self.assertEqual(task.official_sightings, 0)
+
+        # "sdk_or_vision"：官方没读数 → 退回画面判据，并把这件事写进接管那一刻的 message
+        fallback = FreeJunctionTask(FreeJunctionConfig(blockage_source="sdk_or_vision"))
+        records = self._replay(fallback, fork_frame(car_left=True), ())
+        messages = [update.message for _state, update, _now in records]
+        self.assertTrue(
+            any("official robot detection unavailable" in m for m in messages),
+            "官方没读数时必须写明在用画面判据兜底：%s" % messages[:3],
+        )
+        self.assertIs(records[-1][1].status, TaskStatus.COMPLETED)
+        self.assertEqual(fallback.last_blockage.source, "vision")
+
+        # "sdk"：官方没读数就是"没有判据" —— 不接管（只用于确认订阅有没有通）
+        strict = FreeJunctionTask(FreeJunctionConfig(blockage_source="sdk"))
+        records = self._replay(strict, fork_frame(car_left=True), (), frames=40)
+        for _state, update, _now in records:
+            self.assertIs(update.status, TaskStatus.NOT_TRIGGERED)
+
+        # 纯画面判据那条路上不该出现这句提示
+        picture = FreeJunctionTask(FreeJunctionConfig(blockage_source="vision"))
+        self.assertEqual(picture._official_note(), "")
+
+    def test_or_vision_mode_falls_back_when_the_official_source_is_silent(self):
+        """"sdk_or_vision"：官方没读数时退回画面判据，不会因此错过岔路。"""
+        task = FreeJunctionTask(FreeJunctionConfig(blockage_source="sdk_or_vision"))
+        records = self._replay(task, fork_frame(car_left=True), ())
+        self.assertIs(records[-1][1].status, TaskStatus.COMPLETED)
+        self.assertIs(task.chosen_branch, Branch.RIGHT)
+        self.assertEqual(task.last_blockage.source, "vision")
+
+        # 官方有读数时以官方为准（即使画面里根本没车）
+        official = FreeJunctionTask(FreeJunctionConfig(blockage_source="sdk_or_vision"))
+        records = self._replay(official, fork_frame(), [(0.20, 0.40, 0.18, 0.26)])
+        self.assertIs(records[-1][1].status, TaskStatus.COMPLETED)
+        self.assertEqual(official.last_blockage.source, "sdk")
+
+    def test_snapshot_is_replaced_not_merged(self):
+        """快照是"整体替换"：官方改口说"什么也没看到"，读数就得跟着变。"""
+        task = self._task()
+        image = fork_frame()
+        task.update_candidates([(0.20, 0.40, 0.18, 0.26)], now=1.0)
+        task.step(FramePacket(image, 1, 1.0), 1.0)
+        self.assertEqual(task.last_blockage.reading, BLOCKAGE_LEFT)
+
+        task.update_candidates([], now=1.05)          # 官方这一帧什么也没看到
+        task.step(FramePacket(image, 2, 1.05), 1.05)
+        self.assertEqual(task.last_blockage.reading, BLOCKAGE_NONE)
+
+        task.update_candidates([(0.80, 0.40, 0.18, 0.26)], now=1.10)   # 换成右边
+        task.step(FramePacket(image, 3, 1.10), 1.10)
+        self.assertEqual(task.last_blockage.reading, BLOCKAGE_RIGHT)
+
+
+class SpeedRegressionTests(unittest.TestCase):
+    """**提速不许改判**（2026-09-16 19:58 实车运行里 step() 超预算的修法）。
+
+    那一次运行成功但日志一直报 `free_junction step was slow: 0.031s (limit 0.020s)`，
+    连模块结束后的帧也在报。三处改动：整列扫描向量化预筛、用不到判据的阶段不算判据、
+    判据在缩小的检测带上算。这一组测试把"结果必须和老实算完全一样"钉住。
+    """
+
+    def test_fork_rows_equals_the_naive_full_scan(self):
+        """加速后的整列扫描 == 逐行老实扫（含"某一段贴着 ROI 边缘"的行）。"""
+        settings = FreeJunctionConfig()
+        for image in (fork_frame(), fork_frame(car_left=True), fork_frame(tips=(200, 440)),
+                      noise_split_frame(), edge_fork_frame(), line_frame()):
+            _fork, _roi, mask, _rect = FreeJunctionDetector(settings).analyze(image)
+            naive = []
+            for row in range(mask.shape[0]):
+                found = _separated_runs(
+                    mask[row], settings.merge_gap_px, settings.min_run_px,
+                    settings.min_branch_separation_px, settings.min_gap_over_tape)
+                if found is not None:
+                    naive.append((row, found[0], found[1], found[2]))
+            fast = _fork_rows(
+                mask, settings.merge_gap_px, settings.min_run_px,
+                settings.min_branch_separation_px, settings.min_gap_over_tape)
+            self.assertEqual(naive, fast, "整列扫描的加速版和逐行扫描结果不一致")
+
+    def test_a_fork_touching_the_roi_edge_is_still_found(self):
+        """贴着 ROI 右边缘的分支也要认得出（加速版最初漏掉的就是这种行）。"""
+        self.assertTrue(FreeJunctionDetector().detect(edge_fork_frame()).valid)
+
+    def test_downscaling_does_not_change_the_reading(self):
+        """检测带缩小一半只提速、不改判。"""
+        for image, expected in (
+            (fork_frame(car_left=True), BLOCKAGE_LEFT),
+            (fork_frame(car_right=True), BLOCKAGE_RIGHT),
+            (fork_frame(), BLOCKAGE_NONE),
+        ):
+            readings = []
+            for scale in (1.0, 0.5):
+                task = FreeJunctionTask(FreeJunctionConfig(vehicle_downscale=scale))
+                fork, _roi, _line, rect = task.detector.analyze(image)
+                readings.append(task._read_blockage(fork, image, rect, 1.0).reading)
+            self.assertEqual(
+                readings, [expected, expected],
+                "缩放检测带改变了读数：1.0 -> %s，0.5 -> %s（期望 %s）"
+                % (readings[0], readings[1], expected),
+            )
+
+    def test_the_blockage_is_not_recomputed_after_the_branch_is_chosen(self):
+        """APPROACH / TURN / EXIT 用的是已定分支，不该每帧再算一遍判据。"""
+        task = FreeJunctionTask()
+        seen = []
+        original = task._read_blockage
+
+        def counting(*args, **kwargs):
+            seen.append(task.state)
+            return original(*args, **kwargs)
+
+        task._read_blockage = counting
+        records = run_with_states(task, fork_frame(car_left=True))
+        self.assertIs(records[-1][1].status, TaskStatus.COMPLETED)
+        self.assertTrue(seen, "IDLE / DECIDE 阶段必须算判据")
+        for state in (JunctionState.APPROACH, JunctionState.TURN, JunctionState.EXIT):
+            self.assertNotIn(state, seen, "%s 阶段不该再算判据" % state)
+
+
+class AimDirectionTests(unittest.TestCase):
+    """选完支之后**方向必须打对**（2026-09-17 实车翻车的那一条）。
+
+    那次日志里明明写着 `aligning with the right branch`，车却开进了左边那条
+    "有车"的分支，最后交回巡线时直接 `LINE_LOST`。两个原因，现在都改掉了：
+
+    1. `left_x` / `right_x` 原来取**分叉行**（两条分支刚分开、几乎重合）的中心，
+       所以"瞄准右支"实际瞄的是几乎正前方（实测 yaw 只有 +2.5，等于直行）；
+       现在取**张开最大那一行**的中心 —— 那才是"分支往哪走"。
+    2. 瞄准的参考点原来是**画面中心**，于是整条岔路偏在画面左边时，"右支"也落在
+       中心左边 → yaw 变成负的、往左打。现在参考点是**车头正下方那根线**
+       （车实际压在哪），右支永远在它右边。
+    """
+
+    def _aim(self, image, fixed_branch="right"):
+        settings = FreeJunctionConfig(decision_rule="fixed", fixed_branch=fixed_branch)
+        task = FreeJunctionTask(settings)
+        fork, _roi, _line, _rect = task.detector.analyze(image)
+        self.assertTrue(fork.valid, "这一帧应该认得出岔路")
+        task.last_detection = fork
+        task.chosen_branch = task._as_branch(fixed_branch)
+        return task, fork, task._approach_yaw()
+
+    def test_branch_targets_point_along_the_branches(self):
+        """瞄准点要指向"分支张开后"的方向，而不是分叉点上几乎重合的两点。"""
+        fork, _roi, _line, _rect = FreeJunctionDetector().analyze(fork_frame(car_left=True))
+        self.assertLess(fork.left_x, fork.split_x)
+        self.assertGreater(fork.right_x, fork.split_x)
+        self.assertGreater(
+            fork.right_x - fork.left_x, fork.separation_px * 1.5,
+            "两个瞄准点分得太开不够 —— 说明又回去用分叉行了",
+        )
+
+    def test_the_aim_is_strong_when_the_right_branch_is_chosen(self):
+        """选右支时不能只给一个"几乎直行"的 yaw（实车那次只有 +2.5）。
+
+        注：这张合成图里"车"是画在左分支上的，挡住了左分支的上半段，
+        所以可见的分支方向偏弱 —— 这里只要求"明显往右"，比例关系由
+        `test_the_aim_follows_the_offset_proportionally` 精确守住。
+        """
+        _task, _fork, yaw = self._aim(fork_frame(car_left=True))
+        self.assertGreater(yaw, 3.0, "选右支时的 yaw 太弱：%+.1f" % yaw)
+
+    def test_handback_needs_one_clean_line_not_just_some_blue(self):
+        """交回巡线要求"脚下只有**一段**胶带"（单根清晰的线），不只是"有蓝线像素"。
+
+        车还压在岔路口上时脚下常常同时有主干和分支两段，底层巡线拿到这种画面会
+        自己判丢线 —— 交回也没用。所以两段时必须再等，等到只有一段（或到时间上限）。
+        """
+
+        def run_into_exit(task, image, now, limit=200):
+            for index in range(limit):
+                update = task.step(FramePacket(image, index + 1, now), now)
+                now += 0.05
+                if task.state is JunctionState.EXIT or update.status in (
+                    TaskStatus.COMPLETED, TaskStatus.FAILED,
+                ):
+                    return now, update
+            return now, update
+
+        # ① 干净的单根线 → 走"条件满足"这条路交回
+        clean = FreeJunctionTask()
+        now, _update = run_into_exit(clean, fork_frame(car_left=True), 1.0)
+        for index in range(20):
+            update = clean.step(FramePacket(line_frame(), 500 + index, now), now)
+            now += 0.05
+            if update.status is TaskStatus.COMPLETED:
+                break
+        self.assertIs(update.status, TaskStatus.COMPLETED)
+        self.assertIn("the line is back", clean.last_message)
+
+        # ② 脚下是两段（还压在岔路口上）→ 不能靠"有线"交回，只能到时间上限
+        split = FreeJunctionTask()
+        now, _update = run_into_exit(split, fork_frame(car_left=True), 1.0)
+        for index in range(30):
+            update = split.step(FramePacket(noise_split_frame(), 900 + index, now), now)
+            now += 0.05
+            if update.status is TaskStatus.COMPLETED:
+                break
+        self.assertIs(update.status, TaskStatus.COMPLETED)
+        self.assertIn("junction cleared", split.last_message,
+                      "两段胶带时不该按'线回来了'交回：%s" % split.last_message)
+
+    def test_the_aim_is_an_angle_not_a_pixel_ratio(self):
+        """瞄准量的是**角度**：偏 51 px ≈ 15°，车就该转 15 deg/s（再限幅到 12）。
+
+        这是 2026-09-17 19:48 / 19:49 两次实车的回归用例：那条岔路很"浅"，
+        右支只比画面中心偏 ~51 px。旧的"像素/半宽"口径算出 0.16 →
+        yaw 只有 3.5（再乘远处折扣只剩 ~1），车几乎直着开进了左边拥堵支。
+        """
+        settings = FreeJunctionConfig()          # hfov 120° → 焦距 185 px
+        task = FreeJunctionTask(settings)
+        task.chosen_branch = Branch.RIGHT
+
+        def aim(right_x):
+            task.last_detection = ForkDetection(
+                valid=True, split_x=300, left_x=200, right_x=right_x, frame_width=640
+            )
+            return task._approach_yaw()
+
+        offset_px = 51
+        degrees = task._pixels_to_degrees(offset_px, 640)
+        self.assertAlmostEqual(degrees, 15.4, delta=1.0, msg="角度换算不对")
+        yaw = aim(320 + offset_px)
+        self.assertAlmostEqual(yaw, degrees, delta=0.1, msg="增益 1.0 时应等于偏角")
+        self.assertGreater(yaw, 8.0, "偏 15° 只给出 %+.1f deg/s —— 车根本转不过来" % yaw)
+
+        # 偏角越大 yaw 越大（单调），很大时超过限幅（由 _motion 裁到 12）
+        self.assertGreater(aim(320 + 100), yaw)
+        self.assertGreater(aim(320 + 300), settings.max_approach_yaw)
+
+        # 左支：同样的几何下必须往反方向（负）
+        task.chosen_branch = Branch.LEFT
+        task.last_detection = ForkDetection(
+            valid=True, split_x=300, left_x=200, right_x=371, frame_width=640
+        )
+        self.assertLess(task._approach_yaw(), 0.0)
+
+        # 真正发出去的命令必须被裁到限幅内
+        task.chosen_branch = Branch.RIGHT
+        task.state = JunctionState.APPROACH
+        task.last_detection = ForkDetection(
+            valid=True, split_x=300, left_x=200, right_x=600, frame_width=640
+        )
+        self.assertAlmostEqual(
+            task._motion(1.0).yaw, settings.max_approach_yaw, delta=1e-6
+        )
+
+    def test_choosing_right_always_aims_further_right_than_choosing_left(self):
+        """不管岔路偏在哪，选右支瞄得一定比选左支更靠右（这才是"选对边"的含义）。
+
+        整条岔路偏在画面左侧时，"右支"也可能仍在车头方向左边 —— 那时**应该**
+        往左打（车得先开到岔路口），但**永远比选左支时更靠右**；
+        进入分支这件事由每帧重新瞄准的闭环完成。
+        （2026-09-17 曾经把"脚下那根线"当参考点，结果浅岔路下 yaw 只有 ±1、车不转。）
+        """
+        for image in (fork_frame(car_left=True), fork_frame(x=180, tips=(60, 300))):
+            _task, _fork, right_yaw = self._aim(image, "right")
+            _task2, _fork2, left_yaw = self._aim(image, "left")
+            self.assertGreater(
+                right_yaw, left_yaw,
+                "选右支必须瞄得更靠右：右 %+.1f vs 左 %+.1f" % (right_yaw, left_yaw),
+            )
+            self.assertGreater(right_yaw - left_yaw, 5.0, "两者的差太小，等于没区分")
+
+    def test_the_turn_offset_uses_the_same_reference(self):
+        """转弯阶段和瞄准阶段必须用同一个参考点，否则两段会互相打架。"""
+        task, fork, yaw = self._aim(fork_frame(car_left=True))
+        offset = task._turn_offset(fork)
+        self.assertIsNotNone(offset)
+        self.assertGreater(offset, 0.0)
+        self.assertGreater(yaw * offset, 0.0, "对准和转弯的方向符号必须一致")
+
+    def test_the_turn_is_gentler_while_the_junction_is_still_far(self):
+        """岔路还在画面远处时**先别急着转**（摄像头比车头早半米看到岔路）。
+
+        2026-09-17 17:24 / 17:26 / 17:27 三次实车都是"看到就满舵转"，
+        车头还没到路口方向就转过去了；17:24 那次交回巡线后直接 LINE_LOST。
+        """
+        settings = FreeJunctionConfig()
+        task = FreeJunctionTask(settings)
+
+        def turn_yaw(split_row):
+            task.state = JunctionState.TURN
+            task.chosen_branch = Branch.RIGHT
+            task.last_detection = ForkDetection(
+                valid=True, split_row=split_row, split_x=300, left_x=200,
+                right_x=420, frame_width=640, frame_height=360,
+            )
+            task._last_line_mask = None
+            return task._motion(1.0).yaw
+
+        far = turn_yaw(200)      # 岔路还在 ROI 上半部（车头离路口还远）
+        near = turn_yaw(330)     # 岔路已经到画面下部（车到了）
+        self.assertGreater(near, 0.0)
+        self.assertGreater(far, 0.0, "远处也要转一点，不能完全不转")
+        self.assertLess(far, near, "远处应该转得更轻")
+        # 折扣本身：远处不小于 turn_far_yaw_scale，到跟前基本不折扣
+        forked = lambda row: ForkDetection(  # noqa: E731
+            valid=True, split_row=row, split_x=300, left_x=200, right_x=420,
+            frame_width=640, frame_height=360,
+        )
+        self.assertGreaterEqual(
+            task._turn_rate_scale(forked(200)), settings.turn_far_yaw_scale - 1e-6,
+            "远处最多只能打到 turn_far_yaw_scale 这个折扣",
+        )
+        self.assertAlmostEqual(task._turn_rate_scale(forked(345)), 1.0, delta=1e-6)
+        # 折扣随"岔路越来越近"单调上升（不是一刀切）
+        self.assertLess(turn_yaw(220), turn_yaw(260))
+        self.assertLess(turn_yaw(260), turn_yaw(300))
+
+    def test_the_turn_keeps_moving_forward(self):
+        """转弯时要真的往前挪：0.04 太小，车几乎原地转身（实车就是这么拐早的）。"""
+        settings = FreeJunctionConfig()
+        self.assertGreaterEqual(
+            settings.turn_forward, settings.approach_forward * 0.9,
+            "转弯时的前进速度不该比对准阶段还慢一大截",
+        )
+        task = FreeJunctionTask(settings)
+        task.state = JunctionState.TURN
+        task.chosen_branch = Branch.RIGHT
+        task.last_detection = ForkDetection(
+            valid=True, split_row=330, split_x=300, left_x=200, right_x=420,
+            frame_width=640, frame_height=360,
+        )
+        task._last_line_mask = None
+        self.assertAlmostEqual(
+            task._motion(1.0).forward, settings.turn_forward, delta=1e-9
+        )
+
+
+    def test_no_detection_while_the_rearm_gate_is_cooling(self):
+        """封锁冷却期内**连画面都不看**：这些帧一定是"不接管"，却白花最贵的一步。
+
+        实车日志里 `free_junction step was slow` 有相当一部分就落在"刚走完岔路、
+        还在冷却"的那些帧上（2026-09-16 的 14.7/15.8s、2026-09-17 的 18.9s）。
+        """
+        task = FreeJunctionTask()
+        calls = []
+        original = task.detector.analyze
+
+        def counting(image):
+            calls.append(1)
+            return original(image)
+
+        task.detector.analyze = counting
+        task.reset()                      # 拉起封锁闸门（冷却 rearm_cooldown 秒）
+        now = 1.0
+        for index in range(10):
+            update = task.step(FramePacket(fork_frame(car_left=True), index + 1, now), now)
+            self.assertIs(update.status, TaskStatus.NOT_TRIGGERED)
+            now += 0.05
+        self.assertEqual(calls, [], "冷却期内不该跑岔路检测")
+
+        # 冷却结束后必须重新看画面，不能一直瞎着
+        task.step(FramePacket(fork_frame(car_left=True), 100, 3.0), 3.0)
+        self.assertTrue(calls, "冷却结束后必须重新检测岔路")
 
 
 class HarnessIntegrationTests(unittest.TestCase):

@@ -21,6 +21,26 @@
 * 报告还提到"运行记录没写模块给的 `message`"——集成侧已在补。所以 v2 把
   **判据读数写进 `TaskUpdate.message`**，实车记录里能直接看到"为什么这么选"。
 
+**3. 2026-09-16 两次实车**（16:52:53 / 16:56:06，`captures/run_*` + 屏幕录制，
+用户提供的 `run_wrong/`）。16:52:53 那次的运行记录里写着
+`junction confirmed, deciding (right branch …)` —— 把**空着的那条**报成"有车"，
+于是去走了真堵的那条（画面证据：车确实往左拐，朝那辆停着的车去了）。
+把当时的现场画面拿出来跑判据，查到一个 v2 的硬伤：
+
+* **检测区域不对**：停着的那辆车在画面**上方**（y≈36~159），而 v2 的走廊只在岔路
+  ROI（y 0.54~0.96）里面 —— 车整个在区域外，"真堵的那条反而看不见"。
+  → v3 改成**整帧高度的一条检测带**（`blockage_top_ratio` 0.10 ~
+  `blockage_bottom_ratio` 0.86），下沿压到 0.86 是为了排掉我们自己车头常驻的橙色轮子。
+* **判据被地砖纹理淹没**：现场是**花岗岩地砖**，细密黑点让 Canny 连成"一整片地毯"
+  （结构像素占 67%~80%，一个框就把整条走廊圈住），真车反而没有独立轮廓。
+  → v3 默认改成**大尺度局部对比度**：车 = "比周围地面暗一大块（或亮一大块）"，
+  地砖黑点/反光是 1~3 像素的小尺度纹理，被大核平均掉；Canny 结构判据降级为可选
+  （`use_structure=False`）。形状闸门也按真车数据重新标定。
+  真车画面实测（4 帧结果一致）：停着车那条 → 宽 0.39 高 0.36 面积 0.14 下沿 0.44；
+  空着那条 → 宽 0.15~0.28 高 0.06~0.16 面积 0.02~0.03 下沿 0.14~0.21。
+  同一次修复还顺手修了：**转弯/出岔路时把"胶带跑出 ROI"误判成丢线而停车**
+  （真车两次都在 TURN/EXIT 里走 0.8 秒就 FAILED），以及**原地多转几十度**。
+
 职责边界（违反会被 `tests/test_task_contract.py` 直接拦下）
 ----------------------------------------------------------
 * 只接收主流程给的 `FramePacket`，绝不自己开相机或视频流；
@@ -57,14 +77,22 @@ A3            真岔路的两条分支是**越往上越张开**的：分叉行�
               不会满足这一条，普通弯道也不会。
 A4            岔路连续出现 `confirm_frames` 帧、同一个拥堵读数连续出现
               `blockage_confirm_frames` 帧，才考虑触发；只闪一帧不算。
-A5            **"拥堵"= 那条分支的走廊里停着一辆同型小车**（官方定义）。判据用
-              **结构**（硬边缘连成的块 + 外接框形状），**不看颜色** —— 理由与 4 号
-              `obstacle.py` 相同：颜色判据在现场没有分离度（皮肤和橙色撞车），
-              而"任何够暗的像素都算障碍"会把影子和车自己的阴影全算进去。
-              形状判据全部相对走廊尺寸：外接框宽 ≥ `vehicle_min_width_ratio`、
-              高 ≥ `vehicle_min_height_ratio`、面积 ≥ `vehicle_min_area_ratio`、
-              框内有东西的像素 ≥ `vehicle_min_density`，再要求这个框落在走廊**偏下**
-              的位置（`vehicle_min_bottom_ratio`，即"不远处"，不是远处的背景墙）。
+A5            **"拥堵"= 那条分支的走廊里停着一辆大疆 RoboMaster S1/EP 小车**
+              （官方定义）。判据有两种来源，由 `blockage_source` 选：
+
+              * `"vision"`（默认）：**按这辆车的样貌认** —— 深色车体
+                （V<=`robot_dark_v_max`）+ 高饱和彩色装甲/灯（S>=`robot_accent_s_min`）。
+                两个比例都**尺度无关**（真车实测：车 深色 0.61~0.70、彩色 0.25~0.34；
+                空地/暗墙彩色 **0.000**），所以车远到 1~2 米也认得出。
+                胶带连同边缘先抹掉，免得"胶带+影子"被凑成一辆车。
+              * `"sdk"`：**只用官方 SDK 的识别结果**（机器人识别 / 视觉标签），
+                由集成层订阅、`main.py` 每帧推给本模块（见 `update_candidates()`）。
+                这条路上本模块**不看长宽高、不看颜色、不看形状**，只信官方读数。
+              * `"sdk_or_vision"`：有新鲜官方读数就用它，没有就退回画面判据。
+
+              检测区域是整帧高度的一条带（`blockage_top_ratio` ~
+              `blockage_bottom_ratio`），**不是**岔路 ROI：真车实测那辆车在
+              y≈36~159，而 ROI 只有 y 0.54~0.96，"只按 ROI 找"会看不见真堵的那条。
 A6            两条分支**只有一条**有车 → 走另一条；**两条都有车** → 判据不成立 →
               停车报失败（或走 `fallback_branch`）；**两条都没有车** → 这不是
               "无拥堵岔路"场景 → **不接管**（`require_blockage_to_trigger`），
@@ -89,9 +117,12 @@ A12           所有阈值都是在合成画面上定的，**必须在正式场�
     python -m unittest tests.test_free_junction -v
 """
 
+import math
+import threading
+import time
 from dataclasses import dataclass
 from enum import Enum
-from typing import List, Optional, Tuple
+from typing import Iterable, List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -113,6 +144,125 @@ BRANCH_RIGHT = "right"
 
 #: 零速度。未触发、等待判据、完成、失败都返回它。
 STOP = MotionCommand()
+
+#: 官方 SDK 报来的坐标是**归一化**还是**像素**，文档没写。归一化坐标不会超过它
+#: —— 与集成层 `marker_source.py` 用的是同一条规则（NORMALIZED_MAX）。
+NORMALIZED_MAX = 1.5
+
+
+@dataclass(frozen=True)
+class SdkSighting:
+    """官方识别（机器人识别 / 视觉标签）报来的一条观测，坐标已换算成**整帧像素**。
+
+    为什么要有这个类
+    ----------------
+    任务模块**不许碰 SDK**（红线 8；`tests/task_harness.py` 的
+    `FORBIDDEN_PATTERNS` 里有 ``\\brobomaster\\b``，`scripts/check_module.py`
+    会把它查出来）。所以官方读数由**集成层**订阅，再由 `main.py` 的
+    `feed_marker_observations()` 每帧推给实现了 `update_candidates()` 的任务
+    —— 和 6 号 `number_marker` 走的是同一条通路，
+    **不需要改 `main.py` / `task_registry.py`**。本模块只消费这个纯数据。
+    """
+
+    center: Tuple[float, float]
+    width: float
+    height: float
+    #: 回调接收时刻（单调钟，和协调器的 `now` 同一个钟）。None = 没有时间戳。
+    observed_at: Optional[float] = None
+    #: 视觉标签识别到的标签（机器人识别时为空）。
+    label: str = ""
+
+    def box(self) -> Tuple[int, int, int, int]:
+        """换算成整帧像素的外接框（x0, y0, x1, y1），只用于日志和证据。"""
+        half_w = max(0.0, float(self.width) / 2.0)
+        half_h = max(0.0, float(self.height) / 2.0)
+        return (
+            int(round(self.center[0] - half_w)),
+            int(round(self.center[1] - half_h)),
+            int(round(self.center[0] + half_w)),
+            int(round(self.center[1] + half_h)),
+        )
+
+    def width_ratio(self, frame_width: int) -> float:
+        """它占画面宽多少（只用来写日志：判定**不看尺寸**）。"""
+        if frame_width <= 0:
+            return 0.0
+        return float(self.width) / float(frame_width)
+
+
+def _observation_parts(item):
+    """外部推来的一条观测 → ``(x, y, w, h, observed_at, label)``；看不懂返回 None。
+
+    认两种既有写法（都是为了对接不同层的约定，且绝不抛异常）：
+
+    * 对象式（`number_marker.MarkerCandidate`）：``center`` + ``width`` +
+      ``height``（+ ``observed_at`` / ``target_id``）；
+    * SDK 原始行：``(x, y, w, h)``（机器人识别）或 ``(x, y, w, h, 标签)``（视觉标签）。
+
+    注意 SDK 回调里的 x/y 是**中心点**（已对 `robomaster/vision.py` 核实）。
+    """
+    if item is None:
+        return None
+    center = getattr(item, "center", None)
+    width = getattr(item, "width", None)
+    height = getattr(item, "height", None)
+    label = getattr(item, "target_id", "")
+    observed_at = getattr(item, "observed_at", None)
+    if center is None or width is None or height is None:
+        try:
+            row = tuple(item)
+        except TypeError:
+            return None
+        if len(row) < 4:
+            return None
+        center = (row[0], row[1])
+        width, height = row[2], row[3]
+        label = row[4] if len(row) > 4 else ""
+        observed_at = None
+    try:
+        x = float(center[0])
+        y = float(center[1])
+        w = float(width)
+        h = float(height)
+    except (TypeError, ValueError, IndexError):
+        return None
+    stamp: Optional[float] = None
+    if observed_at is not None:
+        try:
+            stamp = float(observed_at)
+        except (TypeError, ValueError):
+            stamp = None
+        if stamp is not None and not math.isfinite(stamp):
+            stamp = None
+    if not all(math.isfinite(value) for value in (x, y, w, h)):
+        return None
+    return x, y, w, h, stamp, ("" if label is None else str(label))
+
+
+def observation_is_normalized(item) -> bool:
+    """这条观测用的是归一化坐标吗（四个数都不超过 `NORMALIZED_MAX`）。"""
+    parts = _observation_parts(item)
+    if parts is None:
+        return False
+    return max(abs(value) for value in parts[:4]) <= NORMALIZED_MAX
+
+
+def sighting_from_observation(
+    item, frame_width: int, frame_height: int
+) -> Optional[SdkSighting]:
+    """外部观测 → `SdkSighting`（归一化坐标按整帧尺寸换算；看不懂返回 None）。"""
+    parts = _observation_parts(item)
+    if parts is None:
+        return None
+    x, y, w, h, stamp, label = parts
+    if frame_width > 0 and frame_height > 0 and observation_is_normalized(item):
+        x *= float(frame_width)
+        y *= float(frame_height)
+        w *= float(frame_width)
+        h *= float(frame_height)
+    return SdkSighting(
+        center=(x, y), width=w, height=h, observed_at=stamp, label=label
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -167,9 +317,19 @@ class FreeJunctionConfig:
 
     # ---- ROI：只在画面下半部这块里干活，整张图不做重算法 ----
     roi_left: float = 0.06
-    roi_top: float = 0.54
+    #: 岔路检测 ROI 的上沿。0.54 -> 0.42 是**为了更早看到岔路**：
+    #: 车离岔路还远时，分叉点在画面上方，压到 0.54 就看不见了 → 等到很近才触发。
+    roi_top: float = 0.42
     roi_right: float = 0.94
     roi_bottom: float = 0.96
+
+    # ---- 找车的检测区域（整帧比例）：**故意比岔路 ROI 高得多** ----
+    # 2026-09-16 真车实测：停着的那辆车在画面左上方（y≈36~159），
+    # 而岔路 ROI 只有 y 0.54~0.96，车整个在走廊外面 → "真堵的那条反而看不见"。
+    # 上沿取 0.10 把远处那辆车包进来；下沿取 0.86 是为了排掉我们自己车头的
+    # 橙色轮子/车体（它常驻在画面最下方正中）。
+    blockage_top_ratio: float = 0.10
+    blockage_bottom_ratio: float = 0.86
 
     # ---- 蓝线颜色管线（沿用已验证的蓝色胶带默认值）----
     hsv_lower: Tuple[int, int, int] = (95, 80, 60)
@@ -187,10 +347,10 @@ class FreeJunctionConfig:
     min_gap_over_tape: float = 0.40      # 空隙 ≥ 带宽的 40% 才算真分开
     merge_gap_px: int = 6                # 同一行里隔得比它近的蓝色像素算同一段
     min_run_px: int = 5                  # 短于它的碎块丢掉
-    min_fork_rows: int = 3               # 最少要有几行满足分叉形态
+    min_fork_rows: int = 2               # 最少要有几行满足分叉形态（更早触发）
     min_divergence_ratio: float = 0.25   # 最上面一行间距要比分叉行大这么多（A3）
-    confirm_frames: int = 4              # 连续几帧看到岔路才算数
-    blockage_confirm_frames: int = 2     # 同一个拥堵读数连续几帧才算数
+    confirm_frames: int = 2              # 连续几帧看到岔路才算数（求快：4 -> 2）
+    blockage_confirm_frames: int = 1     # 同一个拥堵读数连续几帧才算数（求快：2 -> 1）
     decide_confirm_frames: int = 1       # 接管后再稳定几帧就落子
     rearm_clear_frames: int = 8          # 岔路消失几帧后才允许再次触发
 
@@ -200,22 +360,117 @@ class FreeJunctionConfig:
     fallback_branch: Optional[str] = None   # 两条都有车时走哪边；None = 停车报失败
     require_blockage_to_trigger: bool = True  # 两条都没车就不接管（A6）
 
-    corridor_height_ratio: float = 1.0    # 走廊高度 = ROI 高度 × 它（1.0 = 整个 ROI 上部）
-    corridor_bottom_margin: float = 0.05  # 走廊下沿再往上让开一点（相机自己的车体/橙色件）
-    corridor_side_margin: float = 0.0     # 走廊左右各让开一点比例
+    # ---- 拥堵判据的**来源**（A5）----
+    #: **默认 `"sdk_or_vision"`：官方 SDK 的机器人识别说了算**（大疆 SDK 里
+    #: `vision.sub_detect_info(name="robot")` 就是"识别同款 RoboMaster 小车"的接口）。
+    #: 只要主循环把官方读数推给本模块（见 `update_candidates()`），判据就**只**看它：
+    #: 不看颜色、不看长宽高、不看形状。
+    #: 官方读数这一帧没到（例如集成层还没订阅 robot 识别）→ 退回画面判据兜底，
+    #: 并在 message 里写明 `official robot detection unavailable`，一眼能看出用的是哪套。
+    #: ``"sdk"`` = 只用官方读数（没订阅就永远不接管 —— 只用于确认订阅是否通了）；
+    #: ``"vision"`` = 只用画面判据（旧行为）。
+    blockage_source: str = "sdk_or_vision"
+    #: 官方读数的保鲜窗口（秒）：回调比这还旧就当作"这一帧没看到"。
+    #: 宁可退回"没有判据"（不接管），也不拿一条过期读数决定往哪边拐。
+    sdk_observation_hold_seconds: float = 0.35
 
-    use_structure: bool = True            # 结构判据（默认唯一判据）
+    # 旧的"走廊"参数（v2 用来把 ROI 下部切块）。v3 改成整帧高度的检测带之后不再使用，
+    # 保留名字只为兼容，值不影响任何行为。
+    corridor_height_ratio: float = 1.0
+    corridor_bottom_margin: float = 0.05
+    corridor_side_margin: float = 0.0
+
+    # ---- 判据一（默认）：按 **RoboMaster S1 / EP 小车的特征**认车 ----
+    # 真车画面实测（2026-09-16，两帧一致，车框 124x124）：
+    #   停着的小车：深色像素(V<=90)占 0.61~0.70、高饱和彩色(S>=100)占 0.25~0.34
+    #               （其中蓝 0.10、绿 0.07~0.14 —— 装甲灯/彩色贴纸）
+    #   空地：      深色占 0.04~0.08、高饱和彩色占 **0.000**（花岗岩地砖没有鲜艳色）
+    # 所以"**深色车体 + 高饱和彩色装甲/灯**"这两条合起来就是 S1/EP 的特征：
+    #   * 地砖、影子、反光、白墙 → 没有鲜艳色 → 不会误判；
+    #   * 两个比例都是**尺度无关**的 → 车离 1 米、2 米照样认得出，
+    #     所以尺寸闸门可以放得很松（robot_min_*）。
+    use_robot_signature: bool = True
+    robot_dark_v_max: int = 90            # "车体深色"的亮度上限（空地中位数 137~144）
+    robot_dark_min_ratio: float = 0.35    # 候选块里深色像素至少占这么多（车 0.61~0.70）
+    robot_accent_s_min: int = 100         # "装甲/灯/贴纸"的饱和度下限
+    robot_accent_min_ratio: float = 0.06  # 高饱和彩色至少占这么多（车 0.25~0.34，空地 0）
+    robot_min_aspect: float = 0.5         # 外接框 宽/高 的允许范围（车约 0.75~1.2）
+    robot_max_aspect: float = 2.5
+    robot_min_width_ratio: float = 0.10   # 尺寸闸门放得很松：远一点的车也要能过
+    robot_min_height_ratio: float = 0.10
+    robot_min_area_ratio: float = 0.015
+    #: 候选框面积占走廊的上限（只当兜底：真车候选实测 ≤ 0.66，含"车和墙连成一块"的
+    #: 极端帧；换场地后那条墙裙误报是 0.84~0.85 —— 挡住它靠的是下面那条**组合判据**，
+    #: 不是这个上限，否则会把"车+墙连成一块"的真检测一起挡掉，2026-09-17 试过）。
+    robot_max_area_ratio: float = 0.90
+    #: **"显眼候选"的彩色门槛**：满足下面任一条的候选，彩色占比必须 ≥ 这个值：
+    #:   * 面积占比 ≥ `robot_large_area_ratio`（0.5）—— 墙/暗带糊成一大块；
+    #:   * 长宽比 ≥ `robot_wide_aspect_ratio`（1.8）—— 门框、踢脚线那种宽扁条。
+    #: 为什么必须"面积/形状 + 彩色"两条一起看（2026-09-17 换场地实测，337 张画面）：
+    #:   * 墙 + 墙脚阴影带 + 木门：面积 0.84~0.85、彩色 **0.074** → 挡掉；
+    #:   * 门框 + 暗墙边：长宽比 2.24、彩色 **0.062** → 挡掉；
+    #:   * 真车（含"车和墙连成一块"、以及宽扁视角那一帧）：彩色 **0.22~0.27** → 照旧认出。
+    #: 单看面积或单看长宽比都会误伤真车（实测：真车面积最大 0.80、长宽比也能到 2.24），
+    #: 单看彩色也不行（真车最低 0.066，和误报的 0.062~0.074 重叠）。
+    robot_large_area_ratio: float = 0.5
+    robot_wide_aspect_ratio: float = 1.8
+    robot_strong_accent_min_ratio: float = 0.15
+    #: **"深色块附近有没有彩色"** 的邻域大小（像素）：装甲/灯就长在车身上，
+    #: 所以只需要很小的邻域。现场实测：暗墙、门框、踢脚线也是"深色"，
+    #: 光看深色会把背景一起圈进来；而彩色只有小车和胶带有（空地和墙是 0.000）。
+    robot_accent_grow_px: int = 9
+    robot_close_px: int = 5               # 深色块的闭运算（别太大，免得又粘背景）
+    #: **判据的运算尺度**：<1 = 先把检测带缩小再算（`1.0` = 不缩放）。
+    #: 两个比例（深色占比、彩色占比）都是**尺度无关**的，离线实测把整幅画面缩到
+    #: 0.45 倍仍然判对，所以缩放几乎不损失判据能力，却把这一步的耗时按面积降下来
+    #: —— 实车日志里 `free_junction step was slow: 0.031s` 就是这一步造成的。
+    vehicle_downscale: float = 0.5
+    #: 检测带小于这么多像素就不缩放（小图/合成帧保持原样，行为可复现）。
+    vehicle_downscale_min_pixels: int = 60000
+
+    # ---- 岔路检测的运算尺度（2026-09-17 试过后**默认关掉**）----
+    #: <1 = 先把岔路 ROI 缩小再算。**默认 1.0 = 不缩放**，原因见下。
+    #:
+    #: 试过 0.5，在 184 张实车画面上做等价性比对（`.local/probe_fork_scale.py`）：
+    #:   * **1 帧直接漏掉岔路**（原尺寸认得出、半尺寸认不出）；
+    #:   * 51 帧几何差 > 8 px，最大 **112 px**，而且偏差最大的正是"瞄准用的
+    #:     `left_x` / `right_x`"（braches 张开最大那一行在缩小图上会落到别的行）。
+    #: 岔路检测是**触发条件**，漏一帧就等于不接管、车直接开向障碍物 —— 这点提速
+    #: 不值得冒这个险，所以整条链路保留但默认不启用。要试就自己把它调小，
+    #: 并**先跑 `.local/probe_fork_scale.py`** 看那三项差异是否都可接受。
+    fork_downscale: float = 1.0
+    #: ROI 小于这么多像素就不缩放（小图/合成帧保持原样）。
+    fork_downscale_min_pixels: int = 40000
+
+    # ---- 判据二（默认关）：大尺度局部对比度（不看颜色，当兜底用）----
+    use_local_contrast: bool = False
+    contrast_kernel_ratio: float = 0.15   # "周围地面"的大核 = 走廊高度 × 它
+    contrast_threshold: int = 45          # |周围 − 自己| 超过它才算"一块东西"
+    contrast_blur_sigma: float = 1.0      # 先抹掉 1 像素级的噪点
+    contrast_close: int = 9               # 把同一块里的空洞补一补
+
+    # ---- 判据二（默认关）：Canny 结构判据 ----
+    # 4 号 obstacle.py 的路子。但现场是**花岗岩地砖**：细纹理把 Canny 连成"一整片地毯"
+    # （实测结构像素占 67%~80%，一个框就把整条走廊圈住），真车反而被淹没 —— 默认关。
+    use_structure: bool = False
     edge_low: int = 40                    # Canny 低阈值
     edge_high: int = 110                  # Canny 高阈值
     edge_dilate: int = 3                  # 边缘加粗，后面才连得成块
     structure_close: int = 15             # 把边缘连成整块的核大小
-    min_vehicle_width_ratio: float = 0.15   # 外接框宽 / 走廊宽
-    min_vehicle_height_ratio: float = 0.20  # 外接框高 / 走廊高
-    min_vehicle_area_ratio: float = 0.04    # 外接框面积 / 走廊面积
-    min_vehicle_density: float = 0.05       # 框内"有东西"的像素占比
+    #: 找车之前，把蓝带**连同边缘**一起抹平多宽（像素）。两个判据共用。
+    #: HSV 掩码只盖得住胶带芯，边缘的抗锯齿混合像素在掩码外面；不抹掉它们，
+    #: 判据就会把胶带自己的轮廓当成"一块东西"
+    #: （2026-09-16 真车实测：干净的那条分支被报成"有车"，于是走了堵的那条）。
+    tape_clear_px: int = 5
+
+    # ---- 形状闸门（全部相对走廊尺寸），按 2026-09-16 真车实测重新标定 ----
+    min_vehicle_width_ratio: float = 0.20   # 车 0.39 / 空 0.15~0.28
+    min_vehicle_height_ratio: float = 0.25  # 车 0.36 / 空 0.06~0.16 ← 主要靠这道分开
+    min_vehicle_area_ratio: float = 0.08    # 车 0.14 / 空 0.02~0.03
+    min_vehicle_density: float = 0.05       # 框内"有东西"的像素占比（太稀的空框不算）
     max_vehicle_width_ratio: float = 0.95   # 上限只当兜底（车很近时会顶满走廊）
     max_vehicle_area_ratio: float = 0.90
-    vehicle_min_bottom_ratio: float = 0.55  # 车要在走廊偏下的位置（"不远处"，不是远处背景）
+    vehicle_min_bottom_ratio: float = 0.35  # 车 0.44 / 空 0.14~0.21 → 0.35 两边都分得开
     reject_skin_like: bool = True         # 皮肤色占比过半的候选丢掉（同 obstacle.py）
     skin_reject_ratio: float = 0.50
     use_color_ranges: bool = False        # 颜色判据默认关（A5 的理由）
@@ -224,18 +479,69 @@ class FreeJunctionConfig:
     )
 
     # ---- 动作（A7 / A8，全部远低于骨架限幅）----
-    decide_timeout: float = 0.6       # 原地稳定判据的最长时间
-    approach_forward: float = 0.10
-    approach_yaw_gain: float = 45.0
-    max_approach_yaw: float = 25.0
-    approach_seconds_max: float = 1.5
-    turn_forward: float = 0.06
-    turn_yaw: float = 45.0
-    turn_seconds: float = 1.2
-    turn_timeout: float = 2.5
-    exit_forward: float = 0.15
+    # 要求 3：判完哪条堵之后**只做微调** —— 微微转、微微前进，一路看着胶带，
+    # 直到岔路标志离开视野、且视野里重新有可用的蓝线，再交回巡线。
+    # 所以下面所有速度/角速度都比骨架限幅小一个量级。
+    decide_timeout: float = 0.25      # 原地稳定判据的最长时间（求快：0.6 -> 0.25）
+    approach_forward: float = 0.08
+    #: 对准阶段的增益与限幅。**2026-09-17 12:13~12:18 四次实车全部"转过头再拉回"**
+    #: （对准 2 s 一直被 18 deg/s 打满 → 转过头 → 后面靠脚下那条线拉回来，
+    #: 用掉 3.2~3.7 s）。所以增益 45→28、限幅 18→12：让它是"比例控制"、
+    #: 快对准时自动慢下来，而不是一路满舵。
+    #: **摄像头水平视场角（度）**：把"分支偏了多少像素"换算成**角度**用。
+    #: 判据必须是角度，才不随场地/远近走样 —— 2026-09-17 19:48/19:49 两次实车：
+    #: 那条岔路很"浅"，右支只比画面中心偏 51 px，旧的"像素/半宽"口径只有 0.16，
+    #: 换算成 yaw 才 3.5 deg/s（再乘"岔路还远"的折扣只剩 ~1），车几乎直着开进
+    #: 左边那条"有车"的分支；换成角度就是 **15°**，看得见的偏差就该转得动。
+    camera_hfov_degrees: float = 120.0
+    #: 瞄准增益：**每 1° 偏差给多少 deg/s**（1.0 = 偏多少度就转多少度/秒）。
+    approach_yaw_gain: float = 1.0
+    max_approach_yaw: float = 12.0
+    approach_seconds_max: float = 2.0
+    #: 转弯时的前进速度。**2026-09-17 17:24 / 17:26 / 17:27 三次实车的共同问题**：
+    #: 摄像头装在车头前上方、看得比车头远 0.5~0.8 m，所以"看到岔路"时车头其实
+    #: 还没到路口；原来的 0.04 太小 —— 车几乎是**原地**把方向转完，等车头到岔路口
+    #: 时早就转过去了（17:24 那次交回巡线后直接 LINE_LOST）。
+    #: 提到与 APPROACH 同速：边转边前进，转弯摊在更长的一段路上。
+    turn_forward: float = 0.08
+    turn_yaw: float = 14.0            # 微转（最大角速度；45 -> 20 -> 14，越改越稳）
+    turn_seconds: float = 2.5         # 只是**上限**：正常会提前收工
+    turn_timeout: float = 3.5
+    #: 岔路还"远"时的转向打折比例与"算近"的门槛（见 `_turn_rate_scale`）。
+    #: 17:24 那次的画面量出来：接管那一刻岔路的路口还在画面 y≈250/360（画面中央偏下），
+    #: 车头离路口还有 0.5~0.8 m —— 一看到就满舵转，自然会拐早。
+    #: 所以岔路还在 ROI 上部时按 `turn_far_yaw_scale` 打折，越靠近越给足：
+    #: 折扣按"岔路在 ROI 里落到多低"线性插值（0.6 → 1.0），不是一刀切 ——
+    #: 一刀切会把"浅岔路本来就不大的偏角"再削一半，车就几乎不转了
+    #: （2026-09-17 19:48/19:49 两次实车：yaw 只有 ±1）。
+    turn_far_yaw_scale: float = 0.6
+    fork_close_ratio: float = 0.72
+    #: 转向至少要转这么久，才允许"看到线回到中央就收工"。
+    turn_min_seconds: float = 0.3
+    #: 闭环转向的增益：yaw = 增益 × **偏角（度）**，再限幅到 `turn_yaw`。
+    #: 看得到岔路就朝"选中那条分支"转；岔路没了就朝车头前那条胶带转。
+    #: 越接近正前方转得越慢 —— 这样不会转过头（真车 2026-09-16 17:26 的教训）。
+    turn_steer_gain: float = 1.0
+    #: **"已经对准"的角度容差（度）**：选中分支在车头正前方这么多度以内算对准。
+    #: 旧的写法是"相对画面宽度的 0.22"，换算过来约等于 **21°** —— 太松了：
+    #: 实测那条浅岔路的右支偏 15°，却被判成"已经对准"，TURN 只跑了 0.3 s 就收工
+    #: （2026-09-17 19:48 那次 1.4 s 就"完成"、车几乎没转）。
+    center_tolerance_degrees: float = 8.0
+    center_confirm_frames: int = 2
+    #: 交回前的前进速度。0.10 → **0.14**（2026-09-17 20:55~21:03 八次实车实测）：
+    #: 那八次全部成功，但有 **6 次是靠 `exit_seconds` 的 1 s 上限交回的**（不是
+    #: "岔路离开视野 + 视野里有单根清晰的线"这个条件）—— 也就是"没确认就交回"。
+    #: 岔路在 EXIT 开始时还在脚下（分叉行落在 ROI 最底部），再走几厘米才会离开视野；
+    #: 同样 1 s 里从 10 cm 提到 14 cm，条件就更容易真正成立（交回更有把握），
+    #: 而且总用时不变。仍然是慢速（骨架限幅 0.30）。
+    exit_forward: float = 0.14
     exit_seconds: float = 1.0
-    exit_timeout: float = 2.0
+    exit_timeout: float = 2.5
+    #: EXIT 阶段顺线修正的增益（每 1° 偏差给多少 deg/s，比转向更温柔）。
+    exit_steer_gain: float = 1.0
+    #: 交回条件：岔路标志已经离开视野、视野里重新有**一条清晰的单根蓝线**，
+    #: 连续这么多帧 → COMPLETED（"只有蓝线像素"不够，见 `_finish_exit`）。
+    handback_confirm_frames: int = 3
 
     # ---- 自己先裁一遍限幅（骨架还会再裁一次）----
     max_forward: float = 0.30
@@ -259,8 +565,10 @@ class ForkDetection:
     """一帧的岔路检测结果。坐标都是**整幅图像**像素（与 `VisualDetection` 一致）。"""
 
     valid: bool
+    #: 分叉点所在的行（ROI 里最靠下的那行分叉）与它的横向中点，用来把走廊分左右。
     split_row: int = 0
     split_x: int = 0
+    #: **两条分支各自的方向** —— 取张开最大那一行（最上面那行）的段中心，对准/转弯时瞄它。
     left_x: int = 0
     right_x: int = 0
     gap_px: int = 0
@@ -270,8 +578,9 @@ class ForkDetection:
     box: Tuple[int, int, int, int] = (0, 0, 0, 0)
     #: ROI 里蓝线像素占比。即使判不出岔路也会填，用来判断"是不是整条线都不见了"。
     blue_ratio: float = 0.0
-    #: 整幅图像宽度，用来把像素偏差换算成归一化误差（对准阶段要用）。
+    #: 整幅图像宽度/高度，用来把像素偏差换算成归一化误差、以及判断"岔路离得多近"。
     frame_width: int = 0
+    frame_height: int = 0
 
     @classmethod
     def empty(cls) -> "ForkDetection":
@@ -283,10 +592,12 @@ class BlockageReading:
     """两条分支上"有没有车"的读数。`reading` 取 BLOCKAGE_* 四个值之一。"""
 
     reading: str
-    left_evidence: float = 0.0     # 左侧候车框面积占走廊的比例（0 表示没找到）
+    left_evidence: float = 0.0     # 左侧证据：画面判据=面积占比；官方读数=宽占比
     right_evidence: float = 0.0
     left_box: Optional[Tuple[int, int, int, int]] = None
     right_box: Optional[Tuple[int, int, int, int]] = None
+    #: 这条读数是谁给的：``"vision"``（本模块画面判据）或 ``"sdk"``（官方识别）。
+    source: str = "vision"
 
     @property
     def blocked(self) -> bool:
@@ -296,8 +607,11 @@ class BlockageReading:
         """一行短描述，直接塞进 message —— 实车运行记录里就能看见判据读数。"""
         left = "yes" if self.reading in (BLOCKAGE_LEFT, BLOCKAGE_BOTH) else "no"
         right = "yes" if self.reading in (BLOCKAGE_RIGHT, BLOCKAGE_BOTH) else "no"
-        return "vehicle L=%s(%.2f) R=%s(%.2f)" % (
-            left, self.left_evidence, right, self.right_evidence
+        # 画面判据的措辞保持不变（历史运行记录/测试都按它比对）；
+        # 官方读数单独标出来，复盘时一眼能看出这条判据是谁给的。
+        label = "official sighting" if self.source == "sdk" else "vehicle"
+        return "%s L=%s(%.2f) R=%s(%.2f)" % (
+            label, left, self.left_evidence, right, self.right_evidence
         )
 
 
@@ -317,6 +631,18 @@ def _odd_kernel(size: int) -> np.ndarray:
     if size % 2 == 0:
         size += 1
     return cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (size, size))
+
+
+def _scaled_px(value: float, scale: float) -> int:
+    """把"以原图为单位的像素参数"换算到缩放后的图上（`:meth:`FreeJunctionConfig
+    .vehicle_downscale` 缩小时，形态学核也要跟着缩，否则相对尺寸会翻倍）。"""
+    try:
+        factor = float(scale)
+    except (TypeError, ValueError):
+        factor = 1.0
+    if not math.isfinite(factor) or factor <= 0.0:
+        factor = 1.0
+    return max(1, int(round(float(value) * factor)))
 
 
 def _row_runs(row_mask: np.ndarray, merge_gap: int, min_run: int) -> List[Tuple[int, int]]:
@@ -359,9 +685,81 @@ def _separated_runs(
     return first, last, separation
 
 
+def _fork_rows(
+    mask: np.ndarray, merge_gap: int, min_run: int,
+    min_separation: float, min_gap_over_tape: float,
+) -> List[Tuple[int, Tuple[int, int], Tuple[int, int], float]]:
+    """整列扫描的**加速版**：先向量化筛掉无关行，再对候选行做精确判定。
+
+    为什么要改（2026-09-16 19:58 实车运行的教训）
+    --------------------------------------------
+    原来每一行都调一次 `_separated_runs`（194 行 × 一次 numpy 调用），
+    实车日志里 `free_junction step was slow: 0.031s (limit 0.020s)` 主要就是这段。
+    现在先用**一趟整块运算**把不可能有分叉的行滤掉，只对少数候选行精算。
+
+    两道预筛都**只是必要条件**，绝不会漏掉真分叉行：
+
+    1. 这一行至少有 2 段（按 `merge_gap` 合并、按 `min_run` 过滤都只会让段数变少）；
+    2. 这一行最左蓝像素到最右蓝像素的跨度 ≥ `min_separation`
+       （两段中心之间的距离一定不超过这个跨度）。
+
+    实车常见的"只有一条带子"帧在第 2 条就被全部滤掉，于是精确判定一次都不用做。
+    """
+    good = mask > 0
+    if not bool(np.any(good)):
+        return []
+    width = int(good.shape[1])
+    columns = np.arange(width, dtype=np.int32)
+    # 每行最左 / 最右的蓝像素列号（空行给哨兵值，后面会被其它条件滤掉）。
+    first_col = np.where(good, columns, width).min(axis=1)
+    last_col = np.where(good, columns, -1).max(axis=1)
+    # 每行有几段：**两边各补一个 False** 再数 False->True 的跳变，
+    # 这样"贴着 ROI 左右边缘的那一段"也数得到（少补一边就会漏，真车踩过）。
+    padded = np.zeros((good.shape[0], width + 2), dtype=np.int8)
+    padded[:, 1:-1] = good
+    runs_per_row = np.count_nonzero(np.diff(padded, axis=1) == 1, axis=1)
+    candidate = np.logical_and(
+        runs_per_row >= 2, (last_col - first_col) >= min_separation
+    )
+
+    rows: List[Tuple[int, Tuple[int, int], Tuple[int, int], float]] = []
+    for row in np.flatnonzero(candidate):
+        found = _separated_runs(
+            mask[row], merge_gap, min_run, min_separation, min_gap_over_tape
+        )
+        if found is not None:
+            first, last, separation = found
+            rows.append((int(row), first, last, separation))
+    return rows
+
+
 # ---------------------------------------------------------------------------
 # 岔路检测器
 # ---------------------------------------------------------------------------
+
+
+def _blue_mask(
+    roi: np.ndarray, settings: FreeJunctionConfig, scale: float = 1.0
+) -> np.ndarray:
+    """一块图里的蓝色带子掩码（bool）。岔路检测和找车都用这一套 HSV。
+
+    `scale` < 1 表示这张图是缩放过的：形态学核要**同比缩放**，核的相对大小才不变
+    —— 否则在缩小图上用原尺寸的核，等于把闭运算核放大了一倍，会把岔路的两条分支
+    重新粘成一条（config 里 `close_kernel` 的注释专门警告过这件事）。
+    """
+    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+    mask = cv2.inRange(
+        hsv,
+        np.array(settings.hsv_lower, dtype=np.uint8),
+        np.array(settings.hsv_upper, dtype=np.uint8),
+    )
+    mask = cv2.morphologyEx(
+        mask, cv2.MORPH_OPEN, _odd_kernel(_scaled_px(settings.open_kernel, scale))
+    )
+    mask = cv2.morphologyEx(
+        mask, cv2.MORPH_CLOSE, _odd_kernel(_scaled_px(settings.close_kernel, scale))
+    )
+    return mask > 0
 
 
 class FreeJunctionDetector:
@@ -373,18 +771,9 @@ class FreeJunctionDetector:
     def __init__(self, settings: Optional[FreeJunctionConfig] = None) -> None:
         self.settings = settings if settings is not None else FreeJunctionConfig()
 
-    def blue_mask(self, roi: np.ndarray) -> np.ndarray:
+    def blue_mask(self, roi: np.ndarray, scale: float = 1.0) -> np.ndarray:
         """ROI 里的蓝色带子掩码（bool）。"""
-        settings = self.settings
-        hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
-        mask = cv2.inRange(
-            hsv,
-            np.array(settings.hsv_lower, dtype=np.uint8),
-            np.array(settings.hsv_upper, dtype=np.uint8),
-        )
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, _odd_kernel(settings.open_kernel))
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, _odd_kernel(settings.close_kernel))
-        return mask > 0
+        return _blue_mask(roi, self.settings, scale)
 
     def roi_rect(self, frame: np.ndarray) -> Optional[Tuple[int, int, int, int]]:
         """把比例 ROI 换算成像素框 (left, top, right, bottom)。"""
@@ -415,8 +804,40 @@ class FreeJunctionDetector:
             return empty
         left, top, right, bottom = rect
         roi = frame[top:bottom, left:right]
-        mask = self.blue_mask(roi)
-        fork = self._locate(roi, mask, left, top, frame.shape[1])
+        # **岔路检测也在缩小的 ROI 上算**（`fork_downscale`）：分叉几何全是相对量，
+        # 缩放不改变判据，但把这一步的耗时按面积降下来。掩码最后放回 ROI 原尺寸，
+        # 这样 `analyze()` 的返回值和以前一样（外面拿它算"脚下那条线偏多少"，与尺度无关）。
+        factor = self._fork_scale(roi)
+        work = roi
+        if factor != 1.0:
+            work = cv2.resize(roi, None, fx=factor, fy=factor, interpolation=cv2.INTER_AREA)
+        mask = self.blue_mask(work, factor)
+        fork = self._locate(
+            work, mask, left, top, frame.shape[1], factor, frame.shape[0]
+        )
+        if factor != 1.0 and mask.size:
+            mask = cv2.resize(
+                mask.astype(np.uint8) * 255,
+                (int(roi.shape[1]), int(roi.shape[0])),
+                interpolation=cv2.INTER_NEAREST,
+            ) > 0
+        return fork, roi, mask, rect
+
+    def _fork_scale(self, roi: np.ndarray) -> float:
+        """岔路检测要在多小的 ROI 上算（1.0 = 原尺寸，见 `fork_downscale`）。"""
+        settings = self.settings
+        try:
+            scale = float(getattr(settings, "fork_downscale", 1.0))
+        except (TypeError, ValueError):
+            return 1.0
+        if not math.isfinite(scale) or not 0.0 < scale < 1.0:
+            return 1.0
+        if roi is None or getattr(roi, "size", 0) == 0:
+            return 1.0
+        minimum = int(getattr(settings, "fork_downscale_min_pixels", 0) or 0)
+        if int(roi.shape[0]) * int(roi.shape[1]) < max(0, minimum):
+            return 1.0
+        return scale
         return fork, roi, mask, rect
 
     def detect(self, image: Optional[np.ndarray]) -> ForkDetection:
@@ -424,23 +845,38 @@ class FreeJunctionDetector:
         fork, _roi, _mask, _rect = self.analyze(image)
         return fork
 
-    def _locate(self, roi, mask, left, top, frame_width) -> ForkDetection:
-        """在已经算好的 ROI 掩码里找分叉（整列扫描 + 张开度判据）。"""
+    def _locate(
+        self, roi, mask, left, top, frame_width, factor: float = 1.0,
+        frame_height: int = 0,
+    ) -> ForkDetection:
+        """在已经算好的 ROI 掩码里找分叉（整列扫描 + 张开度判据）。
+
+        `factor` < 1 表示这张掩码是缩放过的：**像素阈值同比缩放**（判据全是相对量），
+        结果坐标再换算回整帧像素，所以对外看到的 `ForkDetection` 与不缩放时同义。
+        """
         settings = self.settings
+        try:
+            scale = float(factor)
+        except (TypeError, ValueError):
+            scale = 1.0
+        if not math.isfinite(scale) or scale <= 0.0:
+            scale = 1.0
         roi_height, roi_width = mask.shape[:2]
         blue_ratio = float(np.count_nonzero(mask)) / float(max(1, mask.size))
-        empty = ForkDetection(valid=False, blue_ratio=blue_ratio, frame_width=frame_width)
+        empty = ForkDetection(
+            valid=False, blue_ratio=blue_ratio, frame_width=frame_width,
+            frame_height=int(frame_height),
+        )
 
         # A2：整列扫描（v1 只看 50% 处那 7 行，远一点的岔路会整个漏掉）。
-        rows: List[Tuple[int, Tuple[int, int], Tuple[int, int], float]] = []
-        for row in range(roi_height):
-            found = _separated_runs(
-                mask[row], settings.merge_gap_px, settings.min_run_px,
-                settings.min_branch_separation_px, settings.min_gap_over_tape,
-            )
-            if found is not None:
-                first, last, separation = found
-                rows.append((row, first, last, separation))
+        # 具体实现在 `_fork_rows()`：先向量化筛掉无关行，只对候选行精算 —— 逐行
+        # 调用 numpy 是实车 step() 超预算的主因（2026-09-16 19:58 那次运行）。
+        min_separation = float(settings.min_branch_separation_px) * scale
+        rows = _fork_rows(
+            mask, _scaled_px(settings.merge_gap_px, scale),
+            _scaled_px(settings.min_run_px, scale),
+            min_separation, settings.min_gap_over_tape,
+        )
 
         if len(rows) < max(1, int(settings.min_fork_rows)):
             return empty
@@ -454,25 +890,46 @@ class FreeJunctionDetector:
         if top_row >= split_row or divergence < settings.min_divergence_ratio:
             return empty
 
-        left_x = int(round((first[0] + first[1]) / 2.0)) + left
-        right_x = int(round((last[0] + last[1]) / 2.0)) + left
-        split_x = int(round((left_x + right_x) / 2.0))
-        confidence = min(
-            1.0, separation / max(1.0, float(settings.min_branch_separation_px) * 2.0)
-        )
+        # **`left_x` / `right_x` 要的是"两条分支各自往哪边走"**，所以取**张开最大的
+        # 那几行**（最上面那四分之一，至少 3 行）的段中心平均。
+        #
+        # * 不能取分叉行：那两行上分支刚分开、几乎重合，拿它的中心当瞄准点等于
+        #   "几乎直行" —— 2026-09-17 实车就是这么翻的（选了右支、yaw 只有 +2.5，
+        #   车最后开进左边那条有车的分支）；
+        # * 也不能只取最上面一行：单行会被噪声带偏，2026-09-17 12:18 那次实车
+        #   TURN 阶段的 yaw 出现过 20/12/20 来回跳。
+        # `split_x`（分左右走廊用）仍然是分叉行的中点。
+        head = rows[: max(1, min(len(rows), max(3, len(rows) // 4)))]
+
+        def to_frame(value: float) -> int:
+            return int(round(float(value) / scale))
+
+        def centre(run) -> float:
+            return (run[0] + run[1]) / 2.0
+
+        split_x = to_frame((first[0] + first[1] + last[0] + last[1]) / 4.0) + left
+        left_x = to_frame(sum(centre(row[1]) for row in head) / len(head)) + left
+        right_x = to_frame(sum(centre(row[2]) for row in head) / len(head)) + left
+        confidence = min(1.0, separation / max(1.0, min_separation * 2.0))
         return ForkDetection(
             valid=True,
-            split_row=split_row + top,
+            split_row=to_frame(split_row) + top,
             split_x=split_x,
             left_x=left_x,
             right_x=right_x,
-            gap_px=int(max(0, last[0] - first[1])),
-            separation_px=int(separation),
+            gap_px=int(max(0, last[0] - first[1]) / scale),
+            separation_px=int(round(separation / scale)),
             divergence=round(float(divergence), 3),
             confidence=confidence,
-            box=(max(0, left_x - 20), top, min(frame_width, right_x + 20), top + roi_height),
+            box=(
+                max(0, left_x - 20),
+                top,
+                min(frame_width, right_x + 20),
+                top + to_frame(roi_height),
+            ),
             blue_ratio=blue_ratio,
             frame_width=frame_width,
+            frame_height=int(frame_height),
         )
 
 
@@ -499,14 +956,58 @@ class VehicleDetector:
     def __init__(self, settings: Optional[FreeJunctionConfig] = None) -> None:
         self.settings = settings if settings is not None else FreeJunctionConfig()
 
+    def _erase_tape(self, gray: np.ndarray, line: Optional[np.ndarray]) -> np.ndarray:
+        """把蓝带**连同边缘**抹成周围地面的灰度。
+
+        HSV 掩码只盖得住胶带芯，边缘的抗锯齿混合像素在掩码外面；不抹掉它们，
+        判据就会把胶带自己的轮廓当成"一块东西"（2026-09-16 真车实测踩过这个坑：
+        干净的那条分支被报成"有车"，于是走了堵的那条）。
+        """
+        if line is None or not bool(np.any(line)):
+            return gray
+        tape = np.zeros(gray.shape, dtype=np.uint8)
+        tape[line] = 255
+        grow = int(self.settings.tape_clear_px)
+        if grow >= 3:
+            tape = cv2.dilate(tape, _odd_kernel(grow))
+        tape = tape > 0
+        floor = gray[~tape]
+        if not floor.size:
+            return gray
+        out = gray.copy()
+        out[tape] = int(np.median(floor))
+        return out
+
+    def contrast_mask(self, region: np.ndarray, line: Optional[np.ndarray]) -> np.ndarray:
+        """大尺度局部对比度：车 = "比周围地面暗一大块（或亮一大块）"。
+
+        * 大核均值模糊得到"周围地面"的亮度水平，再和原图求 |差|；
+        * 车是一两百像素的大块，差值很大；地砖的黑点、反光是 1~3 像素的小尺度纹理，
+          被大核平均进地面里，差值很小 → 自然被抹掉；
+        * 取**绝对值** → 深色车、浅色车都能抓（这才是"不看颜色"的正确做法）。
+        """
+        settings = self.settings
+        gray = self._erase_tape(cv2.cvtColor(region, cv2.COLOR_BGR2GRAY), line)
+        sigma = float(settings.contrast_blur_sigma)
+        if sigma > 0.0:
+            gray = cv2.GaussianBlur(gray, (0, 0), sigmaX=sigma)
+        height = int(gray.shape[0])
+        kernel = int(max(3, round(_clamp(settings.contrast_kernel_ratio, 0.05, 0.5) * height)))
+        if kernel % 2 == 0:
+            kernel += 1
+        background = cv2.blur(gray, (kernel, kernel))
+        mask = cv2.absdiff(background, gray) > int(settings.contrast_threshold)
+        mask = mask.astype(np.uint8) * 255
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, _odd_kernel(3))
+        if settings.contrast_close >= 3:
+            mask = cv2.morphologyEx(
+                mask, cv2.MORPH_CLOSE, _odd_kernel(settings.contrast_close)
+            )
+        return mask
+
     def structure_mask(self, region: np.ndarray, line: Optional[np.ndarray]) -> np.ndarray:
         settings = self.settings
-        gray = cv2.cvtColor(region, cv2.COLOR_BGR2GRAY)
-        if line is not None and bool(np.any(line)):
-            floor = gray[~line]
-            if floor.size:
-                gray = gray.copy()
-                gray[line] = int(np.median(floor))
+        gray = self._erase_tape(cv2.cvtColor(region, cv2.COLOR_BGR2GRAY), line)
         edges = cv2.Canny(gray, int(settings.edge_low), int(settings.edge_high))
         if settings.edge_dilate >= 3:
             edges = cv2.dilate(edges, _odd_kernel(settings.edge_dilate))
@@ -531,32 +1032,139 @@ class VehicleDetector:
             )
         return mask
 
-    def detect(
-        self, region: Optional[np.ndarray], line: Optional[np.ndarray] = None
-    ) -> Tuple[bool, float, Optional[Tuple[int, int, int, int]]]:
-        """返回 (这段走廊里有没有车, 证据强度 0~1, 外接框或 None)。"""
+    def mask_kind(self) -> str:
+        """当前用哪套判据（决定闸门用哪一组）。"""
+        return "robot" if self.settings.use_robot_signature else "contrast"
+
+    def robot_mask(
+        self, region: np.ndarray, line: Optional[np.ndarray], scale: float = 1.0
+    ) -> np.ndarray:
+        """按 **RoboMaster S1 / EP 小车**的特征做掩码：深色车体 ∪ 高饱和彩色装甲/灯。
+
+        真车画面实测（2026-09-16，车框 124x124，两帧一致）：
+
+        ==================  ==================  ==========
+        特征                 停着的小车           空地
+        ==================  ==================  ==========
+        深色 V<=90 占比       0.61 ~ 0.70         0.04 ~ 0.08
+        高饱和 S>=100 占比    0.25 ~ 0.34         **0.000**
+        其中蓝 / 绿           0.10 / 0.07~0.14    0
+        ==================  ==================  ==========
+
+        所以"深色车体 + 鲜艳的装甲/灯"这两条一合，S1/EP 就出来了；而花岗岩地砖、
+        影子、反光、白墙都**没有鲜艳色**，进不来。这两个比例还是**尺度无关**的，
+        车离得远（1 米、2 米）一样成立 —— 这是"1 米间距也能认出来"的关键。
+        """
+        settings = self.settings
+        hsv = cv2.cvtColor(region, cv2.COLOR_BGR2HSV)
+        value, sat = hsv[:, :, 2], hsv[:, :, 1]
+        dark = value <= int(settings.robot_dark_v_max)
+        accent = sat >= int(settings.robot_accent_s_min)
+        if line is not None and bool(np.any(line)):
+            # 胶带自己也是高饱和的（蓝色），而且它旁边常有一条暗影子：
+            # 把胶带（含边缘）抠掉，免得"胶带+影子"被凑成一辆车。
+            tape = np.zeros(dark.shape, dtype=np.uint8)
+            tape[line] = 255
+            grow = _scaled_px(settings.tape_clear_px, scale)
+            if grow >= 3:
+                tape = cv2.dilate(tape, _odd_kernel(grow))
+            inside_tape = tape > 0
+            accent = np.logical_and(accent, np.logical_not(inside_tape))
+            dark = np.logical_and(dark, np.logical_not(inside_tape))
+        # 快速出口：这一块里根本没有"胶带之外的鲜艳色" → 不可能是 S1/EP。
+        # 现场实测空地和暗墙的高饱和像素是 **0.000**，所以常见帧在这里就结束了，
+        # 后面的形态学 + 连通块一个都不用做。
+        if not bool(np.any(accent)):
+            return np.zeros(dark.shape, np.uint8)
+        # **"深色车体" + "它身上/旁边有彩色装甲"** —— 注意是**连通块**层面的判断：
+        # 暗墙、门框、踢脚线也是深色，光看深色会把背景一起圈进来；而彩色（装甲灯、
+        # 彩色件）在场地上只有小车有（空地和墙的高饱和像素实测是 0.000）。
+        # 所以：**被彩色碰到的那一整块深色**才算一辆车 —— 只保留彩色旁边几行像素
+        # 是不行的（那会把车体切成两条细边，长宽比直接出界）。
+        dark_u8 = (dark.astype(np.uint8)) * 255
+        dark_u8 = cv2.morphologyEx(dark_u8, cv2.MORPH_OPEN, _odd_kernel(3))
+        close = _scaled_px(settings.robot_close_px, scale)
+        if close >= 3:
+            dark_u8 = cv2.morphologyEx(dark_u8, cv2.MORPH_CLOSE, _odd_kernel(close))
+        accent_u8 = (accent.astype(np.uint8)) * 255
+        accent_core = cv2.morphologyEx(accent_u8, cv2.MORPH_OPEN, _odd_kernel(3))
+        grow = _scaled_px(settings.robot_accent_grow_px, scale)
+        accent_near = accent_core
+        if grow >= 3:
+            accent_near = cv2.dilate(accent_core, _odd_kernel(grow))
+        if not bool(np.any(accent_core)) or not bool(np.any(dark_u8)):
+            return np.zeros(dark.shape, np.uint8)
+        count, labels, _stats, _centroids = cv2.connectedComponentsWithStats(dark_u8, 8)
+        if count <= 1:
+            return np.zeros(dark.shape, np.uint8)
+        touched = np.unique(labels[accent_near > 0])
+        hit = np.zeros(count, dtype=bool)
+        hit[touched] = True
+        hit[0] = False                     # 0 号是背景
+        if not bool(np.any(hit)):
+            return np.zeros(dark.shape, np.uint8)
+        # 车体整块留下，再把**长在它身上的彩色装甲/灯**一起并进来
+        # （装甲在图上盖住车体，所以它们是"深色连通块"之外的像素，不并进来
+        #  外接框就会比车小一圈，彩色占比也就量不准了）。
+        kept = (hit[labels].astype(np.uint8)) * 255
+        grown = kept
+        if grow >= 3:
+            grown = cv2.dilate(kept, _odd_kernel(grow))
+        return cv2.bitwise_or(kept, cv2.bitwise_and(accent_core, grown))
+
+    def build_mask(
+        self, region: np.ndarray, line: Optional[np.ndarray] = None, scale: float = 1.0
+    ) -> np.ndarray:
+        """把一块区域算成"可能是车"的掩码（判据按开关组合；整块只算一次）。
+
+        `scale` 是这块图相对原图的缩放比（`:attr:`FreeJunctionConfig.vehicle_downscale``）：
+        只有用到**像素单位**参数的判据才需要它（现在的 S1/EP 判据是）。
+        """
         settings = self.settings
         if region is None or region.size == 0:
-            return False, 0.0, None
+            return np.zeros((0, 0), np.uint8)
         height, width = region.shape[:2]
-        if height < 8 or width < 8:
-            return False, 0.0, None
-
         mask = np.zeros((height, width), np.uint8)
+        if height < 8 or width < 8:
+            return mask
+        if line is None:
+            line = _blue_mask(region, settings)
+        if settings.use_robot_signature:
+            mask = cv2.bitwise_or(mask, self.robot_mask(region, line, scale))
+        if settings.use_local_contrast:
+            mask = cv2.bitwise_or(mask, self.contrast_mask(region, line))
         if settings.use_structure:
             mask = cv2.bitwise_or(mask, self.structure_mask(region, line))
         if settings.use_color_ranges:
             mask = cv2.bitwise_or(mask, self.color_mask(region))
-        if not bool(np.any(mask)):
-            return False, 0.0, None
+        return mask
 
+    def pick(
+        self, mask: np.ndarray, region: np.ndarray, line: Optional[np.ndarray] = None
+    ) -> Tuple[bool, float, Optional[Tuple[int, int, int, int]]]:
+        """在掩码里挑一个"像车"的外接框（按当前判据过闸门）。"""
+        settings = self.settings
+        if mask is None or mask.size == 0 or region is None:
+            return False, 0.0, None
+        height, width = mask.shape[:2]
+        if height < 8 or width < 8 or not bool(np.any(mask)):
+            return False, 0.0, None
+        if line is None:
+            line = _blue_mask(region, settings)
+
+        kind = self.mask_kind()
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         region_area = float(max(1, height * width))
         skin = self._skin_mask(region) if settings.reject_skin_like else None
         best: Optional[Tuple[float, Tuple[int, int, int, int]]] = None
         for contour in contours:
             box = cv2.boundingRect(contour)
-            score = self._score_box(mask, skin, box, height, width, region_area)
+            if kind == "robot":
+                score = self._robot_box_ok(
+                    region, line, skin, mask, box, height, width, region_area
+                )
+            else:
+                score = self._score_box(mask, skin, box, height, width, region_area)
             if score is None:
                 continue
             if best is None or score > best[0]:
@@ -566,8 +1174,19 @@ class VehicleDetector:
             return False, 0.0, None
         score, box = best
         x, y, box_width, box_height = box
-        absolute = (int(x), int(y), int(x + box_width), int(y + box_height))
-        return True, round(float(score), 3), absolute
+        return True, round(float(score), 3), (
+            int(x), int(y), int(x + box_width), int(y + box_height)
+        )
+
+    def detect(
+        self, region: Optional[np.ndarray], line: Optional[np.ndarray] = None
+    ) -> Tuple[bool, float, Optional[Tuple[int, int, int, int]]]:
+        """返回 (这块区域里有没有车, 证据强度, 外接框或 None)。"""
+        if region is None or region.size == 0:
+            return False, 0.0, None
+        if line is None:
+            line = _blue_mask(region, self.settings)
+        return self.pick(self.build_mask(region, line), region, line)
 
     def _skin_mask(self, region: np.ndarray) -> np.ndarray:
         hsv = cv2.cvtColor(region, cv2.COLOR_BGR2HSV)
@@ -615,6 +1234,79 @@ class VehicleDetector:
                     return None
         return area_ratio
 
+    def _robot_box_ok(
+        self, region: np.ndarray, line: Optional[np.ndarray], skin: Optional[np.ndarray],
+        mask: np.ndarray, box: Tuple[int, int, int, int], height: int, width: int,
+        region_area: float,
+    ) -> Optional[float]:
+        """**S1/EP 专用闸门**：尺寸（松）+ 长宽比 + 不肤色 + 深色车体 + 高饱和彩色装甲。
+
+        和"局部对比度"那套的区别：这里判的是**颜色构成**，不是"比周围暗一块"。
+        因为深色占比和高饱和占比都是**尺度无关**的（而且只统计候选块自己），
+        所以尺寸闸门可以放得很松（`robot_min_*` 只要 0.10/0.015），
+        车远到 1~2 米也照样能过。
+        """
+        settings = self.settings
+        x, y, box_width, box_height = box
+        if box_width <= 0 or box_height <= 0:
+            return None
+        # 尺寸：只挡掉明显不是车的小碎块（远距离的车很小，所以门槛很低）。
+        if box_width < settings.robot_min_width_ratio * width:
+            return None
+        if box_height < settings.robot_min_height_ratio * height:
+            return None
+        area_ratio = (box_width * box_height) / region_area
+        if area_ratio < settings.robot_min_area_ratio:
+            return None
+        if area_ratio > settings.robot_max_area_ratio:
+            return None
+        # 长宽比：S1/EP 俯视/斜视大致 0.5~2.5，太细长的一定不是车。
+        aspect = box_width / float(box_height)
+        if aspect < settings.robot_min_aspect or aspect > settings.robot_max_aspect:
+            return None
+        # 手：肤色占比过半直接丢。
+        if skin is not None:
+            skin_patch = skin[y:y + box_height, x:x + box_width]
+            if skin_patch.size:
+                skin_ratio = float(np.count_nonzero(skin_patch)) / float(skin_patch.size)
+                if skin_ratio > settings.skin_reject_ratio:
+                    return None
+        # 颜色构成 —— 这才是"是不是 S1/EP"的依据。
+        # **只统计候选块自己**（mask 里的像素 = 深色车体 + 长在它身上的彩色装甲），
+        # 不按整框算：现场里车常和暗墙/踢脚线连成一块（框能大到 271x273），
+        # 按整框算比例会被背景稀释，车稍微暗一点就掉出闸门。
+        patch_hsv = cv2.cvtColor(
+            region[y:y + box_height, x:x + box_width], cv2.COLOR_BGR2HSV
+        )
+        value = patch_hsv[:, :, 2]
+        sat = patch_hsv[:, :, 1]
+        inside = mask[y:y + box_height, x:x + box_width] > 0
+        if line is not None:
+            tape_patch = line[y:y + box_height, x:x + box_width]
+            valid = np.logical_and(np.logical_not(tape_patch), inside)
+        else:
+            valid = inside
+        total = float(max(1, int(np.count_nonzero(valid))))
+        dark_ratio = float(
+            np.count_nonzero(np.logical_and(value <= settings.robot_dark_v_max, valid))
+        ) / total
+        accent_ratio = float(
+            np.count_nonzero(np.logical_and(sat >= settings.robot_accent_s_min, valid))
+        ) / total
+        if dark_ratio < settings.robot_dark_min_ratio:
+            return None
+        if accent_ratio < settings.robot_accent_min_ratio:
+            return None
+        # **"显眼"候选要彩色更多**：大面积（墙/暗带糊成一块）或宽扁（门框、踢脚线）
+        # 的候选，必须真的带够鲜艳色才算车。这一条同时挡住了 2026-09-17 换场地后
+        # 出现的那两类误报（墙裙 0.074、门框 0.062），而真车（0.22~0.27）照旧过。
+        prominent = (area_ratio >= settings.robot_large_area_ratio
+                     or aspect >= settings.robot_wide_aspect_ratio)
+        if prominent and accent_ratio < settings.robot_strong_accent_min_ratio:
+            return None
+        # 分数：越"又黑又有鲜艳装甲"越像（0~2）。
+        return dark_ratio + accent_ratio
+
 
 # ---------------------------------------------------------------------------
 # 任务
@@ -651,6 +1343,17 @@ class FreeJunctionTask:
         )
         self.state = JunctionState.IDLE
         self.last_detection: Optional[ForkDetection] = None
+        #: 官方 SDK 观测的快照（由 `main.py` 每帧推送，见 `update_candidates()`）。
+        #: 回调可能来自 SDK 自己的线程，所以读写都要过这把锁。
+        self._sdk_lock = threading.Lock()
+        self._sdk_rows: Tuple = ()
+        self._sdk_pushed_at: Optional[float] = None
+        #: 最近一次官方读数被判成哪种坐标（"normalized"/"pixels"/""）——实车排查用。
+        self.last_sdk_mode = ""
+        #: 从启动到现在，官方识别**一共报过几条**"看到一辆 RoboMaster 小车"。
+        #: 一直是 0 就说明集成层还没订阅 robot 识别（那时用的是画面判据兜底）——
+        #: 主循环的 message 会直接写出来，实车上一眼可见。
+        self.official_sightings = 0
         self.last_blockage = BlockageReading(BLOCKAGE_NONE)
         self.last_visual = VisualDetection.no_result(KIND)
         self.chosen_branch: Optional[Branch] = None
@@ -666,7 +1369,10 @@ class FreeJunctionTask:
         self._decide_count = 0
         self._clear_count = 0
         self._lost_count = 0
+        self._center_count = 0
+        self._handback_count = 0
         self._last_blue_ratio = 0.0
+        self._last_line_mask = None
         self._state_since: Optional[float] = None
         self._run_started_at: Optional[float] = None
         self._rearm_ready_at: Optional[float] = None
@@ -709,8 +1415,16 @@ class FreeJunctionTask:
         self.last_message = "reset"
         self.last_outcome = None
         self._decide_count = 0
+        self._center_count = 0
+        self._handback_count = 0
+        self._last_line_mask = None
         self._state_since = None
         self._run_started_at = None
+        with self._sdk_lock:
+            # 被迫结束后把官方读数也丢掉：那是上一次接管时的画面，不能接着用。
+            self._sdk_rows = ()
+            self._sdk_pushed_at = None
+        self.last_sdk_mode = ""
         self._arm_rearm()
 
     def detect(self, image: Optional[np.ndarray]) -> VisualDetection:
@@ -720,7 +1434,7 @@ class FreeJunctionTask:
         不用虚构坐标冒充结果。
         """
         fork, roi, line, rect = self.detector.analyze(image)
-        reading = self._read_blockage(fork, roi, line, rect)
+        reading = self._read_blockage(fork, image, rect)
         self.last_blockage = reading
         branch: Optional[Branch] = None
         reason = "no junction"
@@ -737,56 +1451,182 @@ class FreeJunctionTask:
         self._last_now = moment
         if frame is None or getattr(frame, "image", None) is None:
             return self._handle_missing_image(moment)
+        # 封锁期内（刚走完一个岔路 / 刚被人工或协调器踢出来）这一帧必定是
+        # "不接管"，而看一次画面（岔路检测）是整帧里最贵的一步 —— 那就别看。
+        # 实车日志里 `free_junction step was slow` 有相当一部分就出在这些帧上
+        # （2026-09-16 19:58 的 14.7s/15.8s、2026-09-17 11:43 的 18.9s）。
+        if self.state is JunctionState.IDLE and self._rearm_cooling(moment):
+            self._confirm_count = 0
+            return self._not_triggered("rearm gate")
 
         fork, roi, line, rect = self.detector.analyze(frame.image)
         self.last_detection = fork if fork.valid else None
         self._last_blue_ratio = fork.blue_ratio
-        reading = self._read_blockage(fork, roi, line, rect)
-        self.last_blockage = reading
+        self._last_line_mask = line
+        # 只有"要不要接管"（IDLE）和"往哪边拐"（DECIDE）需要判据；APPROACH / TURN /
+        # EXIT 用的是**已经定下来的分支**，再算一次纯属白花时间（实车日志里
+        # `free_junction step was slow` 有几次就落在这些阶段）。
+        if self._wants_blockage_reading():
+            self.last_blockage = self._read_blockage(fork, frame.image, rect, moment)
+        reading = self.last_blockage
         self.last_visual = self._visual(fork, self.chosen_branch)
 
         if self.state is JunctionState.IDLE:
             return self._step_idle(fork, reading, moment)
         return self._step_active(fork, reading, moment)
 
+    # -- 官方 SDK 观测（集成层推来的纯数据）--------------------------------
+
+    def update_candidates(self, candidates: Iterable, now: Optional[float] = None) -> None:
+        """主循环推来的**官方 SDK 观测快照**（与 6 号 `number_marker` 同一套接口）。
+
+        接这条通路**不需要改 `main.py` / `task_registry.py`**：`main.py` 的
+        `feed_marker_observations()` 每帧对任何实现了本方法的名字调一次
+        （``push(candidates)``，喂在 `coordinator.step()` 之前）。
+
+        本模块只**存快照**：不订阅、不碰 SDK、不做判定 —— 判定在
+        `_read_blockage()` 里，而且只在 `blockage_source` 选了官方读数时才用。
+
+        :param candidates: 可迭代，元素可以是 `MarkerCandidate` 这类对象
+            （``center``/``width``/``height``/``observed_at``），也可以是 SDK 原始行
+            ``(x, y, w, h)``（机器人识别）或 ``(x, y, w, h, 标签)``（视觉标签）。
+            坐标是归一化还是像素都能认（见 `sighting_from_observation`）。
+        :param now: 给"没有自带时间戳的原始行"打的时间戳（默认取单调钟；
+            离线测试可以传真时钟，这样判定完全可复现）。
+        """
+        try:
+            snapshot = tuple(candidates) if candidates is not None else ()
+        except TypeError:
+            snapshot = ()
+        stamp = time.monotonic() if now is None else now
+        try:
+            stamp = float(stamp)
+        except (TypeError, ValueError):
+            stamp = None
+        with self._sdk_lock:
+            self._sdk_rows = snapshot
+            self._sdk_pushed_at = stamp
+
+    def _sdk_sightings(
+        self, frame_width: int, frame_height: int, now: float
+    ) -> List[SdkSighting]:
+        """快照 → 整帧像素坐标的观测列表，**顺带扔掉过期的**。
+
+        过期这一条很关键：官方识别是"有就推"的回调，车拐过去之后旧读数可能还挂在
+        快照里；拿一条过期读数去选路，比"没有判据"危险得多。
+        """
+        with self._sdk_lock:
+            rows = self._sdk_rows
+            pushed_at = self._sdk_pushed_at
+        hold = max(0.0, float(self.settings.sdk_observation_hold_seconds))
+        sightings: List[SdkSighting] = []
+        mode = ""
+        for row in rows:
+            sighting = sighting_from_observation(row, frame_width, frame_height)
+            if sighting is None:
+                continue
+            stamp = sighting.observed_at if sighting.observed_at is not None else pushed_at
+            if stamp is None:
+                continue            # 没时间戳 = 不知道新不新鲜 → 不敢用
+            age = float(now) - float(stamp)
+            if not math.isfinite(age) or age < 0.0 or age > hold:
+                continue
+            if observation_is_normalized(row):
+                mode = mode or "normalized"
+            else:
+                mode = "pixels"
+            sightings.append(sighting)
+        self.last_sdk_mode = mode
+        return sightings
+
     # -- 拥堵读数 ---------------------------------------------------------
 
+    def _wants_blockage_reading(self) -> bool:
+        """这一帧要不要算"哪条分支堵"（算一次 5~9 ms，别在不需要时白算）。
+
+        * IDLE：要 —— 决定要不要接管；
+        * DECIDE：要 —— 落子前让判据稳定；
+        * APPROACH / TURN / EXIT / 终态：**不要** —— 走的哪条分支早就定了，
+          这一段再看判据对结果没有任何影响（实车日志里 step 超预算有几次就在这儿）。
+        """
+        return self.state in (JunctionState.IDLE, JunctionState.DECIDE)
+
     def _read_blockage(
-        self, fork: ForkDetection, roi, line_mask, rect
+        self, fork: ForkDetection, frame, rect, now: Optional[float] = None
     ) -> BlockageReading:
         """读两条分支走廊：哪边停着车（A5）。
 
-        走廊 = ROI 下部那一块（默认就是整个 ROI），以 `split_x` 分成左右两块。
-        **刻意不锚在分叉行上**：车停在分支上会挡住那段胶带，被挡之后"最低的合格分叉行"
-        会被顶到车的前面，锚在分叉行上的走廊反而会把车漏在外面（v2 早期版本踩过）。
-        锚在 ROI 下沿 = "离车最近的这一段"，也正好对应"不远处停着一辆车"。
+        按 `blockage_source` 选判据来源：默认自己的画面判据；
+        选了官方读数（`"sdk"` / `"sdk_or_vision"`）时先看官方读数。
+
+        区域 = **整帧高度上的一条带**（`blockage_top_ratio` ~ `blockage_bottom_ratio`），
+        横向沿用岔路 ROI 的左右边界，再以分叉点 `split_x` 分成左右两块。
+        两种来源**用同一条带、同一个分叉点**，所以左右的定义完全一致。
+
+        为什么不像 v2 那样直接用岔路 ROI：2026-09-16 真车实测，停着的那辆车在
+        **画面上方**（y≈36~159），而岔路 ROI 只有 y 0.54~0.96 —— 车整个在区域外面，
+        于是"真堵的那条反而报没有车"。上沿抬到 0.10 把远处的车包进来，
+        下沿压到 0.86 是为了排掉我们自己车头常驻的橙色轮子/车体。
         """
         settings = self.settings
-        if not fork.valid or roi is None or roi.size == 0 or line_mask is None:
+        if not fork.valid or frame is None or rect is None:
             return BlockageReading(BLOCKAGE_NONE)
-        if rect is None:
+        image = np.asarray(frame)
+        if image.ndim != 3 or image.shape[2] != 3:
             return BlockageReading(BLOCKAGE_NONE)
+        height = int(image.shape[0])
 
-        roi_left, roi_top = int(rect[0]), int(rect[1])
-        roi_height, roi_width = roi.shape[:2]
-        split_x_local = int(fork.split_x) - roi_left
+        source = str(getattr(settings, "blockage_source", "vision")).strip().lower()
+        if source not in ("vision", "sdk", "sdk_or_vision"):
+            source = "vision"
+        moment = self._last_now if now is None else float(now)
+        if source != "vision":
+            official = self._read_sdk_blockage(fork, image, rect, moment)
+            # "sdk"：官方说没有就是没有（这是它的判据，不再退回画面）；
+            # "sdk_or_vision"：官方这一帧没读数 → 退回画面判据兜底。
+            if source == "sdk" or official.blocked:
+                return official
 
-        corridor_height = int(_clamp(settings.corridor_height_ratio, 0.1, 1.0) * roi_height)
-        bottom_margin = int(_clamp(settings.corridor_bottom_margin, 0.0, 0.4) * roi_height)
-        corridor_bottom = int(max(12, roi_height - bottom_margin))
-        corridor_top = int(max(0, corridor_bottom - corridor_height))
-        if corridor_bottom - corridor_top < 8:
+        left_edge, right_edge = int(rect[0]), int(rect[2])
+        top = int(_clamp(settings.blockage_top_ratio, 0.0, 0.9) * height)
+        bottom = int(_clamp(settings.blockage_bottom_ratio, 0.1, 1.0) * height)
+        if bottom - top < 16 or right_edge - left_edge < 16:
             return BlockageReading(BLOCKAGE_NONE)
-        margin = int(_clamp(settings.corridor_side_margin, 0.0, 0.4) * roi_width)
-        divider = int(max(6, min(roi_width - 6, split_x_local)))
+        region = image[top:bottom, left_edge:right_edge]
 
-        left_region = roi[corridor_top:corridor_bottom, margin:divider]
-        right_region = roi[corridor_top:corridor_bottom, divider + margin:roi_width - margin]
-        left_line = line_mask[corridor_top:corridor_bottom, margin:divider]
-        right_line = line_mask[corridor_top:corridor_bottom, divider + margin:roi_width - margin]
+        # **在缩小的图上算判据**（`vehicle_downscale`）：深色占比、彩色占比都是
+        # 尺度无关的，离线实测整幅画面缩到 0.45 倍仍判对；而这一步是 step() 的大头
+        # （实车 2026-09-16 19:58 那次运行里 `free_junction step was slow` 就是它）。
+        # 像素单位的形态学核跟着缩放，框再换算回整帧坐标。
+        factor = self._vehicle_scale(region)
+        work = region
+        if factor != 1.0:
+            work = cv2.resize(
+                region,
+                (
+                    max(8, int(round(region.shape[1] * factor))),
+                    max(8, int(round(region.shape[0] * factor))),
+                ),
+                interpolation=cv2.INTER_AREA,
+            )
+        work_width = int(work.shape[1])
 
-        left_blocked, left_score, left_box = self.vehicle.detect(left_region, left_line)
-        right_blocked, right_score, right_box = self.vehicle.detect(right_region, right_line)
+        divider = int(
+            max(6, min(work_width - 6, int(round((int(fork.split_x) - left_edge) * factor))))
+        )
+        left_region = work[:, :divider]
+        right_region = work[:, divider:]
+
+        # 蓝带掩码在这块区域里算**一次**，左右两侧共用（省一半时间，真车日志里
+        # step() 曾经因为每侧各算一遍而超预算）。判据本身在 VehicleDetector 里。
+        line_region = _blue_mask(work, self.settings)
+        mask = self.vehicle.build_mask(work, line_region, factor)
+        left_blocked, left_score, left_box = self.vehicle.pick(
+            mask[:, :divider], left_region, line_region[:, :divider]
+        )
+        right_blocked, right_score, right_box = self.vehicle.pick(
+            mask[:, divider:], right_region, line_region[:, divider:]
+        )
 
         if left_blocked and right_blocked:
             reading = BLOCKAGE_BOTH
@@ -801,19 +1641,118 @@ class FreeJunctionTask:
             reading=reading,
             left_evidence=left_score,
             right_evidence=right_score,
-            left_box=self._to_frame(left_box, rect, margin, corridor_top),
-            right_box=self._to_frame(right_box, rect, divider + margin, corridor_top),
+            left_box=self._to_frame(left_box, left_edge, top, factor),
+            right_box=self._to_frame(
+                right_box, left_edge + int(round(divider / factor)), top, factor
+            ),
+        )
+
+    def _vehicle_scale(self, region) -> float:
+        """判据要在多小的图上算（1.0 = 原尺寸，见 `vehicle_downscale`）。"""
+        settings = self.settings
+        try:
+            scale = float(getattr(settings, "vehicle_downscale", 1.0))
+        except (TypeError, ValueError):
+            return 1.0
+        if not math.isfinite(scale) or not 0.0 < scale < 1.0:
+            return 1.0
+        if region is None or getattr(region, "size", 0) == 0:
+            return 1.0
+        minimum = int(getattr(settings, "vehicle_downscale_min_pixels", 0) or 0)
+        if int(region.shape[0]) * int(region.shape[1]) < max(0, minimum):
+            return 1.0
+        return scale
+
+    def _official_note(self) -> str:
+        """官方识别一直没读数时，给 message 加一句"现在用的是画面判据兜底"。
+
+        实车上判断"集成层到底有没有把 robot 识别接进来"就靠这句话：
+        看到它 = 官方读数没到（或者没订阅），消息里那套读数来自画面判据。
+        """
+        source = str(getattr(self.settings, "blockage_source", "")).strip().lower()
+        if source not in ("sdk", "sdk_or_vision"):
+            return ""
+        if self.official_sightings > 0:
+            return ""
+        return "official robot detection unavailable (0 sightings so far; picture criterion); "
+
+    def _read_sdk_blockage(
+        self, fork: ForkDetection, image, rect, now: float
+    ) -> BlockageReading:
+        """**官方识别**读数 → 左右分支堵不堵（`blockage_source="sdk"`）。
+
+        判据只有一条：官方 SDK 在**某条分支的走廊里**报出了一辆 RoboMaster 小车
+        （机器人识别），或者一个视觉标签。**不看长宽高、不看颜色、不看形状** ——
+        尺寸只用来记日志（宽占比），不参与判定；这样车离岔路口 1 米、2 米都一样成立。
+
+        左右的定义和画面判据完全一致：同一条检测带 + 同一个分叉点 `split_x`。
+        """
+        settings = self.settings
+        height, width = int(image.shape[0]), int(image.shape[1])
+        if height <= 0 or width <= 0:
+            return BlockageReading(BLOCKAGE_NONE)
+        left_edge, right_edge = int(rect[0]), int(rect[2])
+        top = int(_clamp(settings.blockage_top_ratio, 0.0, 0.9) * height)
+        bottom = int(_clamp(settings.blockage_bottom_ratio, 0.1, 1.0) * height)
+        split = int(fork.split_x)
+
+        left_score = 0.0
+        right_score = 0.0
+        left_box: Optional[Tuple[int, int, int, int]] = None
+        right_box: Optional[Tuple[int, int, int, int]] = None
+        sightings = self._sdk_sightings(width, height, now)
+        if sightings:
+            self.official_sightings += len(sightings)
+        for sighting in sightings:
+            center_x, center_y = sighting.center
+            # 只看"岔路口那条带"和岔路 ROI 的横向范围：和画面判据同一块地方。
+            if center_y < top or center_y > bottom:
+                continue
+            if center_x < left_edge or center_x > right_edge:
+                continue
+            ratio = sighting.width_ratio(width)
+            if center_x < split:
+                if left_box is None or ratio > left_score:
+                    left_score, left_box = ratio, sighting.box()
+            else:
+                if right_box is None or ratio > right_score:
+                    right_score, right_box = ratio, sighting.box()
+
+        if left_box is not None and right_box is not None:
+            reading = BLOCKAGE_BOTH
+        elif left_box is not None:
+            reading = BLOCKAGE_LEFT
+        elif right_box is not None:
+            reading = BLOCKAGE_RIGHT
+        else:
+            reading = BLOCKAGE_NONE
+        return BlockageReading(
+            reading=reading,
+            left_evidence=round(float(left_score), 3),
+            right_evidence=round(float(right_score), 3),
+            left_box=left_box,
+            right_box=right_box,
+            source="sdk",
         )
 
     @staticmethod
-    def _to_frame(box, rect, offset_x, offset_y):
-        """走廊内的外接框坐标 → 整幅图像坐标（给 evidence / 复盘用）。"""
+    def _to_frame(box, offset_x, offset_y, scale: float = 1.0):
+        """区域内（可能已缩放）的外接框坐标 → 整幅图像坐标（给 evidence / 复盘用）。"""
         if box is None:
             return None
-        roi_left, roi_top = int(rect[0]), int(rect[1])
+        try:
+            factor = float(scale)
+        except (TypeError, ValueError):
+            factor = 1.0
+        if not math.isfinite(factor) or factor <= 0.0:
+            factor = 1.0
         x0, y0, x1, y1 = box
-        return (x0 + roi_left + offset_x, y0 + roi_top + offset_y,
-                x1 + roi_left + offset_x, y1 + roi_top + offset_y)
+        return (
+            int(round(x0 / factor)) + offset_x,
+            int(round(y0 / factor)) + offset_y,
+            int(round(x1 / factor)) + offset_x,
+            int(round(y1 / factor)) + offset_y,
+        )
 
     def _choose_branch(self, reading: BlockageReading) -> Tuple[Optional[Branch], str]:
         """返回 (走哪条分支, 理由)。分支为 None 表示判据不成立 —— 那就别动。"""
@@ -829,12 +1768,21 @@ class FreeJunctionTask:
             return None, "unknown decision rule %r" % (settings.decision_rule,)
 
         if reading.reading == BLOCKAGE_LEFT:
-            return Branch.RIGHT, "left branch blocked by a vehicle (%.2f)" % reading.left_evidence
+            return Branch.RIGHT, "left branch blocked by %s" % self._blocker_text(
+                reading, reading.left_evidence)
         if reading.reading == BLOCKAGE_RIGHT:
-            return Branch.LEFT, "right branch blocked by a vehicle (%.2f)" % reading.right_evidence
+            return Branch.LEFT, "right branch blocked by %s" % self._blocker_text(
+                reading, reading.right_evidence)
         if reading.reading == BLOCKAGE_BOTH:
             return self._fallback("both branches blocked by vehicles")
         return None, "no vehicle on either branch"
+
+    @staticmethod
+    def _blocker_text(reading: BlockageReading, evidence: float) -> str:
+        """理由里写清楚这条判据是**谁**给的（实车复盘时一眼能分）。"""
+        if getattr(reading, "source", "vision") == "sdk":
+            return "a RoboMaster vehicle seen by the official detector (width %.2f)" % evidence
+        return "a vehicle (%.2f)" % evidence
 
     def _fallback(self, reason: str) -> Tuple[Optional[Branch], str]:
         branch = self._as_branch(self.settings.fallback_branch)
@@ -902,7 +1850,8 @@ class FreeJunctionTask:
         self._run_started_at = now
         self._decide_count = 0
         return self._running(
-            now, "junction confirmed, deciding (%s; %s)" % (reason, reading.describe())
+            now, "%sjunction confirmed, deciding (%s; %s)"
+            % (self._official_note(), reason, reading.describe())
         )
 
     # -- 接管中的状态机 ---------------------------------------------------
@@ -916,13 +1865,20 @@ class FreeJunctionTask:
                 and now - self._run_started_at > settings.max_task_seconds):
             return self._fail(now, "task time budget exceeded")
 
-        if settings.abort_on_line_lost:
+        # 只在"车头前面必须看得见线"的阶段才因为丢线认输：DECIDE / APPROACH。
+        # TURN / EXIT 时车头一转，胶带本来就可能跑出 ROI —— 那不是"线没了"，
+        # 再按丢线停车就会在岔路口中间白停一次（2026-09-16 真车：两次都是在
+        # TURN/EXIT 里走了 0.8 s 就 FAILED）。这两段仍有各自的超时兜底。
+        line_watch = self.state in (JunctionState.DECIDE, JunctionState.APPROACH)
+        if settings.abort_on_line_lost and line_watch:
             if fork.valid or self._blue_present():
                 self._lost_count = 0
             else:
                 self._lost_count += 1
                 if self._lost_count >= max(1, int(settings.lost_line_frames)):
                     return self._fail(now, "line lost while owning control")
+        else:
+            self._lost_count = 0
 
         if self.state is JunctionState.DECIDE:
             branch, reason = self._choose_branch(reading)
@@ -933,8 +1889,8 @@ class FreeJunctionTask:
                 self.chosen_branch = branch
                 self._enter(JunctionState.APPROACH, now)
                 return self._running(
-                    now, "taking the %s branch (%s; %s)"
-                    % (branch.value, reason, reading.describe())
+                    now, "%staking the %s branch (%s; %s)"
+                    % (self._official_note(), branch.value, reason, reading.describe())
                 )
             if self._elapsed(now) >= settings.decide_timeout:
                 return self._fail(
@@ -946,7 +1902,18 @@ class FreeJunctionTask:
 
         if self.state is JunctionState.APPROACH:
             gone = self._fork_gone(fork)
-            if gone or self._elapsed(now) >= settings.approach_seconds_max * 0.75:
+            # 已经对准了就别再转完整个 APPROACH：原来一定要转满 1.5 s（或等岔路消失），
+            # 结果带着满舵转过头，还得靠后面一段把车身拉回来
+            # （2026-09-17 12:13~12:18 四次实车都是这个形状）。
+            offset = self._turn_offset(fork)
+            if offset is not None and abs(offset) <= float(settings.center_tolerance_degrees):
+                self._center_count += 1
+            else:
+                self._center_count = 0
+            aligned = self._center_count >= max(1, int(settings.center_confirm_frames))
+            if (gone
+                    or aligned
+                    or self._elapsed(now) >= settings.approach_seconds_max * 0.75):
                 self._enter(JunctionState.TURN, now)
             else:
                 return self._running(now, "aligning with the %s branch" % self._branch_name())
@@ -954,20 +1921,57 @@ class FreeJunctionTask:
         if self.state is JunctionState.TURN:
             if self._elapsed(now) >= settings.turn_timeout:
                 return self._fail(now, "turn timed out")
+            # **闭环微转**：盯住"选中那条分支"，朝它转；偏得越多转得越快（限幅很小）。
+            offset = self._turn_offset(fork)
+            # 收工条件：**岔路已经到跟前**、而且选中分支在正前方容差内。
+            # 岔路还在远处时不许收工 —— 那时车头还没到路口，收工就等于"没拐"
+            # （2026-09-17 19:48 那次 TURN 只跑了 0.3 s，车几乎直行开进左支）。
+            # 岔路已经从画面里消失（车进了分支）→ 这时看脚下胶带就够了。
+            fork_visible = fork is not None and fork.valid
+            ready = (not fork_visible) or self._fork_is_close(fork)
+            if offset is None or not ready:
+                self._center_count = 0
+            elif abs(offset) <= float(settings.center_tolerance_degrees):
+                self._center_count += 1
+            else:
+                self._center_count = 0
+            centered = self._center_count >= max(1, int(settings.center_confirm_frames))
             if self._elapsed(now) >= settings.turn_seconds:
+                self._enter(JunctionState.EXIT, now)
+            elif centered and self._elapsed(now) >= settings.turn_min_seconds:
                 self._enter(JunctionState.EXIT, now)
             else:
                 return self._running(
                     now, "turning into the %s branch" % self._branch_name()
                 )
 
-        return self._finish_exit(now)
+        return self._finish_exit(now, fork)
 
-    def _finish_exit(self, now: float) -> TaskUpdate:
-        """EXIT 阶段：直行一小段，走完就算完成，走太久就失败。"""
-        if self._elapsed(now) >= self.settings.exit_timeout:
+    def _finish_exit(self, now: float, fork: Optional[ForkDetection] = None) -> TaskUpdate:
+        """EXIT 阶段：**微微前进 + 顺线**，直到可以安全交回巡线。
+
+        交回条件（要求 3）：**岔路标志已经离开视野**，而且视野里重新有
+        **一条清晰、单根的蓝线**（脚下那一小条里恰好只有一段胶带），
+        连续 `handback_confirm_frames` 帧 → COMPLETED。
+
+        为什么不是"有蓝线像素就行"：车还压在岔路口上时，脚下常常同时有一段主干和
+        一段分支（两段），底层巡线拿到这种画面会自己判丢线 —— 交回也没用。
+        时间到了但条件还没满足 → 也交回（COMPLETED），把控制权还给巡线；
+        拖过 `exit_timeout` → FAILED 停车。
+        """
+        settings = self.settings
+        fork_gone = fork is None or not fork.valid
+        line_back = self._last_blue_ratio >= settings.min_blue_ratio
+        single_line = self._tape_offset() is not None
+        if fork_gone and line_back and single_line:
+            self._handback_count += 1
+        else:
+            self._handback_count = 0
+        if self._handback_count >= max(1, int(settings.handback_confirm_frames)):
+            return self._complete(now, "junction left the view and the line is back")
+        if self._elapsed(now) >= settings.exit_timeout:
             return self._fail(now, "exit timed out")
-        if self._elapsed(now) >= self.settings.exit_seconds:
+        if self._elapsed(now) >= settings.exit_seconds:
             return self._complete(now, "junction cleared")
         return self._running(now, "leaving the junction")
 
@@ -981,6 +1985,8 @@ class FreeJunctionTask:
         self._state_since = now
         self._lost_count = 0
         self._clear_count = 0
+        self._center_count = 0
+        self._handback_count = 0
 
     # -- 运动请求 ---------------------------------------------------------
 
@@ -994,37 +2000,173 @@ class FreeJunctionTask:
                 forward=_clamp(settings.approach_forward, 0.0, settings.max_forward),
                 lateral=0.0,
                 yaw=_clamp(
-                    self._approach_yaw(), -settings.max_approach_yaw,
-                    settings.max_approach_yaw,
+                    self._approach_yaw() * self._turn_rate_scale(self.last_detection),
+                    -settings.max_approach_yaw, settings.max_approach_yaw,
                 ),
             )
         if self.state is JunctionState.TURN:
-            yaw = settings.turn_yaw * self._branch_sign()
+            # 闭环微转：看得到岔路就朝"选中那条分支"转，岔路没了就朝车头前的胶带转；
+            # 越接近正前方转得越慢（turn_yaw 本身也已经压到 20 deg/s）。
+            offset = self._turn_offset(self.last_detection)
+            if offset is None:
+                yaw = settings.turn_yaw * self._branch_sign()
+            else:
+                yaw = _clamp(
+                    settings.turn_steer_gain * offset,
+                    -settings.turn_yaw,
+                    settings.turn_yaw,
+                )
+            yaw *= self._turn_rate_scale(self.last_detection)
             return MotionCommand(
                 forward=_clamp(settings.turn_forward, 0.0, settings.max_forward),
                 lateral=0.0,
                 yaw=_clamp(yaw, -settings.max_yaw, settings.max_yaw),
             )
+        # EXIT：微微前进 + 顺线（很温柔），保证交回巡线时车头正对着线。
+        # 还看得见岔路时（说明车还压在岔路口上）继续盯**选中那条分支** ——
+        # 只看脚下那条胶带是不够的：那一刻脚下的可能还是主干，顺着它走会拐回原路
+        # （2026-09-17 实车就是"选了右支、脚下却顺着左边那条走掉了"）。
+        offset = self._turn_offset(self.last_detection)
+        yaw = 0.0
+        if offset is not None:
+            yaw = _clamp(
+                settings.exit_steer_gain * offset,
+                -settings.max_approach_yaw,
+                settings.max_approach_yaw,
+            )
         return MotionCommand(
             forward=_clamp(settings.exit_forward, 0.0, settings.max_forward),
             lateral=0.0,
-            yaw=0.0,
+            yaw=_clamp(yaw, -settings.max_yaw, settings.max_yaw),
+        )
+
+    def _turn_rate_scale(self, fork: Optional[ForkDetection]) -> float:
+        """岔路还"远"的时候把转向速率**按距离线性打折**（远处 `turn_far_yaw_scale`，
+        到脚下 1.0）。
+
+        为什么要打折：摄像头装在车头前上方，比车头早 0.5~0.8 m 看到岔路
+        （2026-09-17 17:24 的画面量出来：接管那一刻岔路的路口还在画面 y≈250/360，
+        车头离路口还有半米多）。一看到就满舵转，等车头到岔路口时方向早就转过去了
+        —— 车会"拐早"、切进分支内侧，交回巡线后直接 `LINE_LOST`。
+
+        为什么是**线性**而不是一刀切：一刀切会把"本来就不大的偏角"再削一半，
+        浅岔路下 yaw 只剩 ±1、车几乎不转（2026-09-17 19:48/19:49 两次实车）。
+        所以按"岔路在 ROI 里落到多低"从 `turn_far_yaw_scale` 线性升到 1.0。
+
+        岔路看不见了（已经开进分支）→ 不打折，交给"顺脚下那条线"的闭环去修。
+        """
+        settings = self.settings
+        if fork is None or not fork.valid or fork.frame_height <= 0:
+            return 1.0
+        try:
+            scale = float(settings.turn_far_yaw_scale)
+        except (TypeError, ValueError):
+            return 1.0
+        if not math.isfinite(scale):
+            return 1.0
+        cheap = _clamp(scale, 0.0, 1.0)
+        near = self._fork_proximity(fork)
+        return cheap + (1.0 - cheap) * near
+
+    def _split_offset_degrees(self, fork: ForkDetection) -> float:
+        """**分叉点（主干方向）**相对车头偏了多少度（右为正）—— "车对着岔路口吗"。"""
+        if fork.frame_width <= 0:
+            return 0.0
+        return self._pixels_to_degrees(
+            float(fork.split_x) - float(fork.frame_width) / 2.0, fork.frame_width
+        )
+
+    def _fork_proximity(self, fork: Optional[ForkDetection]) -> float:
+        """岔路口离车头多近了：0 = 刚在画面里出现（远），1 = 已经在车头跟前。"""
+        if fork is None or not fork.valid or fork.frame_height <= 0:
+            return 0.0
+        height = int(fork.frame_height)
+        top = int(_clamp(self.settings.roi_top, 0.0, 1.0) * height)
+        bottom = int(_clamp(self.settings.roi_bottom, 0.0, 1.0) * height)
+        if bottom - top <= 0:
+            return 0.0
+        close_row = top + _clamp(self.settings.fork_close_ratio, 0.0, 1.0) * (bottom - top)
+        span = max(1.0, float(close_row - top))
+        return _clamp((float(fork.split_row) - top) / span, 0.0, 1.0)
+
+    def _fork_is_close(self, fork: Optional[ForkDetection]) -> bool:
+        """岔路口是不是已经到车头跟前了（分叉行落进 ROI 下部 `fork_close_ratio`）。"""
+        return self._fork_proximity(fork) >= 1.0
+
+    def _steer_offset_degrees(self, fork: Optional[ForkDetection]) -> Optional[float]:
+        """转向/瞄准的目标偏角（度，右为正）—— **按远近把两个目标混起来**：
+
+        * 岔路还远 → 主要瞄**分叉点**（= 主干方向）：先把车顺着主干开到岔路口；
+        * 岔路到跟前 → 主要瞄**选中那条分支**：这一步才是"拐进去"。
+
+        为什么要有这个过渡（两个实车教训，方向刚好相反）：
+        * 一看到岔路就朝分支打 —— 摄像头比车头早半米看到它，车头还没到路口方向就转过去了，
+          于是"拐早"、切进分支内侧（2026-09-17 17:24）；
+        * 反过来只瞄"脚下那根线"，或者"没到跟前就完全不瞄分支" —— 浅岔路下 yaw 只剩
+          ±1 甚至 0，车几乎直行，直接开进左边那条有车的分支
+          （2026-09-17 19:48 / 19:49）。
+        所以用**线性混合**而不是硬切换：远的时候主干占多数（不会拐早），
+        越近分支分量越大（到跟前就是纯分支方向），中间任何时刻都有一点分支分量。
+        """
+        if fork is None or not fork.valid or fork.frame_width <= 0:
+            return None
+        split = self._split_offset_degrees(fork)
+        branch = self._aim_offset_degrees(fork)
+        near = self._fork_proximity(fork)
+        return split + (branch - split) * near
+
+    def _focal_px(self, frame_width: int) -> float:
+        """水平焦距（像素）：由水平视场角推出来，用来把像素偏差换算成角度。"""
+        hfov = float(getattr(self.settings, "camera_hfov_degrees", 120.0))
+        if not math.isfinite(hfov) or not 1.0 < hfov < 179.0:
+            hfov = 120.0
+        return max(1.0, (max(1, int(frame_width)) / 2.0) / math.tan(math.radians(hfov / 2.0)))
+
+    def _pixels_to_degrees(self, offset_px: float, frame_width: int) -> float:
+        """横向偏了多少像素 → 偏了多少度（右为正）。"""
+        if not math.isfinite(float(offset_px)):
+            return 0.0
+        return math.degrees(math.atan2(float(offset_px), self._focal_px(frame_width)))
+
+    def _aim_offset_degrees(self, fork: ForkDetection) -> float:
+        """**选中那条分支**相对车头方向偏了多少度（右为正）。
+
+        目标取"分支张开后的方向"（`left_x` / `right_x`，mask 里张开最大的那几行）；
+        参考点是**画面中心 = 车头方向**（相机就装在车头上）。
+
+        为什么参考点不能用"脚下那根线"：那是**横向位置**，不是**朝向**。
+        车贴着线的一侧走时，"脚下这根线"会把右支的偏角算没 ——
+        2026-09-17 19:48/19:49 两次实车就是这么直着开进左边拥堵支的
+        （算出来 yaw 只有 ±1，车几乎没转）。
+        """
+        if self.chosen_branch is None or fork.frame_width <= 0:
+            return 0.0
+        target = fork.left_x if self.chosen_branch is Branch.LEFT else fork.right_x
+        return self._pixels_to_degrees(
+            float(target) - float(fork.frame_width) / 2.0, fork.frame_width
         )
 
     def _approach_yaw(self) -> float:
         """对准阶段：往选中分支偏一点点，每帧只修一点（A8）。
 
-        误差以**整幅图像宽度**归一化（和 `LineDetection.error` 同口径）：
-        目标在右半边 → 误差为正 → yaw 为正（正值右转）。
+        单位：`approach_yaw_gain` 是"每 1° 偏差给多少 deg/s"，默认 1.0
+        （偏 15° 就给 15 deg/s，再由 `max_approach_yaw` 裁到 12）。
+        符号沿用项目约定：偏差在右边为正 → yaw 为正（正值右转），
+        与巡线控制器一致（`LineController.track` 里 `target_yaw = kp * error`，
+        而 `error` 是"线偏右为正"）。
         """
-        settings = self.settings
         fork = self.last_detection
-        if fork is None or self.chosen_branch is None or fork.frame_width <= 0:
+        if fork is None:
             return 0.0
-        target = fork.left_x if self.chosen_branch is Branch.LEFT else fork.right_x
-        half_width = max(1.0, fork.frame_width / 2.0)
-        error = (target - fork.frame_width / 2.0) / half_width
-        return settings.approach_yaw_gain * error
+        return self.settings.approach_yaw_gain * self._aim_offset_degrees(fork)
+
+    def _aim_reference_x(self, fork: ForkDetection) -> float:
+        """保留给测试/排查用的"参考点"：车头正前方（画面中心）。
+
+        （2026-09-17 曾经把它改成"脚下那根线"，结果是**朝向目标被当成了位置目标**，
+        浅岔路下 yaw 只有 ±1 —— 已改回画面中心，见 `_aim_offset_degrees`。）
+        """
+        return float(fork.frame_width) / 2.0
 
     def _branch_sign(self) -> float:
         if self.chosen_branch is None:
@@ -1043,6 +2185,54 @@ class FreeJunctionTask:
             return True
         return self._last_blue_ratio >= self.settings.min_blue_ratio
 
+    def _tape_offset(self) -> Optional[float]:
+        """车头正前方那条胶带偏了多少：-1 = 最左，0 = 正中，+1 = 最右。
+
+        只算 ROI 底部那一小条，而且必须**只有一段**（出现两段说明车还压在岔路口上）。
+        看不到、或不止一段 → 返回 None。
+        """
+        line = self._last_line_mask
+        if line is None:
+            return None
+        height, width = line.shape[:2]
+        if height <= 0 or width <= 0:
+            return None
+        band = line[int(height * 0.75):, :]
+        if band.size == 0:
+            return None
+        runs = _row_runs(
+            band[band.shape[0] // 2], self.settings.merge_gap_px, self.settings.min_run_px
+        )
+        if len(runs) != 1:
+            return None
+        center = (runs[0][0] + runs[0][1]) / 2.0
+        half = max(1.0, width / 2.0)
+        return (center - width / 2.0) / half
+
+    def _turn_offset(self, fork: Optional[ForkDetection]) -> Optional[float]:
+        """转弯/退出阶段"还要往哪边转多少" —— 单位是**度**（右为正）。
+
+        * 还看得见岔路 → `_steer_offset_degrees`（远瞄主干、近瞄选中分支）；
+        * 岔路已经从画面里消失 → 车头前方那条胶带的偏角（这时它就是分支的胶带）。
+
+        为什么不能只看胶带：刚进转弯时车头前面那条是**主干**，正的、就在中央，
+        只按它判会得出"已经对齐"→ 根本不转（2026-09-16 本地测试踩出来过）。
+        """
+        offset = self._steer_offset_degrees(fork)
+        if offset is not None:
+            return offset
+        tape = self._tape_offset()
+        if tape is None:
+            return None
+        line = self._last_line_mask
+        roi_width = 0 if line is None else int(line.shape[1])
+        if roi_width <= 0:
+            return None
+        frame_width = int(fork.frame_width) if fork is not None else 0
+        if frame_width <= 0:
+            return None
+        return self._pixels_to_degrees(tape * (roi_width / 2.0), frame_width)
+
     def _fork_gone(self, fork: ForkDetection) -> bool:
         """分叉是否已经消失（说明车已经开进分支里了）。"""
         if fork.valid:
@@ -1050,6 +2240,14 @@ class FreeJunctionTask:
             return False
         self._clear_count += 1
         return self._clear_count >= 2
+
+    def _rearm_cooling(self, now: float) -> bool:
+        """封锁闸门的**冷却期**内吗（这段时间看不到岔路也不许再接管）。
+
+        冷却期内 `step()` 直接返回，连画面都不看：反正结果一定是"不接管"，
+        而岔路检测是整帧最贵的一步。冷却结束后才开始要求"连续若干帧看不见岔路"。
+        """
+        return self._rearm_ready_at is not None and float(now) < self._rearm_ready_at
 
     def _arm_rearm(self) -> None:
         """拉起封锁闸门（A9 / A10）：冷却时间 + 等岔路从画面里消失。"""
