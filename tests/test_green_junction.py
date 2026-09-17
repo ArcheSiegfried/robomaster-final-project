@@ -890,7 +890,70 @@ class StateMachineTests(unittest.TestCase):
         self.assertIsNotNone(task.chosen_bearing_deg)
         self.assertGreater(task.chosen_bearing_deg, 0.0)
 
-    # -- helpers ---------------------------------------------------------
+    def test_steep_branch_stops_turning_once_it_has_rotated_enough(self):
+        """A21 回归：偏角大于 ``branch_align_deg`` 时，不许恒定 yaw 转到超时。
+
+        2026-09-17 实车（``run_20260917_220912``）：左分支锁死偏角 -22.5°
+        → yaw 恒为 -45°/s、1.8 秒转了约 80°，把巡线带转出画面（全图蓝色像素变 0）
+        → ``line did not return after the turn`` 失败。而成功那次只是因为锁死的
+        偏角恰好 ≤ 6°（``aligned`` 一进门就成立）—— 是运气，不是设计。
+
+        改法：锁死的偏角当**转动目标**，积分 ``yaw × dt`` 转到目标就停，
+        并且接近目标时缓出。
+        """
+        steep = approach_frame(fork_y=290, far_y=120, reach=300)  # 左分支 ≈ -18.7°
+        settings = JunctionConfig(turn_timeout=6.0, turn_min_duration=0.2)
+        task = GreenJunctionTask(
+            settings=settings, light_probe=lambda frame, now: green(Branch.LEFT)
+        )
+        now = 800.0
+        yaws = []
+        for index in range(40):
+            now += FRAME_DT
+            update = task.step(packet(steep, index + 1, now), now, fake_line(error=0.9))
+            if task.state is JunctionState.TURN:
+                yaws.append(update.motion.yaw)
+            if yaws and task.state is not JunctionState.TURN:
+                break
+        self.assertTrue(yaws, "必须先进入 TURN")
+        self.assertGreater(
+            abs(task._chosen_bearing), settings.branch_align_deg,
+            "这个画面得是陡分支，否则测不到这个 bug",
+        )
+        # 1) 正常转到位往下走，而不是"转到 turn_timeout 失败"
+        self.assertIs(task.state, JunctionState.SETTLE)
+        self.assertNotIn("turn_timeout", task.last_message)
+        # 2) 转过的角度不超过目标角度（旧实现会转到 3~4 倍）
+        self.assertLessEqual(abs(task._turn_rotated_deg), abs(task._chosen_bearing))
+        # 3) 一开始按满增益、越接近目标越小（缓出），且从不超过上限
+        self.assertLessEqual(max(abs(y) for y in yaws), settings.max_turn_yaw + 1e-9)
+        self.assertLess(abs(yaws[-1]), abs(yaws[0]), "接近目标时要缓出")
+
+    def test_rotation_target_does_not_grow_in_settle(self):
+        """转到目标之后就不要再自己加转：SETTLE 里只允许缓出的残余量。"""
+        steep = approach_frame(fork_y=290, far_y=120, reach=300)
+        settings = JunctionConfig(turn_timeout=6.0, turn_min_duration=0.2)
+        task = GreenJunctionTask(
+            settings=settings, light_probe=lambda frame, now: green(Branch.LEFT)
+        )
+        now = 900.0
+        for index in range(40):
+            now += FRAME_DT
+            update = task.step(packet(steep, index + 1, now), now, fake_line(error=0.9))
+            if task.state is JunctionState.SETTLE:
+                break
+        rotated_at_settle = abs(task._turn_rotated_deg)
+        # SETTLE 里再走几帧：残余 yaw 只能是缓出下限那一档，不能又按满增益转
+        for index in range(3):
+            now += FRAME_DT
+            update = task.step(packet(steep, 100 + index, now), now, fake_line(error=0.9))
+            self.assertLessEqual(abs(update.motion.yaw), abs(task._chosen_bearing) * 1.0 + 1e-9)
+        self.assertLessEqual(
+            abs(task._turn_rotated_deg) - rotated_at_settle,
+            abs(task._chosen_bearing) * 0.4,
+            "SETTLE 里的残余转动必须远小于目标角度",
+        )
+
 
     @staticmethod
     def _advance_until(task, state, limit=40, line=None):

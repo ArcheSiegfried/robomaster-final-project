@@ -1353,6 +1353,11 @@ class LampSpotter:
         return self.readings(_frame_image(frame))
 
 
+#: 缓出下限：转到接近目标时 yaw 最低缩到这个倍数（A21）。太小会转不到位，
+#: 太大会冲过目标，0.25 是拿实测 yaw 曲线配的。
+_TURN_EASE_FLOOR = 0.25
+
+
 def _straightest(branches: Sequence[BranchGeometry]) -> Optional[BranchGeometry]:
     if not branches:
         return None
@@ -1520,6 +1525,11 @@ class GreenJunctionTask:
         self._last_seen_at: Optional[float] = None
         self._run_started_at: Optional[float] = None
         self._turn_started_at: Optional[float] = None
+        #: 进入 TURN 之后**已经转过的角度**（deg，带符号，由 yaw×dt 积分）。
+        #: A21：锁死的偏角只能当"要转多少度"的目标，不能当"对齐了没有"的判据 ——
+        #: 常量要么一开始就小于阈值（碰巧成功），要么永远不成立（转到线飞出画面）。
+        self._turn_rotated_deg = 0.0
+        self._turn_last_at: Optional[float] = None
         self._rearm_ready_at: Optional[float] = None
 
     # -- 对外状态 ---------------------------------------------------------
@@ -1563,6 +1573,8 @@ class GreenJunctionTask:
         self._last_seen_at = None
         self._run_started_at = None
         self._turn_started_at = None
+        self._turn_rotated_deg = 0.0
+        self._turn_last_at = None
         self._rearm_ready_at = None
 
     # -- 内部工具 ---------------------------------------------------------
@@ -1573,6 +1585,8 @@ class GreenJunctionTask:
         if state is JunctionState.TURN:
             # 转向总时长从进入 TURN 开始算，跨 TURN / SETTLE 两段都有效。
             self._turn_started_at = now
+            self._turn_rotated_deg = 0.0
+            self._turn_last_at = None
 
     def _elapsed(self, now: float) -> float:
         if self._state_since is None:
@@ -1654,20 +1668,48 @@ class GreenJunctionTask:
 
         前进速度与转向量成比例（A10）：还没选出分支时 yaw 为 0，前进也为 0，
         也就是等判据期间原地停着，绝不自己往前冲。
+
+        A21（2026-09-17 实车）：锁死的偏角在这里当**转动目标**用 ——
+        每帧把 ``yaw × dt`` 积进 ``_turn_rotated_deg``，并把 yaw 按"离目标还有
+        多远"缓出。原实现不管转了多少度都恒定 45°/s 地转，只要
+        ``|锁死偏角| > branch_align_deg``，车就会一直转到带子飞出画面
+        （实测：偏角 -22.5° → yaw 恒为 -45°/s → 1.8 秒转了约 80° → 全图蓝色像素
+        变成 0 → "line did not return after the turn"）。
         """
         settings = self.settings
         bearing = self._chosen_bearing
         if bearing is None:
             bearing = self.chosen_bearing_deg or 0.0
-        yaw = bearing * settings.yaw_gain
+        target = float(bearing)
+        gain_yaw = target * settings.yaw_gain
         limit = abs(settings.max_turn_yaw)
-        yaw = max(-limit, min(limit, yaw))
+        gain_yaw = max(-limit, min(limit, gain_yaw))
+        # 缓出：转过一大半之后按剩余角度缩，最后一段用 floor 倍速蹭过去，
+        # 免得恒定角速度冲过目标（原来的抖动就是这么来的）。
+        remaining = max(0.0, abs(target) - abs(self._turn_rotated_deg))
+        if abs(target) > 0.0:
+            scale = max(_TURN_EASE_FLOOR, min(1.0, remaining / abs(target)))
+        else:
+            scale = 0.0
+        yaw = gain_yaw * scale
+        # 积分：dt 只在同一段 TURN 里有效，并且夹住异常大的间隔（调试断点/卡帧）。
+        if self._turn_last_at is not None:
+            dt = now - self._turn_last_at
+            if 0.0 <= dt <= 0.25:
+                self._turn_rotated_deg += yaw * dt
+        self._turn_last_at = now
         ratio = 0.0 if limit <= 0.0 else min(1.0, abs(yaw) / limit)
         return MotionCommand(
             forward=settings.forward_speed * ratio,
             lateral=0.0,
             yaw=yaw,
         )
+
+    def _turn_still_needed(self) -> bool:
+        """还要不要继续转（A21）：转过目标角度减去 ``branch_align_deg`` 就够了。"""
+        target = 0.0 if self._chosen_bearing is None else abs(float(self._chosen_bearing))
+        margin = max(0.0, float(self.settings.branch_align_deg))
+        return abs(self._turn_rotated_deg) < max(0.0, target - margin)
 
     def _read_probe(self, frame: FramePacket, now: float) -> List[LightReading]:
         """这一帧的灯读数（0 / 1 / 2 盏都合法，见 A6/A15/A17）。
@@ -1973,20 +2015,25 @@ class GreenJunctionTask:
                 return self._failed("lost the junction while turning")
 
         centered, line_source = self._line_centered(frame, now)
-        bearing = self.chosen_bearing_deg
-        # 车头已经对准选中的分支（偏角收敛）也算转到位：岔路口上"线回中央"可能一直不成立
-        # （2026-09-16 实测：yaw 都收敛到 0 了，却因为近处一直看不到"单条居中的线"而转向超时）。
-        aligned = bearing is not None and abs(bearing) <= settings.branch_align_deg
+        # 三种"转到位"都算（A21）：
+        #   1) 线回到画面中央（最可靠，能看见就直接用）；
+        #   2) **当前**这一帧算出来的分支偏角已经收敛（不是锁死的那个常量！）；
+        #   3) 已经转过的角度达到"锁死偏角 - branch_align_deg"（线看不见时的兜底）。
+        live = self.chosen_bearing_deg
+        aligned = live is not None and abs(live) <= settings.branch_align_deg
+        rotated = not self._turn_still_needed()
         settled = (
             self._turn_elapsed(now) >= settings.turn_min_duration
-            and (centered or aligned)
+            and (centered or aligned or rotated)
         )
         if settled:
             self._enter(JunctionState.SETTLE, now)
+            whose = "line" if centered else (
+                "bearing %.1f deg" % live if aligned else "rotated %.1f deg" % self._turn_rotated_deg
+            )
             return self._running(
                 now,
-                "branch entered, checking line stability (%s)"
-                % ("line" if centered else "bearing %.1f deg" % (bearing or 0.0)),
+                "branch entered, checking line stability (%s)" % whose,
             )
 
         return self._running(
