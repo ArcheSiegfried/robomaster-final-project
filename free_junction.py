@@ -361,12 +361,15 @@ class FreeJunctionConfig:
     require_blockage_to_trigger: bool = True  # 两条都没车就不接管（A6）
 
     # ---- 拥堵判据的**来源**（A5）----
-    #: ``"vision"``（默认）= 本模块自己的画面判据（深色车体 + 高饱和彩色装甲）；
-    #: ``"sdk"`` = **只用官方 SDK 的识别结果**（机器人识别 / 视觉标签），
-    #: 由集成层订阅、`main.py` 每帧推给 `update_candidates()`；
-    #: ``"sdk_or_vision"`` = 有新鲜官方读数就用它，没有就退回画面判据。
-    #: 默认值保持 "vision"：没人在集成层订阅官方识别时，行为与本改动前**完全一致**。
-    blockage_source: str = "vision"
+    #: **默认 `"sdk_or_vision"`：官方 SDK 的机器人识别说了算**（大疆 SDK 里
+    #: `vision.sub_detect_info(name="robot")` 就是"识别同款 RoboMaster 小车"的接口）。
+    #: 只要主循环把官方读数推给本模块（见 `update_candidates()`），判据就**只**看它：
+    #: 不看颜色、不看长宽高、不看形状。
+    #: 官方读数这一帧没到（例如集成层还没订阅 robot 识别）→ 退回画面判据兜底，
+    #: 并在 message 里写明 `official robot detection unavailable`，一眼能看出用的是哪套。
+    #: ``"sdk"`` = 只用官方读数（没订阅就永远不接管 —— 只用于确认订阅是否通了）；
+    #: ``"vision"`` = 只用画面判据（旧行为）。
+    blockage_source: str = "sdk_or_vision"
     #: 官方读数的保鲜窗口（秒）：回调比这还旧就当作"这一帧没看到"。
     #: 宁可退回"没有判据"（不接管），也不拿一条过期读数决定往哪边拐。
     sdk_observation_hold_seconds: float = 0.35
@@ -400,19 +403,18 @@ class FreeJunctionConfig:
     #: 极端帧；换场地后那条墙裙误报是 0.84~0.85 —— 挡住它靠的是下面那条**组合判据**，
     #: 不是这个上限，否则会把"车+墙连成一块"的真检测一起挡掉，2026-09-17 试过）。
     robot_max_area_ratio: float = 0.90
-    #: **大候选的"彩色要更多"规则**：面积占比 ≥ `robot_large_area_ratio` 的候选，
-    #: 要求彩色占比 ≥ `robot_large_accent_min_ratio`。
-    #: 为什么需要它（2026-09-17 换场地后）：新场地里**墙 + 墙脚阴影带 + 木门**会在
-    #: 走廊里连成一条大暗块（面积 0.84~0.85），木门那点彩色（占比只有 0.074）正好
-    #: 让它过了 0.06 的闸门 → **空的那一侧也被判成"有车"**，日志里就是
-    #: `deciding (both branches ...)`（190513 那次因此没走对、190602 那次直接 FAILED）。
-    #: 实测分界（337 张实车画面逐帧统计，.local/probe_accent_stats.py）：
-    #:   * 大候选里的真车（车+墙连成一块）：彩色 **0.22 ~ 0.27**；
-    #:   * 墙裙误报：彩色 **0.074**。
-    #: 小块候选（面积 < 0.5）不受这条约束 —— 远处的车小、彩色像素少，实测最低 0.066，
-    #: 靠 0.06 那条老阈值兜着。
+    #: **"显眼候选"的彩色门槛**：满足下面任一条的候选，彩色占比必须 ≥ 这个值：
+    #:   * 面积占比 ≥ `robot_large_area_ratio`（0.5）—— 墙/暗带糊成一大块；
+    #:   * 长宽比 ≥ `robot_wide_aspect_ratio`（1.8）—— 门框、踢脚线那种宽扁条。
+    #: 为什么必须"面积/形状 + 彩色"两条一起看（2026-09-17 换场地实测，337 张画面）：
+    #:   * 墙 + 墙脚阴影带 + 木门：面积 0.84~0.85、彩色 **0.074** → 挡掉；
+    #:   * 门框 + 暗墙边：长宽比 2.24、彩色 **0.062** → 挡掉；
+    #:   * 真车（含"车和墙连成一块"、以及宽扁视角那一帧）：彩色 **0.22~0.27** → 照旧认出。
+    #: 单看面积或单看长宽比都会误伤真车（实测：真车面积最大 0.80、长宽比也能到 2.24），
+    #: 单看彩色也不行（真车最低 0.066，和误报的 0.062~0.074 重叠）。
     robot_large_area_ratio: float = 0.5
-    robot_large_accent_min_ratio: float = 0.15
+    robot_wide_aspect_ratio: float = 1.8
+    robot_strong_accent_min_ratio: float = 0.15
     #: **"深色块附近有没有彩色"** 的邻域大小（像素）：装甲/灯就长在车身上，
     #: 所以只需要很小的邻域。现场实测：暗墙、门框、踢脚线也是"深色"，
     #: 光看深色会把背景一起圈进来；而彩色只有小车和胶带有（空地和墙是 0.000）。
@@ -1281,11 +1283,12 @@ class VehicleDetector:
             return None
         if accent_ratio < settings.robot_accent_min_ratio:
             return None
-        # **大块候选要"彩色更多"**：墙 + 墙脚阴影带 + 木门在走廊里连成的大暗块
-        # （面积 0.84~0.85、彩色只有 0.074）就是被这一条挡掉的；而"车和墙连成一块"
-        # 的真检测彩色有 0.22~0.27，照样过（2026-09-17 换场地后标定）。
-        if (area_ratio >= settings.robot_large_area_ratio
-                and accent_ratio < settings.robot_large_accent_min_ratio):
+        # **"显眼"候选要彩色更多**：大面积（墙/暗带糊成一块）或宽扁（门框、踢脚线）
+        # 的候选，必须真的带够鲜艳色才算车。这一条同时挡住了 2026-09-17 换场地后
+        # 出现的那两类误报（墙裙 0.074、门框 0.062），而真车（0.22~0.27）照旧过。
+        prominent = (area_ratio >= settings.robot_large_area_ratio
+                     or aspect >= settings.robot_wide_aspect_ratio)
+        if prominent and accent_ratio < settings.robot_strong_accent_min_ratio:
             return None
         # 分数：越"又黑又有鲜艳装甲"越像（0~2）。
         return dark_ratio + accent_ratio
@@ -1333,6 +1336,10 @@ class FreeJunctionTask:
         self._sdk_pushed_at: Optional[float] = None
         #: 最近一次官方读数被判成哪种坐标（"normalized"/"pixels"/""）——实车排查用。
         self.last_sdk_mode = ""
+        #: 从启动到现在，官方识别**一共报过几条**"看到一辆 RoboMaster 小车"。
+        #: 一直是 0 就说明集成层还没订阅 robot 识别（那时用的是画面判据兜底）——
+        #: 主循环的 message 会直接写出来，实车上一眼可见。
+        self.official_sightings = 0
         self.last_blockage = BlockageReading(BLOCKAGE_NONE)
         self.last_visual = VisualDetection.no_result(KIND)
         self.chosen_branch: Optional[Branch] = None
@@ -1642,6 +1649,19 @@ class FreeJunctionTask:
             return 1.0
         return scale
 
+    def _official_note(self) -> str:
+        """官方识别一直没读数时，给 message 加一句"现在用的是画面判据兜底"。
+
+        实车上判断"集成层到底有没有把 robot 识别接进来"就靠这句话：
+        看到它 = 官方读数没到（或者没订阅），消息里那套读数来自画面判据。
+        """
+        source = str(getattr(self.settings, "blockage_source", "")).strip().lower()
+        if source not in ("sdk", "sdk_or_vision"):
+            return ""
+        if self.official_sightings > 0:
+            return ""
+        return "official robot detection unavailable (0 sightings so far; picture criterion); "
+
     def _read_sdk_blockage(
         self, fork: ForkDetection, image, rect, now: float
     ) -> BlockageReading:
@@ -1666,7 +1686,10 @@ class FreeJunctionTask:
         right_score = 0.0
         left_box: Optional[Tuple[int, int, int, int]] = None
         right_box: Optional[Tuple[int, int, int, int]] = None
-        for sighting in self._sdk_sightings(width, height, now):
+        sightings = self._sdk_sightings(width, height, now)
+        if sightings:
+            self.official_sightings += len(sightings)
+        for sighting in sightings:
             center_x, center_y = sighting.center
             # 只看"岔路口那条带"和岔路 ROI 的横向范围：和画面判据同一块地方。
             if center_y < top or center_y > bottom:
@@ -1813,7 +1836,8 @@ class FreeJunctionTask:
         self._run_started_at = now
         self._decide_count = 0
         return self._running(
-            now, "junction confirmed, deciding (%s; %s)" % (reason, reading.describe())
+            now, "%sjunction confirmed, deciding (%s; %s)"
+            % (self._official_note(), reason, reading.describe())
         )
 
     # -- 接管中的状态机 ---------------------------------------------------
@@ -1851,8 +1875,8 @@ class FreeJunctionTask:
                 self.chosen_branch = branch
                 self._enter(JunctionState.APPROACH, now)
                 return self._running(
-                    now, "taking the %s branch (%s; %s)"
-                    % (branch.value, reason, reading.describe())
+                    now, "%staking the %s branch (%s; %s)"
+                    % (self._official_note(), branch.value, reason, reading.describe())
                 )
             if self._elapsed(now) >= settings.decide_timeout:
                 return self._fail(

@@ -797,14 +797,51 @@ class OfficialSdkCriterionTests(unittest.TestCase):
             )
             self.assertIs(task.chosen_branch, Branch.RIGHT, label)
 
-    def test_default_source_still_uses_the_picture(self):
-        """默认配置下官方读数**不参与判定**（行为与本改动前完全一致）。"""
-        task = FreeJunctionTask()                    # 默认 blockage_source="vision"
-        # 画面：左分支有车；官方读数故意说右边有车 —— 应该听画面的（走右边）
+    def test_the_default_source_prefers_the_official_reading(self):
+        """**默认配置下官方 SDK 的读数说了算**（要求：判据用官方机器人识别）。
+
+        画面里"左支有车"、官方读数却说右边有车 —— 默认必须听**官方**的
+        （走左边），而且读数来源标成 `sdk`。
+        """
+        task = FreeJunctionTask()                    # 默认 blockage_source="sdk_or_vision"
+        self.assertEqual(task.settings.blockage_source, "sdk_or_vision")
         records = self._replay(task, fork_frame(car_left=True), [(0.80, 0.40, 0.18, 0.26)])
         self.assertIs(records[-1][1].status, TaskStatus.COMPLETED)
-        self.assertIs(task.chosen_branch, Branch.RIGHT)
-        self.assertEqual(task.last_blockage.source, "vision")
+        self.assertIs(task.chosen_branch, Branch.LEFT)
+        self.assertEqual(task.last_blockage.source, "sdk")
+        self.assertGreater(task.official_sightings, 0)
+
+    def test_the_default_falls_back_and_says_so_when_the_sdk_is_silent(self):
+        """官方读数一直没到（集成层还没订阅 robot 识别）时：退回画面判据，并**写在 message 里**。
+
+        实车上就靠这句话判断"集成层到底接没接"：
+        看到 `official robot detection unavailable` = 现在用的是画面判据兜底。
+        """
+        for source in ("sdk_or_vision", "sdk"):
+            task = FreeJunctionTask(FreeJunctionConfig(blockage_source=source))
+            self.assertIn("official robot detection unavailable", task._official_note())
+            self.assertEqual(task.official_sightings, 0)
+
+        # "sdk_or_vision"：官方没读数 → 退回画面判据，并把这件事写进接管那一刻的 message
+        fallback = FreeJunctionTask(FreeJunctionConfig(blockage_source="sdk_or_vision"))
+        records = self._replay(fallback, fork_frame(car_left=True), ())
+        messages = [update.message for _state, update, _now in records]
+        self.assertTrue(
+            any("official robot detection unavailable" in m for m in messages),
+            "官方没读数时必须写明在用画面判据兜底：%s" % messages[:3],
+        )
+        self.assertIs(records[-1][1].status, TaskStatus.COMPLETED)
+        self.assertEqual(fallback.last_blockage.source, "vision")
+
+        # "sdk"：官方没读数就是"没有判据" —— 不接管（只用于确认订阅有没有通）
+        strict = FreeJunctionTask(FreeJunctionConfig(blockage_source="sdk"))
+        records = self._replay(strict, fork_frame(car_left=True), (), frames=40)
+        for _state, update, _now in records:
+            self.assertIs(update.status, TaskStatus.NOT_TRIGGERED)
+
+        # 纯画面判据那条路上不该出现这句提示
+        picture = FreeJunctionTask(FreeJunctionConfig(blockage_source="vision"))
+        self.assertEqual(picture._official_note(), "")
 
     def test_or_vision_mode_falls_back_when_the_official_source_is_silent(self):
         """"sdk_or_vision"：官方没读数时退回画面判据，不会因此错过岔路。"""
