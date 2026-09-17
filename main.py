@@ -22,6 +22,7 @@ def build_coordinator(
     capture_directory=DEFAULT_CAPTURE_DIRECTORY,
     gimbal_output=None,
     motion_task_names=None,
+    motion_tasks_override=None,
 ):
     """Wire every registered module into the coordinator.
 
@@ -35,7 +36,10 @@ def build_coordinator(
         settings,
         follower,
         output,
-        motion_tasks=build_motion_tasks(motion_task_names),
+        motion_tasks=(
+            build_motion_tasks(motion_task_names)
+            if motion_tasks_override is None else tuple(motion_tasks_override)
+        ),
         observers=build_observers(capture_directory),
         gimbal_output=gimbal_output,
     )
@@ -408,6 +412,8 @@ def main(
     motion_task_names=None,
     marker_subscription=True,
     run_label="FULL",
+    motion_tasks_override=None,
+    gimbal_output_factory=None,
 ) -> None:
     # Keeping this import inside main makes every offline import hardware-safe.
     from robomaster import camera, robot
@@ -440,12 +446,17 @@ def main(
         output = MotionOutput(ep_robot.chassis, CONFIG)
         _align_camera(ep_robot, output, robot)
         print("[main] 云台就位，正在打开视频流 ...", flush=True)
-        gimbal_output = GimbalOutput(ep_robot.gimbal, CONFIG)
+        gimbal_output = (
+            GimbalOutput(ep_robot.gimbal, CONFIG)
+            if gimbal_output_factory is None
+            else gimbal_output_factory(ep_robot, CONFIG, robot)
+        )
         coordinator = build_coordinator(
             follower,
             output,
             gimbal_output=gimbal_output,
             motion_task_names=motion_task_names,
+            motion_tasks_override=motion_tasks_override,
         )
         resolution_name = f"STREAM_{CONFIG.camera_resolution.upper()}"
         resolution = getattr(camera, resolution_name)
@@ -562,6 +573,12 @@ def main(
                 gimbal_output.restore_line_view()
             except Exception:
                 pass
+            close_gimbal_output = getattr(gimbal_output, "close", None)
+            if callable(close_gimbal_output):
+                try:
+                    close_gimbal_output()
+                except Exception:
+                    pass
         if source is not None:
             source.close()
         if marker_source is not None:
