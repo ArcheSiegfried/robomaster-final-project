@@ -311,6 +311,75 @@ class VehicleDetectorTests(unittest.TestCase):
         self.assertFalse(blocked)
 
 
+    def test_a_wall_band_with_a_bit_of_colour_is_not_a_vehicle(self):
+        """**换场地后的误报**（2026-09-17 19:05/19:06）：墙 + 墙脚阴影带 + 木门。
+
+        那条暗带会横跨整条走廊，木门的彩色把它"点亮" → 原来过了闸门，
+        于是空的那一侧也被判成"有车"，日志里出现 `both branches blocked`。
+        实测：真车候选面积占比 ≤ 0.66，这条误报 0.84~0.85 —— 用面积上限挡掉。
+        """
+        settings = FreeJunctionConfig()
+        detector = FreeJunctionDetector(settings)
+        vehicle = VehicleDetector(settings)
+        region = np.full((136, 300, 3), FLOOR, np.uint8)
+        # 暗带占走廊的大部分（宽 250 × 高 130 / 300×136 ≈ 0.80），只有一小块彩色
+        cv2.rectangle(region, (10, 5), (260, 135), CAR_BODY, -1)
+        cv2.rectangle(region, (200, 40), (250, 90), CAR_ARMOR_RED, -1)   # 木门那点彩色
+        blocked, score, box = vehicle.detect(region, detector.blue_mask(region))
+        self.assertFalse(
+            blocked,
+            "墙裙那条大暗带被当成车了（真车面积上限 0.75）：证据=%.3f 框=%s" % (score, box),
+        )
+
+        # 同一块地方，把它缩成"车那么大"（占走廊约 0.3）→ 应该判成车
+        small = np.full((136, 300, 3), FLOOR, np.uint8)
+        cv2.rectangle(small, (60, 40), (170, 110), CAR_BODY, -1)
+        cv2.rectangle(small, (64, 44), (76, 106), CAR_ARMOR_RED, -1)
+        cv2.rectangle(small, (154, 44), (166, 106), CAR_ARMOR_GREEN, -1)
+        blocked2, score2, box2 = vehicle.detect(small, detector.blue_mask(small))
+        self.assertTrue(blocked2, "车那么大的深色块+装甲应该判成车：%s %s" % (score2, box2))
+
+    def test_a_large_blob_is_a_vehicle_only_with_enough_colour_on_it(self):
+        """大块候选（面积 ≥ 0.5）要"彩色够多"才算车 —— 车和墙连成一块时也要认得出。
+
+        这条规则是为了同时满足两头（2026-09-17 换场地后实测）：
+          * 墙裙那条大暗块：彩色 0.074 → **挡掉**；
+          * 车和墙连成一块的真检测：彩色 0.22~0.27、面积 0.7~0.8 → **照旧认出**。
+
+        注意"彩色"用的是**细灯条**：真车（S1/EP）的装甲灯就是细条/小块，
+        掩码只把离深色车体一个核半径以内的彩色像素并进来，所以大面积纯色块的
+        内部不会被计入 —— 这是照着实物标定的，不是缺陷。
+        """
+        settings = FreeJunctionConfig()
+        detector = FreeJunctionDetector(settings)
+        vehicle = VehicleDetector(settings)
+
+        def bars(image, y0, y1, colour, thickness=6):
+            for y in range(y0, y1, 22):
+                cv2.rectangle(image, (20, y), (250, y + thickness), colour, -1)
+
+        # 大块 + 细灯条够多（≈车和墙连成一块）→ 判成车
+        merged = np.full((136, 300, 3), FLOOR, np.uint8)
+        cv2.rectangle(merged, (5, 5), (265, 130), CAR_BODY, -1)
+        bars(merged, 14, 128, CAR_ARMOR_RED)
+        bars(merged, 25, 128, CAR_ARMOR_GREEN)
+        blocked, score, box = vehicle.detect(merged, detector.blue_mask(merged))
+        self.assertTrue(
+            blocked,
+            "车和墙连成一块的大候选（彩色够多）不该被挡：证据=%.3f 框=%s" % (score, box),
+        )
+
+        # 同样大的块，但彩色只有一小条（≈墙裙 + 木门）→ 不是车
+        wall = np.full((136, 300, 3), FLOOR, np.uint8)
+        cv2.rectangle(wall, (5, 5), (265, 130), CAR_BODY, -1)
+        cv2.rectangle(wall, (232, 40), (256, 46), CAR_ARMOR_RED, -1)
+        blocked2, score2, box2 = vehicle.detect(wall, detector.blue_mask(wall))
+        self.assertFalse(
+            blocked2,
+            "大块但彩色很少（墙裙+门）不该判成车：证据=%.3f 框=%s" % (score2, box2),
+        )
+
+
 class ChoosingBranchTests(unittest.TestCase):
     def test_car_on_the_left_takes_the_right_branch(self):
         task = FreeJunctionTask()

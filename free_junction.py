@@ -396,7 +396,23 @@ class FreeJunctionConfig:
     robot_min_width_ratio: float = 0.10   # 尺寸闸门放得很松：远一点的车也要能过
     robot_min_height_ratio: float = 0.10
     robot_min_area_ratio: float = 0.015
+    #: 候选框面积占走廊的上限（只当兜底：真车候选实测 ≤ 0.66，含"车和墙连成一块"的
+    #: 极端帧；换场地后那条墙裙误报是 0.84~0.85 —— 挡住它靠的是下面那条**组合判据**，
+    #: 不是这个上限，否则会把"车+墙连成一块"的真检测一起挡掉，2026-09-17 试过）。
     robot_max_area_ratio: float = 0.90
+    #: **大候选的"彩色要更多"规则**：面积占比 ≥ `robot_large_area_ratio` 的候选，
+    #: 要求彩色占比 ≥ `robot_large_accent_min_ratio`。
+    #: 为什么需要它（2026-09-17 换场地后）：新场地里**墙 + 墙脚阴影带 + 木门**会在
+    #: 走廊里连成一条大暗块（面积 0.84~0.85），木门那点彩色（占比只有 0.074）正好
+    #: 让它过了 0.06 的闸门 → **空的那一侧也被判成"有车"**，日志里就是
+    #: `deciding (both branches ...)`（190513 那次因此没走对、190602 那次直接 FAILED）。
+    #: 实测分界（337 张实车画面逐帧统计，.local/probe_accent_stats.py）：
+    #:   * 大候选里的真车（车+墙连成一块）：彩色 **0.22 ~ 0.27**；
+    #:   * 墙裙误报：彩色 **0.074**。
+    #: 小块候选（面积 < 0.5）不受这条约束 —— 远处的车小、彩色像素少，实测最低 0.066，
+    #: 靠 0.06 那条老阈值兜着。
+    robot_large_area_ratio: float = 0.5
+    robot_large_accent_min_ratio: float = 0.15
     #: **"深色块附近有没有彩色"** 的邻域大小（像素）：装甲/灯就长在车身上，
     #: 所以只需要很小的邻域。现场实测：暗墙、门框、踢脚线也是"深色"，
     #: 光看深色会把背景一起圈进来；而彩色只有小车和胶带有（空地和墙是 0.000）。
@@ -1264,6 +1280,12 @@ class VehicleDetector:
         if dark_ratio < settings.robot_dark_min_ratio:
             return None
         if accent_ratio < settings.robot_accent_min_ratio:
+            return None
+        # **大块候选要"彩色更多"**：墙 + 墙脚阴影带 + 木门在走廊里连成的大暗块
+        # （面积 0.84~0.85、彩色只有 0.074）就是被这一条挡掉的；而"车和墙连成一块"
+        # 的真检测彩色有 0.22~0.27，照样过（2026-09-17 换场地后标定）。
+        if (area_ratio >= settings.robot_large_area_ratio
+                and accent_ratio < settings.robot_large_accent_min_ratio):
             return None
         # 分数：越"又黑又有鲜艳装甲"越像（0~2）。
         return dark_ratio + accent_ratio
