@@ -32,6 +32,7 @@ from runtime import LineFollower
 # over motion; "observe" means it never may.
 # evidence.py is infrastructure owned by the integration person, not a slot.
 EXPECTED_MODULE_FILES = {
+    "traffic_light.py": "step",
     "number_marker.py": "step",
     "obstacle.py": "step",
     "route.py": "step",
