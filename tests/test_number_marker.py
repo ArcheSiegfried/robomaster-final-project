@@ -1,8 +1,11 @@
 """Offline checks for the Final number-marker task (WP2 / Issue #2)."""
 
+import io
+import json
 import pathlib
 import sys
 import unittest
+from contextlib import redirect_stderr
 from dataclasses import replace
 
 import numpy as np
@@ -492,6 +495,130 @@ class AimingStateTests(unittest.TestCase):
         self.assertIs(update.status, TaskStatus.FAILED)
         self.assertEqual(update.motion.yaw, 0.0)
         self.assertIn("OBSERVATION_PROVIDER_ERROR", update.message)
+
+
+class TrackingHysteresisTests(unittest.TestCase):
+    def feed(self, task, sequence, now, ratio, marker_id="1", centered=True):
+        item = candidate(
+            marker_id, x=WIDTH / 2 if centered else 460,
+            width=WIDTH * ratio,
+        )
+        set_current(task, sequence, now, item)
+        return task.step(packet(sequence, now), now)
+
+    def test_first_trigger_remains_strictly_above_020(self):
+        task = NumberMarkerTask(BASE_CONFIG)
+        self.assertIs(self.feed(task, 1, 1.0, 0.20).status, TaskStatus.NOT_TRIGGERED)
+        self.assertIsNone(task.target_id)
+        self.assertIs(self.feed(task, 2, 1.01, 0.2001).status, TaskStatus.RUNNING)
+        self.assertEqual(task.target_id, "1")
+
+    def test_019_after_lock_keeps_same_target_without_failure(self):
+        task = NumberMarkerTask(BASE_CONFIG)
+        self.feed(task, 1, 1.0, 0.25)
+        update = self.feed(task, 2, 1.01, 0.19, centered=False)
+        self.assertIs(update.status, TaskStatus.RUNNING)
+        self.assertEqual(update.message, "AIMING:TRACKING_BELOW_TRIGGER")
+        self.assertEqual(task.target_id, "1")
+        self.assertIsNone(task.pending_evidence_request)
+
+    def test_tracking_boundary_017_holds_but_0169_enters_zero_motion_grace(self):
+        task = NumberMarkerTask(replace(BASE_CONFIG, aim_stable_frames=1))
+        self.feed(task, 1, 1.0, 0.25)
+        held = self.feed(task, 2, 1.01, 0.17)
+        self.assertIs(held.status, TaskStatus.RUNNING)
+        self.assertIsNone(task.pending_evidence_request)
+        lost = self.feed(task, 3, 1.02, 0.169, centered=False)
+        self.assertEqual(lost.message, "TARGET_LOST:HOLD")
+        self.assertEqual(lost.motion.yaw, 0.0)
+        self.assertIsNone(task.pending_evidence_request)
+
+    def test_locked_exactly_020_cannot_create_evidence(self):
+        task = NumberMarkerTask(replace(BASE_CONFIG, aim_stable_frames=1))
+        self.feed(task, 1, 1.0, 0.25)
+        for sequence in (2, 3):
+            update = self.feed(task, sequence, 1.0 + sequence * 0.01, 0.20)
+            self.assertIs(update.status, TaskStatus.RUNNING)
+            self.assertIsNone(task.pending_evidence_request)
+        self.feed(task, 4, 1.04, 0.2001)
+        self.assertIsNotNone(task.pending_evidence_request)
+
+    def test_recovery_above_trigger_retains_id_and_restarts_stability(self):
+        task = NumberMarkerTask(replace(BASE_CONFIG, aim_stable_frames=2))
+        self.feed(task, 1, 1.0, 0.25)
+        self.feed(task, 2, 1.01, 0.18)
+        set_current(task, 3, 1.02,
+                    candidate("1", width=WIDTH * 0.23),
+                    candidate("2", width=WIDTH * 0.40))
+        recovered = task.step(packet(3, 1.02), 1.02)
+        self.assertIs(recovered.status, TaskStatus.RUNNING)
+        self.assertEqual(task.target_id, "1")
+        self.assertIsNone(task.pending_evidence_request)
+        self.assertIn("TRACKING_RECOVERED", [e["event"] for e in task.diagnostic_events])
+        self.feed(task, 4, 1.03, 0.23)
+        self.assertEqual(task.pending_evidence_request.marker_id, "1")
+
+    def test_evidence_gate_requires_new_above_trigger_stable_frames(self):
+        task = NumberMarkerTask(replace(BASE_CONFIG, aim_stable_frames=3))
+        self.feed(task, 1, 1.0, 0.25)
+        for sequence in (2, 3, 4, 5):
+            self.feed(task, sequence, 1.0 + sequence * 0.01, 0.18)
+            self.assertIsNone(task.pending_evidence_request)
+            self.assertNotIn("1", task.aimed_ids)
+        for sequence in (6, 7):
+            self.feed(task, sequence, 1.0 + sequence * 0.01, 0.23)
+            self.assertIsNone(task.pending_evidence_request)
+        self.feed(task, 8, 1.08, 0.23)
+        self.assertEqual(task.pending_evidence_request.marker_id, "1")
+        self.assertIn("1", task.aimed_ids)
+        self.assertNotIn("1", task.saved_ids)
+
+    def test_below_tracking_threshold_uses_existing_030_timeout(self):
+        task = NumberMarkerTask(BASE_CONFIG)
+        self.feed(task, 1, 1.0, 0.25)
+        self.feed(task, 2, 1.01, 0.169)
+        task.update_candidates(())
+        self.assertIs(task.step(packet(3, 1.30), 1.30).status, TaskStatus.RUNNING)
+        failed = task.step(packet(4, 1.32), 1.32)
+        self.assertIs(failed.status, TaskStatus.FAILED)
+        self.assertEqual(failed.message, "FAILED:TARGET_LOST_TIMEOUT")
+        self.assertEqual(failed.motion.yaw, 0.0)
+        self.assertIsNone(task.pending_evidence_request)
+
+    def test_transition_diagnostics_include_bounded_pre_failure_trace(self):
+        task = NumberMarkerTask(BASE_CONFIG)
+        output = io.StringIO()
+        with redirect_stderr(output):
+            self.feed(task, 1, 1.0, 0.25)
+            self.feed(task, 2, 1.01, 0.18)
+            self.feed(task, 3, 1.02, 0.23)
+            self.feed(task, 4, 1.03, 0.169)
+            task.update_candidates(())
+            task.step(packet(5, 1.34), 1.34)
+        lines = [json.loads(line.split(" ", 1)[1]) for line in output.getvalue().splitlines()]
+        events = [line["event"] for line in lines]
+        self.assertEqual(events, ["TARGET_LOCKED", "TRACKING_BELOW_TRIGGER",
+                                  "TRACKING_RECOVERED", "TARGET_LOST_GRACE",
+                                  "TARGET_LOST_TIMEOUT"])
+        self.assertEqual(lines[0]["locked_target_id"], "1")
+        self.assertEqual(lines[0]["locked_target_width_ratio"], 0.25)
+        self.assertEqual(lines[-1]["frame_sequence"], 5)
+        self.assertGreater(lines[-1]["target_lost_age"], 0.30)
+        self.assertTrue(any(row["current_target_width_ratio"] == 0.169
+                            for row in lines[-1]["recent_observations"]))
+        self.assertEqual(len(task.diagnostic_events), len(lines))
+
+    def test_diagnostics_preserve_age_of_rejected_same_id_observation(self):
+        task = NumberMarkerTask(BASE_CONFIG)
+        with redirect_stderr(io.StringIO()):
+            self.feed(task, 1, 1.0, 0.25)
+            task.update_candidates((candidate(now=1.0, sequence=None),))
+            update = task.step(packet(2, 1.20), 1.20)
+        self.assertEqual(update.message, "TARGET_LOST:HOLD")
+        lost = task.diagnostic_events[-1]
+        self.assertEqual(lost["event"], "TARGET_LOST_GRACE")
+        self.assertAlmostEqual(lost["observation_age"], 0.20)
+        self.assertEqual(lost["frame_sequence"], 2)
 
 
 class EvidenceTests(unittest.TestCase):

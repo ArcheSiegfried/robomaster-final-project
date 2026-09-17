@@ -9,8 +9,11 @@ All defaults in ``NumberMarkerConfig`` are engineering starting values. They
 are not claimed as teacher-specified tolerances or hardware-verified settings.
 """
 
+import json
 import math
+import sys
 import threading
+from collections import deque
 from dataclasses import dataclass, replace
 from enum import Enum
 from typing import Callable, FrozenSet, Iterable, Optional, Sequence, Tuple
@@ -61,6 +64,7 @@ class NumberMarkerConfig:
     """Module-local settings pending an integration-owned config migration."""
 
     min_marker_width_ratio: float = 0.20
+    tracking_min_marker_width_ratio: float = 0.17
     aim_stable_frames: int = 3
     # Engineering interpretation of the ambiguous "1/10 marker size" center
     # region: these are full zone fractions, so the error limits are half.
@@ -377,6 +381,11 @@ class NumberMarkerTask:
         self.saved_ids = set()
 
         self._target_id: Optional[str] = None
+        self._locked_target_width_ratio: Optional[float] = None
+        self._tracking_below_trigger = False
+        self._recent_observations = deque(maxlen=32)
+        self._diagnostic_events = deque(maxlen=64)
+        self._last_raw_target: Optional[MarkerCandidate] = None
         self._started_at: Optional[float] = None
         self._lost_since: Optional[float] = None
         self._stable_frames = 0
@@ -390,6 +399,8 @@ class NumberMarkerTask:
     def _validate_settings(self) -> None:
         if not 0.0 < self.settings.min_marker_width_ratio < 1.0:
             raise ValueError("min_marker_width_ratio must be between 0 and 1")
+        if not 0.0 < self.settings.tracking_min_marker_width_ratio < self.settings.min_marker_width_ratio:
+            raise ValueError("tracking_min_marker_width_ratio must be below the trigger threshold")
         if self.settings.aim_stable_frames < 1:
             raise ValueError("aim_stable_frames must be at least 1")
         if self.settings.max_evidence_attempts < 1:
@@ -432,6 +443,12 @@ class NumberMarkerTask:
     @property
     def target_id(self) -> Optional[str]:
         return self._target_id
+
+    @property
+    def diagnostic_events(self) -> Tuple[dict, ...]:
+        """Bounded module-owned event history; the runtime can inspect it safely."""
+
+        return tuple(dict(event) for event in self._diagnostic_events)
 
     @property
     def target_pitch(self) -> Optional[float]:
@@ -499,6 +516,15 @@ class NumberMarkerTask:
 
         height, width = frame.image.shape[:2]
         candidates = self._read_candidates(frame, now)
+        raw_matches = (
+            tuple(item for item in candidates
+                  if isinstance(item, MarkerCandidate) and item.target_id == target_id)
+            if target_id is not None else ()
+        )
+        self._last_raw_target = (
+            max(raw_matches, key=lambda item: _finite(item.width) or 0.0)
+            if raw_matches else None
+        )
         accepted = evaluate_number_markers(
             candidates,
             width,
@@ -511,6 +537,59 @@ class NumberMarkerTask:
         if target_id is not None:
             accepted = tuple(item for item in accepted if item.target_id == target_id)
         return select_target_marker(accepted)
+
+    def _note_observation(
+        self, event: str, frame: FramePacket, now: float,
+        candidate: Optional[MarkerCandidate], *, emit: bool = False,
+        include_recent: bool = False,
+    ) -> None:
+        """Keep a short pre-failure trace and print only significant transitions."""
+
+        width = frame.image.shape[1]
+        observed_at = None if candidate is None else _finite(candidate.observed_at)
+        age = None if observed_at is None else now - observed_at
+        current_width = None if candidate is None else _finite(candidate.width)
+        ratio = None if current_width is None or width <= 0 else current_width / width
+        try:
+            x = None if candidate is None else _finite(candidate.center[0])
+            y = None if candidate is None else _finite(candidate.center[1])
+        except (TypeError, IndexError):
+            x = y = None
+        try:
+            source_sequence = (
+                None if candidate is None or candidate.source_sequence is None
+                else int(candidate.source_sequence)
+            )
+        except (TypeError, ValueError):
+            source_sequence = None
+        entry = {
+            "event": event,
+            "timestamp_monotonic_s": round(now, 6),
+            "frame_sequence": frame.sequence,
+            "locked_target_id": self._target_id,
+            "locked_target_width_ratio": self._locked_target_width_ratio,
+            "candidate_id": None if candidate is None else str(candidate.target_id),
+            "candidate_source_sequence": source_sequence,
+            "current_target_width_ratio": ratio,
+            "x_px": x,
+            "y_px": y,
+            "observation_age": age,
+            "target_lost_age": None if self._lost_since is None else now - self._lost_since,
+        }
+        if self._target_id is not None:
+            self._recent_observations.append(entry)
+        if not emit:
+            return
+        if include_recent:
+            entry = dict(entry, recent_observations=[
+                item for item in self._recent_observations
+                if now - item["timestamp_monotonic_s"] <= 0.5
+            ])
+        self._diagnostic_events.append(entry)
+        try:
+            sys.stderr.write("NUMBER_MARKER_DIAG " + json.dumps(entry, sort_keys=True) + "\n")
+        except (OSError, TypeError, ValueError):
+            pass  # Diagnostics must never interrupt motion safety.
 
     def _clamp_pitch(self, pitch: float) -> float:
         return max(self._pitch_min, min(float(pitch), self._pitch_max))
@@ -587,7 +666,7 @@ class NumberMarkerTask:
 
         if self._target_id is not None:
             if selection is None:
-                return self._step_target_lost(now)
+                return self._step_target_lost(frame, now, self._last_raw_target)
 
         if selection is None:
             self.state = MarkerState.IDLE
@@ -603,18 +682,20 @@ class NumberMarkerTask:
         detection = candidate.to_detection(width, height)
         self.last_detection = detection
         self.last_selection_strategy = selection.strategy
+        ratio = candidate.width_ratio(width)
 
-        if not is_marker_eligible(candidate, width, self.settings.min_marker_width_ratio):
+        if self._target_id is not None:
+            if ratio < self.settings.tracking_min_marker_width_ratio:
+                return self._step_target_lost(frame, now, candidate)
+            self._note_observation("TARGET_TRACKING", frame, now, candidate)
+            if ratio > self.settings.min_marker_width_ratio and self._tracking_below_trigger:
+                self._tracking_below_trigger = False
+                self._note_observation("TRACKING_RECOVERED", frame, now, candidate, emit=True)
+
+        if self._target_id is None and not is_marker_eligible(
+            candidate, width, self.settings.min_marker_width_ratio
+        ):
             self.state = MarkerState.TARGET_TOO_SMALL
-            if self._target_id is not None:
-                self.state = MarkerState.FAILED
-                self._clear_terminal_transients()
-                return TaskUpdate(
-                    TaskStatus.FAILED,
-                    motion=MotionCommand(),
-                    detection=detection,
-                    message="FAILED:TARGET_TOO_SMALL",
-                )
             return TaskUpdate(
                 TaskStatus.NOT_TRIGGERED,
                 detection=detection,
@@ -624,11 +705,15 @@ class NumberMarkerTask:
         if self._target_id is None:
             self.state = MarkerState.TARGET_FOUND
             self._target_id = candidate.target_id
+            self._locked_target_width_ratio = ratio
+            self._tracking_below_trigger = False
+            self._recent_observations.clear()
             self._started_at = now
             self._stable_frames = 0
             self._lost_since = None
             self._begin_pitch_tracking(now)
             self.state = MarkerState.STOPPING
+            self._note_observation("TARGET_LOCKED", frame, now, candidate, emit=True)
             return TaskUpdate(
                 TaskStatus.RUNNING,
                 motion=None,
@@ -641,6 +726,23 @@ class NumberMarkerTask:
         intent = compute_aim_intent(candidate, width, height, self.settings)
         self.last_aim_intent = intent
         gimbal = self._integrate_pitch(intent, now)
+
+        if ratio <= self.settings.min_marker_width_ratio:
+            self._stable_frames = 0
+            self._last_centered_sequence = None
+            if not self._tracking_below_trigger:
+                self._tracking_below_trigger = True
+                self._note_observation("TRACKING_BELOW_TRIGGER", frame, now, candidate, emit=True)
+            return TaskUpdate(
+                TaskStatus.RUNNING,
+                motion=MotionCommand(
+                    yaw=0.0 if is_marker_centered(candidate, width, height, self.settings)
+                    else intent.yaw_rate
+                ),
+                gimbal=gimbal,
+                detection=detection,
+                message="AIMING:TRACKING_BELOW_TRIGGER",
+            )
 
         if not is_marker_centered(candidate, width, height, self.settings):
             self._stable_frames = 0
@@ -700,17 +802,30 @@ class NumberMarkerTask:
                 return self._injected_candidates
         return tuple(self._observation_provider(frame, now))
 
-    def _step_target_lost(self, now: float) -> TaskUpdate:
+    def _step_target_lost(
+        self, frame: FramePacket, now: float,
+        candidate: Optional[MarkerCandidate] = None,
+    ) -> TaskUpdate:
         self.state = MarkerState.LOST
         self._stable_frames = 0
         self._last_centered_sequence = None
+        self._tracking_below_trigger = True
         # Keep the last absolute target for a brief reacquisition, but move the
         # integration clock forward so lost time can never become pitch motion.
         if self._last_step_at is not None:
             self._last_step_at = max(self._last_step_at, now)
-        if self._lost_since is None:
+        first_miss = self._lost_since is None
+        if first_miss:
             self._lost_since = now
+        self._note_observation(
+            "TARGET_LOST_GRACE" if first_miss else "TARGET_LOST_HOLD",
+            frame, now, candidate, emit=first_miss,
+        )
         if now - self._lost_since > self.settings.target_lost_timeout:
+            self._note_observation(
+                "TARGET_LOST_TIMEOUT", frame, now, candidate,
+                emit=True, include_recent=True,
+            )
             self.state = MarkerState.FAILED
             self._clear_terminal_transients()
             return TaskUpdate(
@@ -816,6 +931,10 @@ class NumberMarkerTask:
         self.last_selection_strategy = None
         self.last_aim_intent = None
         self._target_id = None
+        self._locked_target_width_ratio = None
+        self._tracking_below_trigger = False
+        self._last_raw_target = None
+        self._recent_observations.clear()
         self._started_at = None
         self._lost_since = None
         self._stable_frames = 0
