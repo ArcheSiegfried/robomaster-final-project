@@ -797,68 +797,6 @@ class OfficialSdkCriterionTests(unittest.TestCase):
             )
             self.assertIs(task.chosen_branch, Branch.RIGHT, label)
 
-    def test_robot_recognition_channel_drives_the_decision(self):
-        """集成层的官方"机器人识别"通道（`robot_source.py` → `update_robot_observations`）。
-
-        这条就是用户要求的"用大疆 SDK 认同款小车"的主路：`main.py` 的
-        `feed_robot_observations()` 对**任何**实现了本方法的名字每帧推一次，
-        参数是 ``(rows, observed_at)``，`rows` 每行 ``(x, y, w, h)``（中心点 + 宽高）。
-        """
-        task = FreeJunctionTask()                 # 默认 sdk_or_vision
-        records = []
-        now = 1.0
-        for index in range(200):
-            task.update_robot_observations([(128.0, 144.0, 115.0, 94.0)], observed_at=now)
-            update = task.step(FramePacket(fork_frame(), index + 1, now), now)
-            records.append(update)
-            now += 0.05
-            if update.status in (TaskStatus.COMPLETED, TaskStatus.FAILED):
-                break
-        self.assertIs(records[-1].status, TaskStatus.COMPLETED)
-        self.assertIs(task.chosen_branch, Branch.RIGHT)      # 官方说左边有车 → 走右支
-        self.assertEqual(task.last_blockage.source, "sdk")
-        self.assertIn("official detector", task.last_reason)
-        self.assertGreater(task.official_sightings, 0)
-
-    def test_the_two_official_channels_do_not_clobber_each_other(self):
-        """两个官方通道各自存一份快照（`main.py` 每帧会先后推 marker 和 robot）。
-
-        共用一个槽位的话，后推的会把先推的冲掉 —— 那就会出现"有时有判据、
-        有时没有"，实车上很难查。
-        """
-        task = FreeJunctionTask()
-        image = fork_frame()
-        task.update_candidates([(0.20, 0.40, 0.18, 0.26)], now=1.0)         # 视觉标签：左边
-        task.update_robot_observations([(128.0, 144.0, 115.0, 94.0)], observed_at=1.0)
-        fork, _roi, _line, rect = task.detector.analyze(image)
-
-        task.update_robot_observations([], observed_at=1.05)                # 机器人这帧没看到
-        reading = task._read_blockage(fork, image, rect, 1.05)
-        self.assertEqual(reading.reading, BLOCKAGE_LEFT,
-                         "机器人通道清空后视觉标签那条读数应该还在：%s" % reading.describe())
-
-        task.update_candidates([], now=1.10)                                # 标签清空，机器人重新有
-        task.update_robot_observations([(128.0, 144.0, 115.0, 94.0)], observed_at=1.10)
-        reading = task._read_blockage(fork, image, rect, 1.10)
-        self.assertEqual(reading.reading, BLOCKAGE_LEFT,
-                         "标签清空后机器人那条读数应该还在：%s" % reading.describe())
-
-        task.update_robot_observations([], observed_at=1.15)                # 两个都清空
-        reading = task._read_blockage(fork, image, rect, 1.15)
-        self.assertEqual(reading.reading, BLOCKAGE_NONE)
-        self.assertEqual(reading.source, "vision")
-
-    def test_a_stale_robot_reading_is_not_used(self):
-        """`observed_at` 是**回调接收时刻**：太旧就当"没看到"（不能刷成当前帧时间）。"""
-        task = FreeJunctionTask()
-        image = fork_frame()
-        fork, _roi, _line, rect = task.detector.analyze(image)
-        task.update_robot_observations([(128.0, 144.0, 115.0, 94.0)], observed_at=1.0)
-        fresh = task._read_blockage(fork, image, rect, 1.2)
-        self.assertEqual(fresh.reading, BLOCKAGE_LEFT)
-        stale = task._read_blockage(fork, image, rect, 3.0)   # 2 s 之后
-        self.assertEqual(stale.reading, BLOCKAGE_NONE)
-
     def test_the_default_source_prefers_the_official_reading(self):
         """**默认配置下官方 SDK 的读数说了算**（要求：判据用官方机器人识别）。
 

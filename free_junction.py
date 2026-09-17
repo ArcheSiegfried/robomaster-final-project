@@ -1348,10 +1348,6 @@ class FreeJunctionTask:
         self._sdk_lock = threading.Lock()
         self._sdk_rows: Tuple = ()
         self._sdk_pushed_at: Optional[float] = None
-        #: 官方"机器人识别"通道（`update_robot_observations`）的快照，
-        #: **和视觉标签通道分开存**：`main.py` 每帧会先后推两次，共用一个槽位会互相冲掉。
-        self._robot_rows: Tuple = ()
-        self._robot_pushed_at: Optional[float] = None
         #: 最近一次官方读数被判成哪种坐标（"normalized"/"pixels"/""）——实车排查用。
         self.last_sdk_mode = ""
         #: 从启动到现在，官方识别**一共报过几条**"看到一辆 RoboMaster 小车"。
@@ -1428,8 +1424,6 @@ class FreeJunctionTask:
             # 被迫结束后把官方读数也丢掉：那是上一次接管时的画面，不能接着用。
             self._sdk_rows = ()
             self._sdk_pushed_at = None
-            self._robot_rows = ()
-            self._robot_pushed_at = None
         self.last_sdk_mode = ""
         self._arm_rearm()
 
@@ -1500,52 +1494,18 @@ class FreeJunctionTask:
         :param now: 给"没有自带时间戳的原始行"打的时间戳（默认取单调钟；
             离线测试可以传真时钟，这样判定完全可复现）。
         """
-        snapshot = self._as_row_tuple(candidates)
-        stamp = self._as_stamp(now)
+        try:
+            snapshot = tuple(candidates) if candidates is not None else ()
+        except TypeError:
+            snapshot = ()
+        stamp = time.monotonic() if now is None else now
+        try:
+            stamp = float(stamp)
+        except (TypeError, ValueError):
+            stamp = None
         with self._sdk_lock:
             self._sdk_rows = snapshot
             self._sdk_pushed_at = stamp
-
-    def update_robot_observations(
-        self, rows: Iterable, observed_at: Optional[float] = None
-    ) -> None:
-        """主循环推来的**官方"机器人识别"快照**（集成层 `robot_source.py` 那条通路）。
-
-        这就是用户要求的"**用大疆 SDK 直接认同款小车**"那条路：集成层订阅
-        `vision.sub_detect_info(name="robot")` 之后，`main.py` 的
-        `feed_robot_observations()` 每帧对**任何**实现了本方法的名字调一次
-        （``push(rows, observed_at)``，和 6 号 `number_marker` 的
-        `update_candidates()` 是同一套"鸭子类型"约定，所以**不用改集成层**）。
-
-        :param rows: 可迭代，元素是 ``(x, y, w, h)``（**中心点 + 宽高**，整帧像素
-            或归一化都认）。空元组表示"这一帧没有识别到机器人"。
-        :param observed_at: **回调接收时刻**（不能刷成当前帧时间 —— 否则一辆早就
-            开走的车会被当成新鲜观测；本模块用它做过期判断）。
-        """
-        snapshot = self._as_row_tuple(rows)
-        stamp = self._as_stamp(observed_at)
-        with self._sdk_lock:
-            # 两个官方通道（robot 识别 / marker 视觉标签）**各自存一份**，
-            # 免得后推的那个把先推的冲掉（`main.py` 每帧会先后推两次）。
-            self._robot_rows = snapshot
-            self._robot_pushed_at = stamp
-
-    @staticmethod
-    def _as_row_tuple(rows: Iterable) -> Tuple:
-        try:
-            return tuple(rows) if rows is not None else ()
-        except TypeError:
-            return ()
-
-    @staticmethod
-    def _as_stamp(value: Optional[float]) -> Optional[float]:
-        if value is None:
-            return time.monotonic()
-        try:
-            stamp = float(value)
-        except (TypeError, ValueError):
-            return None
-        return stamp if math.isfinite(stamp) else None
 
     def _sdk_sightings(
         self, frame_width: int, frame_height: int, now: float
@@ -1554,34 +1514,28 @@ class FreeJunctionTask:
 
         过期这一条很关键：官方识别是"有就推"的回调，车拐过去之后旧读数可能还挂在
         快照里；拿一条过期读数去选路，比"没有判据"危险得多。
-
-        两个官方通道（`update_robot_observations` 的机器人识别、
-        `update_candidates` 的视觉标签）都会看，各自用各自的接收时刻判过期。
         """
         with self._sdk_lock:
-            batches = (
-                (self._robot_rows, self._robot_pushed_at),
-                (self._sdk_rows, self._sdk_pushed_at),
-            )
+            rows = self._sdk_rows
+            pushed_at = self._sdk_pushed_at
         hold = max(0.0, float(self.settings.sdk_observation_hold_seconds))
         sightings: List[SdkSighting] = []
         mode = ""
-        for rows, pushed_at in batches:
-            for row in rows:
-                sighting = sighting_from_observation(row, frame_width, frame_height)
-                if sighting is None:
-                    continue
-                stamp = sighting.observed_at if sighting.observed_at is not None else pushed_at
-                if stamp is None:
-                    continue            # 没时间戳 = 不知道新不新鲜 → 不敢用
-                age = float(now) - float(stamp)
-                if not math.isfinite(age) or age < 0.0 or age > hold:
-                    continue
-                if observation_is_normalized(row):
-                    mode = mode or "normalized"
-                else:
-                    mode = "pixels"
-                sightings.append(sighting)
+        for row in rows:
+            sighting = sighting_from_observation(row, frame_width, frame_height)
+            if sighting is None:
+                continue
+            stamp = sighting.observed_at if sighting.observed_at is not None else pushed_at
+            if stamp is None:
+                continue            # 没时间戳 = 不知道新不新鲜 → 不敢用
+            age = float(now) - float(stamp)
+            if not math.isfinite(age) or age < 0.0 or age > hold:
+                continue
+            if observation_is_normalized(row):
+                mode = mode or "normalized"
+            else:
+                mode = "pixels"
+            sightings.append(sighting)
         self.last_sdk_mode = mode
         return sightings
 
