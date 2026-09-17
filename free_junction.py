@@ -528,7 +528,13 @@ class FreeJunctionConfig:
     #: （2026-09-17 19:48 那次 1.4 s 就"完成"、车几乎没转）。
     center_tolerance_degrees: float = 8.0
     center_confirm_frames: int = 2
-    exit_forward: float = 0.10        # 交回前也走得很慢
+    #: 交回前的前进速度。0.10 → **0.14**（2026-09-17 20:55~21:03 八次实车实测）：
+    #: 那八次全部成功，但有 **6 次是靠 `exit_seconds` 的 1 s 上限交回的**（不是
+    #: "岔路离开视野 + 视野里有单根清晰的线"这个条件）—— 也就是"没确认就交回"。
+    #: 岔路在 EXIT 开始时还在脚下（分叉行落在 ROI 最底部），再走几厘米才会离开视野；
+    #: 同样 1 s 里从 10 cm 提到 14 cm，条件就更容易真正成立（交回更有把握），
+    #: 而且总用时不变。仍然是慢速（骨架限幅 0.30）。
+    exit_forward: float = 0.14
     exit_seconds: float = 1.0
     exit_timeout: float = 2.5
     #: EXIT 阶段顺线修正的增益（每 1° 偏差给多少 deg/s，比转向更温柔）。
