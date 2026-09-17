@@ -851,6 +851,36 @@ class CoordinatorIntegrationTests(unittest.TestCase):
         self.assertEqual(released.state, "RELEASING")
         self.assertTrue(released.force_stop)
 
+        # The old check stopped here: it did not prove that the line owner
+        # would actually send another moving command after the photograph.
+        harness.feed_line(1.20)
+        before = len(harness.chassis.motion_calls)
+        harness.feed_line(1.25)
+        self.assertGreater(len(harness.chassis.motion_calls), before)
+        self.assertEqual(harness.coordinator.active_task, None)
+
+    def test_marker_aiming_turn_is_undone_before_release(self):
+        task = NumberMarkerTask(replace(BASE_CONFIG, aim_stable_frames=1))
+        advance_to_evidence(task)
+        task._aimed_yaw_degrees = 35.0
+        request = task.take_evidence_request()
+        self.assertTrue(task.acknowledge_evidence(request.request_id, True))
+        first = task.step(packet(3, 1.10), 1.10)
+        self.assertIs(first.status, TaskStatus.RUNNING)
+        self.assertLess(first.motion.yaw, 0.0)
+        self.assertIs(task.state, MarkerState.RETURNING)
+        terminal = first
+        for sequence in range(4, 25):
+            now = 1.10 + (sequence - 3) * 0.10
+            terminal = task.step(packet(sequence, now), now)
+            if terminal.status is TaskStatus.COMPLETED:
+                break
+        self.assertIs(terminal.status, TaskStatus.COMPLETED)
+        self.assertIn("1", task.saved_ids)
+        set_current(task, 25, 3.40, candidate("1"))
+        self.assertIs(task.step(packet(25, 3.40), 3.40).status,
+                      TaskStatus.NOT_TRIGGERED)
+
 
 if __name__ == "__main__":
     unittest.main()
