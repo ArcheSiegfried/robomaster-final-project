@@ -39,15 +39,15 @@ AIM_MAX_DEG = 100.0
 AIM_ABSOLUTE_LIMIT_DEG = 100.0
 AIM_SETTLE_MARGIN_SECONDS = 0.30
 STOP_BEFORE_AIM_SECONDS = 0.22
-SIDE_LINE_MAX_ANGLE_DEG = 28.0
-SIDE_ENDPOINT_MIN_ROW = 0.45
-SIDE_ENDPOINT_MAX_ROW = 0.94
+SIDE_LINE_MAX_ANGLE_DEG = 80.0
+SIDE_VISIBLE_MIN_ROW = 0.40
 SIDE_CENTER_ERROR = 0.08
 SIDE_CONFIRM_FRAMES = 3
 SIDE_LOSS_SECONDS = 0.55
+SIDE_INITIAL_FIND_SECONDS = 2.4
 SIDE_ADVANCE_MAX_SECONDS = 3.8
-SIDE_ADVANCE_SPEED = 0.15
-SIDE_MAX_ENDPOINT_JUMP = 0.20
+SIDE_ADVANCE_SPEED = 0.12
+SIDE_MAX_AXIS_JUMP = 0.35
 SIDE_AIM_ENDPOINT_MIN_ROW = 0.77
 BODY_TURN_SPEED = 24.0
 BODY_TURN_TOLERANCE_DEG = 3.0
@@ -68,7 +68,7 @@ class GimbalAlignedRouteTask(RouteTask):
         self._aim_error: Optional[str] = None
         self._aim_requested_at: Optional[float] = None
         self._side_last_seen_at: Optional[float] = None
-        self._side_last_endpoint: Optional[Tuple[int, int]] = None
+        self._side_last_error: Optional[float] = None
         self._side_last_sequence: Optional[int] = None
         self._side_confirm_frames = 0
 
@@ -155,26 +155,36 @@ class GimbalAlignedRouteTask(RouteTask):
         )
 
     def _side_candidate(self, frame: FramePacket) -> Optional[RouteCandidate]:
-        height, width = frame.image.shape[:2]
+        height = frame.image.shape[0]
         candidates = []
         for candidate in self._route_vision.candidates(frame.image):
-            endpoint = candidate.entry_endpoint
-            if endpoint is None or not endpoint.internal:
+            if candidate.line_point is None or candidate.detection.box is None:
                 continue
-            if endpoint.branch_length < MIN_LOCK_BRANCH_PIXELS:
+            if not candidate.endpoints or max(
+                endpoint.branch_length for endpoint in candidate.endpoints
+            ) < MIN_LOCK_BRANCH_PIXELS:
                 continue
-            if abs(endpoint.tangent_deg) > SIDE_LINE_MAX_ANGLE_DEG:
+            # Looking along the new line from the side can produce a strongly
+            # diagonal image segment. Its physical end may be outside the
+            # image, so the old endpoint-only/near-vertical gate is invalid.
+            axis_angle = abs(candidate.angle_deg) % 180.0
+            axis_angle = min(axis_angle, 180.0 - axis_angle)
+            if axis_angle > SIDE_LINE_MAX_ANGLE_DEG:
                 continue
-            row = endpoint.point[1] / max(height, 1)
-            if not SIDE_ENDPOINT_MIN_ROW <= row <= SIDE_ENDPOINT_MAX_ROW:
+            if candidate.detection.box[3] / max(height, 1) < SIDE_VISIBLE_MIN_ROW:
                 continue
-            if self._side_last_endpoint is not None:
-                dx = endpoint.point[0] - self._side_last_endpoint[0]
-                dy = endpoint.point[1] - self._side_last_endpoint[1]
-                if (dx * dx + dy * dy) ** 0.5 > SIDE_MAX_ENDPOINT_JUMP * width:
-                    continue
-            candidates.append(candidate)
-        return max(candidates, key=lambda item: item.score) if candidates else None
+            error = self._candidate_axis_error(candidate, frame)
+            if (
+                self._side_last_error is not None
+                and abs(error - self._side_last_error) > SIDE_MAX_AXIS_JUMP
+            ):
+                continue
+            continuity = (
+                0.0 if self._side_last_error is None
+                else 0.2 * (1.0 - abs(error - self._side_last_error))
+            )
+            candidates.append((candidate.score + continuity, candidate))
+        return max(candidates, key=lambda item: item[0])[1] if candidates else None
 
     def _side_update(
         self, now: float, motion: MotionCommand, message: str,
@@ -219,7 +229,6 @@ class GimbalAlignedRouteTask(RouteTask):
                 )
             self.state = SIDE_ADVANCE
             self._phase_started_at = now
-            self._side_last_seen_at = now
             elapsed = 0.0
 
         if self.state == SIDE_ADVANCE:
@@ -232,17 +241,27 @@ class GimbalAlignedRouteTask(RouteTask):
             if candidate is None:
                 self.last_detection = VisualDetection.no_result(KIND)
                 self._side_confirm_frames = 0
+                if self._side_last_seen_at is None:
+                    if elapsed >= SIDE_INITIAL_FIND_SECONDS:
+                        return self._finish(
+                            TaskStatus.FAILED,
+                            "new line never entered side view; stopped",
+                        )
+                    return self._side_update(
+                        now, MotionCommand(forward=SIDE_ADVANCE_SPEED),
+                        "bounded slow advance while new line enters side view",
+                    )
                 if now - float(self._side_last_seen_at) >= SIDE_LOSS_SECONDS:
                     return self._finish(
-                        TaskStatus.FAILED, "physical new-line endpoint lost in side view"
+                        TaskStatus.FAILED, "new line lost after side-view acquisition"
                     )
                 return self._side_update(
-                    now, STOP_COMMAND, "waiting for side-view new-line endpoint"
+                    now, STOP_COMMAND, "side-view line temporarily lost; stopped"
                 )
             self._side_last_seen_at = now
-            self._side_last_endpoint = candidate.entry_endpoint.point
             self.last_detection = candidate.detection
             error = self._candidate_axis_error(candidate, frame)
+            self._side_last_error = error
             if abs(error) > SIDE_CENTER_ERROR and error * self._aim_yaw > 0.0:
                 return self._finish(
                     TaskStatus.FAILED,
