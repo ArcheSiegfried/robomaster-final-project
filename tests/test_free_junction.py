@@ -1023,58 +1023,67 @@ class AimDirectionTests(unittest.TestCase):
         self.assertIn("junction cleared", split.last_message,
                       "两段胶带时不该按'线回来了'交回：%s" % split.last_message)
 
-    def test_the_aim_follows_the_offset_proportionally(self):
-        """瞄准是**比例控制**：偏角翻倍 yaw 翻倍，偏得太多才封顶。
+    def test_the_aim_is_an_angle_not_a_pixel_ratio(self):
+        """瞄准量的是**角度**：偏 51 px ≈ 15°，车就该转 15 deg/s（再限幅到 12）。
 
-        满舵（一路顶在限幅上）正是"转过头再拉回"的成因 ——
-        2026-09-17 12:13~12:18 四次实车都是这个形状，所以增益 45→22、限幅 18→12。
-
-        这里直接喂几何给 `_approach_yaw()`（不依赖合成画面的像素），
-        参考点取"分叉点"（脚下看不到线时的回退），所以下面是精确可算的。
+        这是 2026-09-17 19:48 / 19:49 两次实车的回归用例：那条岔路很"浅"，
+        右支只比画面中心偏 ~51 px。旧的"像素/半宽"口径算出 0.16 →
+        yaw 只有 3.5（再乘远处折扣只剩 ~1），车几乎直着开进了左边拥堵支。
         """
-        settings = FreeJunctionConfig()
+        settings = FreeJunctionConfig()          # hfov 120° → 焦距 185 px
+        task = FreeJunctionTask(settings)
+        task.chosen_branch = Branch.RIGHT
 
         def aim(right_x):
-            task = FreeJunctionTask(settings)
             task.last_detection = ForkDetection(
-                valid=True, split_x=280, left_x=200, right_x=right_x, frame_width=640
+                valid=True, split_x=300, left_x=200, right_x=right_x, frame_width=640
             )
-            task.chosen_branch = Branch.RIGHT
             return task._approach_yaw()
 
-        near = aim(300)          # 偏角 (300-280)/320 = 0.0625
-        far = aim(360)           # 偏角 0.25 —— 正好 4 倍
-        self.assertGreater(near, 0.0)
-        self.assertGreater(far, near)
-        self.assertAlmostEqual(far / near, 4.0, delta=0.1, msg="不是比例控制")
-        self.assertLess(far, settings.max_approach_yaw, "中等偏角就被限幅顶住了")
-        self.assertGreater(
-            aim(520), settings.max_approach_yaw,
-            "偏角很大时比例输出应该超过限幅（限幅在 _motion 里裁）",
+        offset_px = 51
+        degrees = task._pixels_to_degrees(offset_px, 640)
+        self.assertAlmostEqual(degrees, 15.4, delta=1.0, msg="角度换算不对")
+        yaw = aim(320 + offset_px)
+        self.assertAlmostEqual(yaw, degrees, delta=0.1, msg="增益 1.0 时应等于偏角")
+        self.assertGreater(yaw, 8.0, "偏 15° 只给出 %+.1f deg/s —— 车根本转不过来" % yaw)
+
+        # 偏角越大 yaw 越大（单调），很大时超过限幅（由 _motion 裁到 12）
+        self.assertGreater(aim(320 + 100), yaw)
+        self.assertGreater(aim(320 + 300), settings.max_approach_yaw)
+
+        # 左支：同样的几何下必须往反方向（负）
+        task.chosen_branch = Branch.LEFT
+        task.last_detection = ForkDetection(
+            valid=True, split_x=300, left_x=200, right_x=371, frame_width=640
         )
+        self.assertLess(task._approach_yaw(), 0.0)
 
         # 真正发出去的命令必须被裁到限幅内
-        task = FreeJunctionTask(settings)
+        task.chosen_branch = Branch.RIGHT
         task.state = JunctionState.APPROACH
         task.last_detection = ForkDetection(
-            valid=True, split_x=280, left_x=200, right_x=520, frame_width=640
+            valid=True, split_x=300, left_x=200, right_x=600, frame_width=640
         )
-        task.chosen_branch = Branch.RIGHT
         self.assertAlmostEqual(
             task._motion(1.0).yaw, settings.max_approach_yaw, delta=1e-6
         )
 
-    def test_an_off_center_fork_still_aims_at_the_chosen_branch(self):
-        """整条岔路偏在画面左边时，选右支仍然要**往右**打。
+    def test_choosing_right_always_aims_further_right_than_choosing_left(self):
+        """不管岔路偏在哪，选右支瞄得一定比选左支更靠右（这才是"选对边"的含义）。
 
-        参考点是"脚下那根线"，不是画面中心 —— 这一条正是实车翻车的情形。
+        整条岔路偏在画面左侧时，"右支"也可能仍在车头方向左边 —— 那时**应该**
+        往左打（车得先开到岔路口），但**永远比选左支时更靠右**；
+        进入分支这件事由每帧重新瞄准的闭环完成。
+        （2026-09-17 曾经把"脚下那根线"当参考点，结果浅岔路下 yaw 只有 ±1、车不转。）
         """
-        image = fork_frame(x=180, tips=(60, 300))
-        _task, fork, yaw = self._aim(image, "right")
-        self.assertLess(fork.split_x, 320, "这一帧的岔路应该整体偏在画面左侧")
-        self.assertGreater(yaw, 0.0, "岔路偏左时不能反过来往左打：%+.1f" % yaw)
-        _task, _fork, left_yaw = self._aim(image, "left")
-        self.assertLess(left_yaw, 0.0, "选左支应该往左打：%+.1f" % left_yaw)
+        for image in (fork_frame(car_left=True), fork_frame(x=180, tips=(60, 300))):
+            _task, _fork, right_yaw = self._aim(image, "right")
+            _task2, _fork2, left_yaw = self._aim(image, "left")
+            self.assertGreater(
+                right_yaw, left_yaw,
+                "选右支必须瞄得更靠右：右 %+.1f vs 左 %+.1f" % (right_yaw, left_yaw),
+            )
+            self.assertGreater(right_yaw - left_yaw, 5.0, "两者的差太小，等于没区分")
 
     def test_the_turn_offset_uses_the_same_reference(self):
         """转弯阶段和瞄准阶段必须用同一个参考点，否则两段会互相打架。"""
@@ -1108,10 +1117,19 @@ class AimDirectionTests(unittest.TestCase):
         self.assertGreater(near, 0.0)
         self.assertGreater(far, 0.0, "远处也要转一点，不能完全不转")
         self.assertLess(far, near, "远处应该转得更轻")
-        self.assertAlmostEqual(
-            far / near, settings.turn_far_yaw_scale, delta=0.05,
-            msg="远处的转向比例应该正好是 turn_far_yaw_scale",
+        # 折扣本身：远处不小于 turn_far_yaw_scale，到跟前基本不折扣
+        forked = lambda row: ForkDetection(  # noqa: E731
+            valid=True, split_row=row, split_x=300, left_x=200, right_x=420,
+            frame_width=640, frame_height=360,
         )
+        self.assertGreaterEqual(
+            task._turn_rate_scale(forked(200)), settings.turn_far_yaw_scale - 1e-6,
+            "远处最多只能打到 turn_far_yaw_scale 这个折扣",
+        )
+        self.assertAlmostEqual(task._turn_rate_scale(forked(345)), 1.0, delta=1e-6)
+        # 折扣随"岔路越来越近"单调上升（不是一刀切）
+        self.assertLess(turn_yaw(220), turn_yaw(260))
+        self.assertLess(turn_yaw(260), turn_yaw(300))
 
     def test_the_turn_keeps_moving_forward(self):
         """转弯时要真的往前挪：0.04 太小，车几乎原地转身（实车就是这么拐早的）。"""

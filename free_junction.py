@@ -488,7 +488,14 @@ class FreeJunctionConfig:
     #: （对准 2 s 一直被 18 deg/s 打满 → 转过头 → 后面靠脚下那条线拉回来，
     #: 用掉 3.2~3.7 s）。所以增益 45→28、限幅 18→12：让它是"比例控制"、
     #: 快对准时自动慢下来，而不是一路满舵。
-    approach_yaw_gain: float = 22.0
+    #: **摄像头水平视场角（度）**：把"分支偏了多少像素"换算成**角度**用。
+    #: 判据必须是角度，才不随场地/远近走样 —— 2026-09-17 19:48/19:49 两次实车：
+    #: 那条岔路很"浅"，右支只比画面中心偏 51 px，旧的"像素/半宽"口径只有 0.16，
+    #: 换算成 yaw 才 3.5 deg/s（再乘"岔路还远"的折扣只剩 ~1），车几乎直着开进
+    #: 左边那条"有车"的分支；换成角度就是 **15°**，看得见的偏差就该转得动。
+    camera_hfov_degrees: float = 120.0
+    #: 瞄准增益：**每 1° 偏差给多少 deg/s**（1.0 = 偏多少度就转多少度/秒）。
+    approach_yaw_gain: float = 1.0
     max_approach_yaw: float = 12.0
     approach_seconds_max: float = 2.0
     #: 转弯时的前进速度。**2026-09-17 17:24 / 17:26 / 17:27 三次实车的共同问题**：
@@ -503,28 +510,29 @@ class FreeJunctionConfig:
     #: 岔路还"远"时的转向打折比例与"算近"的门槛（见 `_turn_rate_scale`）。
     #: 17:24 那次的画面量出来：接管那一刻岔路的路口还在画面 y≈250/360（画面中央偏下），
     #: 车头离路口还有 0.5~0.8 m —— 一看到就满舵转，自然会拐早。
-    #: 所以岔路还在 ROI 上部（`fork_close_ratio` 以上）时只按 `turn_far_yaw_scale` 转，
-    #: 等它进到 ROI 下部（车真的到了）再给足。
-    #: 0.6 是"压掉过早满舵"又不至于转不够的折中：实车若还是拐早 → 往 0.45 调；
-    #: 若变成转不够（退出时岔路还在视野里）→ 往 0.75 调。一次只改一个。
+    #: 所以岔路还在 ROI 上部时按 `turn_far_yaw_scale` 打折，越靠近越给足：
+    #: 折扣按"岔路在 ROI 里落到多低"线性插值（0.6 → 1.0），不是一刀切 ——
+    #: 一刀切会把"浅岔路本来就不大的偏角"再削一半，车就几乎不转了
+    #: （2026-09-17 19:48/19:49 两次实车：yaw 只有 ±1）。
     turn_far_yaw_scale: float = 0.6
     fork_close_ratio: float = 0.72
     #: 转向至少要转这么久，才允许"看到线回到中央就收工"。
     turn_min_seconds: float = 0.3
-    #: 闭环转向的增益：yaw = 增益 × 偏角（-1..1），再限幅到 `turn_yaw`。
+    #: 闭环转向的增益：yaw = 增益 × **偏角（度）**，再限幅到 `turn_yaw`。
     #: 看得到岔路就朝"选中那条分支"转；岔路没了就朝车头前那条胶带转。
     #: 越接近正前方转得越慢 —— 这样不会转过头（真车 2026-09-16 17:26 的教训）。
-    turn_steer_gain: float = 20.0
-    #: "线回到画面中央"的容差（相对画面宽度）与需要的连续帧数。
-    #: 0.18 → 0.22：**宁可早一点收工**，剩下的对准交给 EXIT 段顺线完成 ——
-    #: 转过头再拉回比"稍微欠一点再补"更难看不安全。
-    center_tolerance_ratio: float = 0.22
+    turn_steer_gain: float = 1.0
+    #: **"已经对准"的角度容差（度）**：选中分支在车头正前方这么多度以内算对准。
+    #: 旧的写法是"相对画面宽度的 0.22"，换算过来约等于 **21°** —— 太松了：
+    #: 实测那条浅岔路的右支偏 15°，却被判成"已经对准"，TURN 只跑了 0.3 s 就收工
+    #: （2026-09-17 19:48 那次 1.4 s 就"完成"、车几乎没转）。
+    center_tolerance_degrees: float = 8.0
     center_confirm_frames: int = 2
     exit_forward: float = 0.10        # 交回前也走得很慢
     exit_seconds: float = 1.0
     exit_timeout: float = 2.5
-    #: EXIT 阶段顺线修正的增益（比转向更温柔）：交回巡线时车头尽量正对着线。
-    exit_steer_gain: float = 25.0
+    #: EXIT 阶段顺线修正的增益（每 1° 偏差给多少 deg/s，比转向更温柔）。
+    exit_steer_gain: float = 1.0
     #: 交回条件：岔路标志已经离开视野、视野里重新有**一条清晰的单根蓝线**，
     #: 连续这么多帧 → COMPLETED（"只有蓝线像素"不够，见 `_finish_exit`）。
     handback_confirm_frames: int = 3
@@ -1892,7 +1900,7 @@ class FreeJunctionTask:
             # 结果带着满舵转过头，还得靠后面一段把车身拉回来
             # （2026-09-17 12:13~12:18 四次实车都是这个形状）。
             offset = self._turn_offset(fork)
-            if offset is not None and abs(offset) <= float(settings.center_tolerance_ratio):
+            if offset is not None and abs(offset) <= float(settings.center_tolerance_degrees):
                 self._center_count += 1
             else:
                 self._center_count = 0
@@ -1909,9 +1917,15 @@ class FreeJunctionTask:
                 return self._fail(now, "turn timed out")
             # **闭环微转**：盯住"选中那条分支"，朝它转；偏得越多转得越快（限幅很小）。
             offset = self._turn_offset(fork)
-            if offset is None:
+            # 收工条件：**岔路已经到跟前**、而且选中分支在正前方容差内。
+            # 岔路还在远处时不许收工 —— 那时车头还没到路口，收工就等于"没拐"
+            # （2026-09-17 19:48 那次 TURN 只跑了 0.3 s，车几乎直行开进左支）。
+            # 岔路已经从画面里消失（车进了分支）→ 这时看脚下胶带就够了。
+            fork_visible = fork is not None and fork.valid
+            ready = (not fork_visible) or self._fork_is_close(fork)
+            if offset is None or not ready:
                 self._center_count = 0
-            elif abs(offset) <= float(settings.center_tolerance_ratio):
+            elif abs(offset) <= float(settings.center_tolerance_degrees):
                 self._center_count += 1
             else:
                 self._center_count = 0
@@ -2021,14 +2035,17 @@ class FreeJunctionTask:
         )
 
     def _turn_rate_scale(self, fork: Optional[ForkDetection]) -> float:
-        """岔路还"远"的时候把转向速率打折（1.0 = 不打折）。
+        """岔路还"远"的时候把转向速率**按距离线性打折**（远处 `turn_far_yaw_scale`，
+        到脚下 1.0）。
 
-        摄像头装在车头前上方，比车头早 0.5~0.8 m 看到岔路（2026-09-17 17:24 的画面
-        量出来：接管那一刻岔路的路口还在画面 y≈250/360，车头离路口还有半米多）。
-        一看到就按满舵转，等车头到岔路口时方向早就转过去了 —— 车会"拐早"、
-        切进分支内侧，交回巡线后直接 `LINE_LOST`。
-        所以：岔路还在 ROI 上部（`fork_close_ratio` 以上）时只按 `turn_far_yaw_scale`
-        的比例转，等它进到 ROI 下部（车真的到了）再给足。
+        为什么要打折：摄像头装在车头前上方，比车头早 0.5~0.8 m 看到岔路
+        （2026-09-17 17:24 的画面量出来：接管那一刻岔路的路口还在画面 y≈250/360，
+        车头离路口还有半米多）。一看到就满舵转，等车头到岔路口时方向早就转过去了
+        —— 车会"拐早"、切进分支内侧，交回巡线后直接 `LINE_LOST`。
+
+        为什么是**线性**而不是一刀切：一刀切会把"本来就不大的偏角"再削一半，
+        浅岔路下 yaw 只剩 ±1、车几乎不转（2026-09-17 19:48/19:49 两次实车）。
+        所以按"岔路在 ROI 里落到多低"从 `turn_far_yaw_scale` 线性升到 1.0。
 
         岔路看不见了（已经开进分支）→ 不打折，交给"顺脚下那条线"的闭环去修。
         """
@@ -2036,54 +2053,114 @@ class FreeJunctionTask:
         if fork is None or not fork.valid or fork.frame_height <= 0:
             return 1.0
         try:
-            ratio = float(settings.fork_close_ratio)
             scale = float(settings.turn_far_yaw_scale)
         except (TypeError, ValueError):
             return 1.0
-        if not 0.0 <= ratio <= 1.0 or not math.isfinite(scale):
+        if not math.isfinite(scale):
             return 1.0
+        cheap = _clamp(scale, 0.0, 1.0)
+        near = self._fork_proximity(fork)
+        return cheap + (1.0 - cheap) * near
+
+    def _split_offset_degrees(self, fork: ForkDetection) -> float:
+        """**分叉点（主干方向）**相对车头偏了多少度（右为正）—— "车对着岔路口吗"。"""
+        if fork.frame_width <= 0:
+            return 0.0
+        return self._pixels_to_degrees(
+            float(fork.split_x) - float(fork.frame_width) / 2.0, fork.frame_width
+        )
+
+    def _fork_proximity(self, fork: Optional[ForkDetection]) -> float:
+        """岔路口离车头多近了：0 = 刚在画面里出现（远），1 = 已经在车头跟前。"""
+        if fork is None or not fork.valid or fork.frame_height <= 0:
+            return 0.0
         height = int(fork.frame_height)
-        top = int(_clamp(settings.roi_top, 0.0, 1.0) * height)
-        bottom = int(_clamp(settings.roi_bottom, 0.0, 1.0) * height)
+        top = int(_clamp(self.settings.roi_top, 0.0, 1.0) * height)
+        bottom = int(_clamp(self.settings.roi_bottom, 0.0, 1.0) * height)
         if bottom - top <= 0:
-            return 1.0
-        close_row = top + ratio * (bottom - top)
-        if fork.split_row >= close_row:
-            return 1.0
-        return max(0.0, min(1.0, scale))
+            return 0.0
+        close_row = top + _clamp(self.settings.fork_close_ratio, 0.0, 1.0) * (bottom - top)
+        span = max(1.0, float(close_row - top))
+        return _clamp((float(fork.split_row) - top) / span, 0.0, 1.0)
+
+    def _fork_is_close(self, fork: Optional[ForkDetection]) -> bool:
+        """岔路口是不是已经到车头跟前了（分叉行落进 ROI 下部 `fork_close_ratio`）。"""
+        return self._fork_proximity(fork) >= 1.0
+
+    def _steer_offset_degrees(self, fork: Optional[ForkDetection]) -> Optional[float]:
+        """转向/瞄准的目标偏角（度，右为正）—— **按远近把两个目标混起来**：
+
+        * 岔路还远 → 主要瞄**分叉点**（= 主干方向）：先把车顺着主干开到岔路口；
+        * 岔路到跟前 → 主要瞄**选中那条分支**：这一步才是"拐进去"。
+
+        为什么要有这个过渡（两个实车教训，方向刚好相反）：
+        * 一看到岔路就朝分支打 —— 摄像头比车头早半米看到它，车头还没到路口方向就转过去了，
+          于是"拐早"、切进分支内侧（2026-09-17 17:24）；
+        * 反过来只瞄"脚下那根线"，或者"没到跟前就完全不瞄分支" —— 浅岔路下 yaw 只剩
+          ±1 甚至 0，车几乎直行，直接开进左边那条有车的分支
+          （2026-09-17 19:48 / 19:49）。
+        所以用**线性混合**而不是硬切换：远的时候主干占多数（不会拐早），
+        越近分支分量越大（到跟前就是纯分支方向），中间任何时刻都有一点分支分量。
+        """
+        if fork is None or not fork.valid or fork.frame_width <= 0:
+            return None
+        split = self._split_offset_degrees(fork)
+        branch = self._aim_offset_degrees(fork)
+        near = self._fork_proximity(fork)
+        return split + (branch - split) * near
+
+    def _focal_px(self, frame_width: int) -> float:
+        """水平焦距（像素）：由水平视场角推出来，用来把像素偏差换算成角度。"""
+        hfov = float(getattr(self.settings, "camera_hfov_degrees", 120.0))
+        if not math.isfinite(hfov) or not 1.0 < hfov < 179.0:
+            hfov = 120.0
+        return max(1.0, (max(1, int(frame_width)) / 2.0) / math.tan(math.radians(hfov / 2.0)))
+
+    def _pixels_to_degrees(self, offset_px: float, frame_width: int) -> float:
+        """横向偏了多少像素 → 偏了多少度（右为正）。"""
+        if not math.isfinite(float(offset_px)):
+            return 0.0
+        return math.degrees(math.atan2(float(offset_px), self._focal_px(frame_width)))
+
+    def _aim_offset_degrees(self, fork: ForkDetection) -> float:
+        """**选中那条分支**相对车头方向偏了多少度（右为正）。
+
+        目标取"分支张开后的方向"（`left_x` / `right_x`，mask 里张开最大的那几行）；
+        参考点是**画面中心 = 车头方向**（相机就装在车头上）。
+
+        为什么参考点不能用"脚下那根线"：那是**横向位置**，不是**朝向**。
+        车贴着线的一侧走时，"脚下这根线"会把右支的偏角算没 ——
+        2026-09-17 19:48/19:49 两次实车就是这么直着开进左边拥堵支的
+        （算出来 yaw 只有 ±1，车几乎没转）。
+        """
+        if self.chosen_branch is None or fork.frame_width <= 0:
+            return 0.0
+        target = fork.left_x if self.chosen_branch is Branch.LEFT else fork.right_x
+        return self._pixels_to_degrees(
+            float(target) - float(fork.frame_width) / 2.0, fork.frame_width
+        )
 
     def _approach_yaw(self) -> float:
         """对准阶段：往选中分支偏一点点，每帧只修一点（A8）。
 
-        误差以**整幅图像宽度**归一化（和 `LineDetection.error` 同口径）：
-        目标在参考点右边 → 误差为正 → yaw 为正（正值右转，与巡线控制器一致：
-        `LineController.track` 里 `target_yaw = kp * error`，而 `error` 是"线偏右为正"）。
+        单位：`approach_yaw_gain` 是"每 1° 偏差给多少 deg/s"，默认 1.0
+        （偏 15° 就给 15 deg/s，再由 `max_approach_yaw` 裁到 12）。
+        符号沿用项目约定：偏差在右边为正 → yaw 为正（正值右转），
+        与巡线控制器一致（`LineController.track` 里 `target_yaw = kp * error`，
+        而 `error` 是"线偏右为正"）。
         """
-        settings = self.settings
         fork = self.last_detection
-        if fork is None or self.chosen_branch is None or fork.frame_width <= 0:
+        if fork is None:
             return 0.0
-        target = fork.left_x if self.chosen_branch is Branch.LEFT else fork.right_x
-        half_width = max(1.0, fork.frame_width / 2.0)
-        error = (target - self._aim_reference_x(fork)) / half_width
-        return settings.approach_yaw_gain * error
+        return self.settings.approach_yaw_gain * self._aim_offset_degrees(fork)
 
     def _aim_reference_x(self, fork: ForkDetection) -> float:
-        """瞄准时的参考点：**车头正下方那条胶带**（车实际压在哪根线上）。
+        """保留给测试/排查用的"参考点"：车头正前方（画面中心）。
 
-        为什么不用画面中心：车是沿着主干胶带往前走的，主干在画面里偏左/偏右都很正常。
-        用画面中心当参考，就会出现"选了右支、却因为整条岔路偏在画面左边而往左打方向"
-        —— 2026-09-17 实车正是这么开进了左边那条有车的分支。
-        换成"脚下这根线"之后，**右支永远在参考点右边**（选左支同理），符号不再是运气。
-
-        脚下看不到线（或压着两段线、正好在岔路口上）时，退到**分叉点**：
-        分叉点本身就在主干上，而"选中的那条分支一定在分叉点的某一侧"，
-        所以符号照样成立（退到画面中心就不行了，那一帧就会反过来打方向）。
+        （2026-09-17 曾经把它改成"脚下那根线"，结果是**朝向目标被当成了位置目标**，
+        浅岔路下 yaw 只有 ±1 —— 已改回画面中心，见 `_aim_offset_degrees`。）
         """
-        offset = self._tape_offset()
-        if offset is None:
-            return float(fork.split_x)
-        return float(fork.frame_width) / 2.0 + offset * (float(fork.frame_width) / 2.0)
+        return float(fork.frame_width) / 2.0
 
     def _branch_sign(self) -> float:
         if self.chosen_branch is None:
@@ -2127,20 +2204,28 @@ class FreeJunctionTask:
         return (center - width / 2.0) / half
 
     def _turn_offset(self, fork: Optional[ForkDetection]) -> Optional[float]:
-        """转弯阶段"还要往哪边转多少"（-1..1）。
+        """转弯/退出阶段"还要往哪边转多少" —— 单位是**度**（右为正）。
 
-        * 还看得见岔路 → 用**选中那条分支**相对"脚下那根线"的偏角
-          （和 `_approach_yaw` 同一个参考点，符号才靠得住）；
-        * 岔路已经从画面里消失 → 用**车头前方那条胶带**的偏移（这时它就是分支的胶带）。
+        * 还看得见岔路 → `_steer_offset_degrees`（远瞄主干、近瞄选中分支）；
+        * 岔路已经从画面里消失 → 车头前方那条胶带的偏角（这时它就是分支的胶带）。
 
         为什么不能只看胶带：刚进转弯时车头前面那条是**主干**，正的、就在中央，
         只按它判会得出"已经对齐"→ 根本不转（2026-09-16 本地测试踩出来过）。
         """
-        if fork is not None and fork.valid and fork.frame_width > 0:
-            target = fork.left_x if self.chosen_branch is Branch.LEFT else fork.right_x
-            half = max(1.0, fork.frame_width / 2.0)
-            return (float(target) - self._aim_reference_x(fork)) / half
-        return self._tape_offset()
+        offset = self._steer_offset_degrees(fork)
+        if offset is not None:
+            return offset
+        tape = self._tape_offset()
+        if tape is None:
+            return None
+        line = self._last_line_mask
+        roi_width = 0 if line is None else int(line.shape[1])
+        if roi_width <= 0:
+            return None
+        frame_width = int(fork.frame_width) if fork is not None else 0
+        if frame_width <= 0:
+            return None
+        return self._pixels_to_degrees(tape * (roi_width / 2.0), frame_width)
 
     def _fork_gone(self, fork: ForkDetection) -> bool:
         """分叉是否已经消失（说明车已经开进分支里了）。"""
