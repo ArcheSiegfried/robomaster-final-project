@@ -964,6 +964,33 @@ class StateMachineTests(unittest.TestCase):
             abs(task._turn_rotated_deg), abs(task._chosen_bearing) + 20.0
         )
 
+    def test_servo_is_bounded_by_the_locked_target(self):
+        """A22c：伺服信号一直很大时，转过"锁死目标角度"就必须收手。
+
+        2026-09-17 22:47 两次实测：yaw 被钉在 -75°/s 转了 1.0~1.3 秒（约 80~100°），
+        线被转出画面（蓝=0/0）→ `line did not return after the turn`。
+        这里用静态画面模拟"tilt 永远不收敛"，验证仍有上限。
+        """
+        settings = JunctionConfig(turn_min_duration=0.0)
+        task = GreenJunctionTask(settings=settings)
+        detection = JunctionDetector(settings).detect(approach_frame(reach=300))
+        left = detection.branch(Branch.LEFT)
+        task.last_detection = detection
+        task.chosen_branch = Branch.LEFT
+        task._chosen_bearing = float(left.bearing_deg)
+        task._chosen_tilt = float(left.tilt_deg)
+        task._enter(JunctionState.TURN, 3000.0)
+        now = 3000.0
+        command = None
+        for _ in range(200):
+            now += FRAME_DT
+            command = task._turn_command(now)
+            if command.yaw == 0.0:
+                break
+        self.assertIsNotNone(command)
+        self.assertEqual(command.yaw, 0.0, "到达锁死目标角度后必须停")
+        self.assertLessEqual(abs(task._turn_rotated_deg), abs(task._chosen_tilt) + 1e-6)
+
     def test_fallback_rotation_target_is_used_when_there_is_no_tilt(self):
         """A21 兜底：算不出带子方向时，仍然按"转过锁死偏角"收手并缓出。
 

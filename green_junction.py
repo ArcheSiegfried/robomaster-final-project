@@ -1597,6 +1597,8 @@ class GreenJunctionTask:
         #: 常量要么一开始就小于阈值（碰巧成功），要么永远不成立（转到线飞出画面）。
         self._turn_rotated_deg = 0.0
         self._turn_last_at: Optional[float] = None
+        #: 最近一帧近处带子是否已经居中（=车真的压在线上）。转向的上限之一（A22c）。
+        self._line_is_centered = False
         self._rearm_ready_at: Optional[float] = None
 
     # -- 对外状态 ---------------------------------------------------------
@@ -1671,6 +1673,7 @@ class GreenJunctionTask:
         self._turn_started_at = None
         self._turn_rotated_deg = 0.0
         self._turn_last_at = None
+        self._line_is_centered = False
         self._rearm_ready_at = None
 
     # -- 内部工具 ---------------------------------------------------------
@@ -1780,6 +1783,21 @@ class GreenJunctionTask:
         if self._chosen_tilt is not None:
             bearing = math.copysign(abs(float(self._chosen_tilt)), float(bearing))
         target = float(bearing)
+        # A22c：**先**判上限，再谈伺服。伺服信号（当前帧的 tilt）可能在车转过去之后
+        # 一直很大 —— 画面里留下的横段、别的带子都会被当成"这条分支还没竖直"，
+        # 没有上限就会转过头：2026-09-17 22:47 两次实测 yaw 被钉在 -75°/s 转了
+        # 1.0~1.3 秒（约 80~100°），最后 `巡线=无 蓝=0/0`（画面里一条蓝带都没有）
+        # → `line did not return after the turn`。
+        # 上限有两层：转过"决策时锁下的目标角度"就不再加转；近处带子已经居中
+        # （车真的压在线上）也不再加转。
+        if not self._turn_still_needed() or self._line_is_centered:
+            creep = (
+                settings.forward_speed * _SETTLE_CREEP
+                if self.state is JunctionState.SETTLE
+                else 0.0
+            )
+            self._turn_last_at = now
+            return MotionCommand(forward=creep, lateral=0.0, yaw=0.0)
         # A22：有"带子方向"就用它做**伺服** —— 一直转到这条分支的带子在画面里
         # 接近竖直（车头与带子平行）为止。tilt 是当前帧算出来的，所以车转过去的
         # 过程中它会自己收敛到 0，转多少度由几何自己决定，不需要估。
@@ -2167,6 +2185,7 @@ class GreenJunctionTask:
         #  而那时车其实已经对准左边的分支了。）
 
         centered, line_source = self._line_centered(frame, now)
+        self._line_is_centered = bool(centered)
         # 三种"转到位"都算（A21/A22）：
         #   1) 线回到画面中央（最可靠，能看见就直接用）；
         #   2) 选中分支的**带子方向**已经在画面里竖直（车头与它平行）；
@@ -2204,6 +2223,7 @@ class GreenJunctionTask:
             return self._failed("task total timeout while settling")
 
         centered, line_source = self._line_centered(frame, now)
+        self._line_is_centered = bool(centered)
         # A21b：岔路口上"线回中央"这个判据**根本不可能成立** —— 路口处整条 Y 形
         # 是**一个**连通块（离线对照：`junction_frame` 的 conf=1.00 就是整块 Y），
         # 近处窄带里也常是劈开的两条，所以 2026-09-17 22:20 那次 settle 整整
