@@ -75,7 +75,7 @@ main.py
 未来任务：共享 FramePacket -> VisualDetection / TaskUpdate / MotionCommand
 ```
 
-`models.py`、`camera_source.py`、`runtime.py`、`motion_output.py`、`gimbal_output.py`、`main.py` 是高冲突公共文件，普通模块不得自行修改。接口详情以 `MODULE_GUIDE.md` 的 v0.2 为准。
+`models.py`、`camera_source.py`、`runtime.py`、`motion_output.py`、`gimbal_output.py`、`main.py` 是高冲突公共文件，普通模块不得自行修改。接口详情以 `MODULE_GUIDE.md` 的 v0.3 为准（v0.3 只扩展 `GimbalOutput` 的行为：动作串行化、最新目标队列、可重试的巡线视角恢复；数据结构与调用顺序不变）。
 
 短时漏检属于底座：`COASTING` 仅处理反光和少数帧漏检，0.28 秒后锁停。长断线属于独立 `RouteTask`：接管前暂停巡线，底盘和云台请求分别经唯一出口，步骤非阻塞且有 19 秒模块总预算、20 秒协调器硬上限；结束后停车、恢复巡线视角、归还 owner、清历史、处理新帧并显式恢复。不得延长短时预算代替长断线。
 
