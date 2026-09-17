@@ -106,7 +106,12 @@ KIND = "obstacle"
 # =====================================================================
 
 # --- 绕行方向 ---
-DODGE_SIDE = "left"          # "left" 往左绕；"right" 往右绕
+DODGE_SIDE = "left"          # 默认往左绕（障碍基本在正中间时用这个）
+# 【v8】PDF item 3 要求 "observe carefully to choose go around it from left or right"，
+# 快照里还要写清是从哪边绕的 —— 所以不能永远往左。
+# 规则：障碍明显偏左就从右边绕、明显偏右就从左边绕（离它远一点更安全）；
+# 偏离不到 SIDE_DEADBAND 就按 DODGE_SIDE 的默认值。
+SIDE_DEADBAND = 0.25         # 障碍横向偏移小于这个比例就算"在正中间"
 
 # --- 速度（m/s）。骨架还会再裁一次（横移<=0.25、前进<=0.30），这里留一点余量 ---
 SIDE_SPEED = 0.24            # 横移让开的速度（0.24 × 1.70s ≈ 41 cm）
@@ -121,7 +126,10 @@ HOLD_BEFORE_GO = 0.00
 T_OUT_TIME = 1.70            # 第 1 段：往侧面让开（0.24 × 1.70 ≈ 41 cm）
 T_PASS_TIME = 2.20           # 第 2 段：往前越过（0.20 × 2.20 ≈ 44 cm，见下面的换算）
 T_BACK_TIME = 1.20           # 第 3 段：往回收（0.20 × 1.20 ≈ 24 cm）
-SEEK_TIME = 1.50             # 第 4 段：主动找线，最多找这么久
+SEEK_TIME = 2.50             # 第 4 段：主动找线，最多找这么久
+# 【v8】原来 1.5s —— 实车记录里"绕完 1.5s 内没找回线"是现在最贵的失败模式
+# （2026-09-16 16:59 那次 5 次绕行里有 1 次要人按 SPACE 救）。
+# 放宽到 2.5s：0.16 m/s × 2.5s ≈ 40 cm 的搜索范围，四段合计 7.6s 仍在 9s 总上限内。
 
 # 【官方信息】障碍是**一辆静止的小车**（另一台 RoboMaster 同型车）。
 # 下面三个距离都是照这个尺寸算出来的，不是拍脑袋：
@@ -163,6 +171,11 @@ CLEAR_SECONDS = 3.00         # 画面里连续这么久没有障碍，就认为�
 # 1.0 秒的依据：被踢掉之后巡线是 STOPPED，需要人工按 SPACE 才恢复，
 # 实测那一次断档是 2.6 秒；而正常绕行时每帧都会调用一次 step()（约 0.03 秒一次）。
 STALE_STEP_GAP = 1.00
+
+# 断档之后"先停一脚"的时长：这段时间内保持控制权、原地不动，然后再重新判断。
+# 为什么不一帧就接着绕：被从外面拿走控制权的瞬间，车可能已经不在原来的位置/姿态，
+# 先停稳、看清画面再动更安全（审阅人 2026-09-16 的建议）。
+RECONFIRM_HOLD = 0.10
 
 # --- 检测 ROI（画面比例 x1, y1, x2, y2）---
 # 【P0-1 / P1-3 的核心修改】原来是 (0.20, 0.45, 0.80, 0.95)：
@@ -265,13 +278,29 @@ SCORE_TOTAL_W = SCORE_AREA_W + SCORE_LOWER_W + SCORE_CENTER_W + SCORE_WIDTH_W
 #       而影子、反光是渐变的，边缘很"软"。所以找硬边缘 -> 连成块 -> 套形状判据。
 #       什么颜色都能抓，不依赖"猜道具颜色"。
 #
-# 两个踩过的坑（都会让另一台车漏检，别再改回去）：
+# 三个踩过的坑（都会让另一台车漏检或让地板误触发，别再改回去）：
 #   * Canny 出来是 1 像素宽的曲线，闭运算不会把它变粗，必须先 dilate 加粗；
 #   * 蓝线是竖着穿过障碍的，如果把蓝线像素从边缘图里"挖掉"，会把障碍的轮廓
-#     切成两半、连不成块。正确做法是**先把蓝线在灰度图上抹平成地面色再找边缘**。
+#     切成两半、连不成块。正确做法是**先把蓝线在灰度图上抹平成地面色再找边缘**；
+#   * 【v8】这个场地的地面是**带斑点的地胶**，斑纹在 blur=5/low=40 下 ROI 里
+#     边缘密度有 4.94%/3.38%/4.28%/4.49%（四处取样），而真车才 14.28%
+#     —— **只差 1.8 倍，分不开**，于是"没障碍的时候车会莫名开始避障"。
+#
+# 【v8】参数是扫出来的（真实画面 + 合成道具一起端到端测）：
+#     blur=5 /40/110  -> 真实地板两处都**误判**，合成道具都能认
+#     blur=9 /60/160  -> 真实地板两处**都干净**，车形障碍仍能认（conf 0.84）★选它
+#     blur=11/80/200  -> 地板干净，但合成车形障碍被滤掉（太狠）
+# 依据：审阅人留的两张真实框图 + `tests/samples/` 里那两个真实裁片
+# （`real_floor_roi.png` 负样本、`real_obstacle_car.png` 正样本）。
+#
+# ⚠️ 代价（必须知道）：模糊变大之后，**对比度不足的扁平浅色道具抓不到**
+# （纯色亮橙块 vs 浅色地面只差 37 灰阶，模糊后边缘消失）。
+# 官方信息说障碍是"一辆静止的小车"（深色、有轮子/云台，结构丰富），所以没问题；
+# 万一真道具是浅色纯色块，把 `USE_COLOR_RANGES` 打开走颜色判据。
 USE_STRUCTURE = True
-EDGE_LOW = 40                # Canny 低阈值：越低越敏感，噪声也越多
-EDGE_HIGH = 110              # Canny 高阈值
+EDGE_BLUR = 9                # Canny 之前的模糊核（奇数）
+EDGE_LOW = 60                # Canny 低阈值（原来 40）
+EDGE_HIGH = 160              # Canny 高阈值（原来 110）
 EDGE_DILATE = 3              # 把 1 像素宽的边缘加粗，后面才连得成块
 STRUCTURE_CLOSE = 17         # 把边缘连成整块的核大小
 
@@ -369,6 +398,7 @@ class ObstacleDetector:
         self.last_position_rejected = 0
         self.last_flat_rejected = 0
         self.last_mask = None
+        self.last_roi = None      # 最近一次用的 ROI 像素框，选边时要用
 
     # ---------------- 两条证据 ----------------
 
@@ -396,7 +426,7 @@ class ObstacleDetector:
                 gray = gray.copy()
                 gray[line > 0] = int(np.median(outside))
 
-        gray = cv2.GaussianBlur(gray, (5, 5), 0)
+        gray = cv2.GaussianBlur(gray, (EDGE_BLUR, EDGE_BLUR), 0)
         edges = cv2.Canny(gray, EDGE_LOW, EDGE_HIGH)
         edges = cv2.dilate(edges, _odd_kernel(EDGE_DILATE))
         blobs = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, _odd_kernel(STRUCTURE_CLOSE))
@@ -494,6 +524,7 @@ class ObstacleDetector:
             return VisualDetection.no_result(KIND)
 
         left, top, right, bottom = _pixel_box(image.shape, OBSTACLE_ROI)
+        self.last_roi = (left, top, right, bottom)
         roi = image[top:bottom, left:right]
         roi_height, roi_width = roi.shape[:2]
         roi_area = float(roi_height * roi_width)
@@ -655,6 +686,9 @@ class ObstacleTask:
         self.last_seen_at = None
         # 到达连绕上限后置位：不再接管，免得变成"每几秒停一下"的走走停停。
         self.locked = False
+        # 这一轮往哪边绕（v8：不再固定往左，触发时按障碍偏哪边决定）
+        self._active_side = 1.0 if DODGE_SIDE == "right" else -1.0
+        self.last_side = None     # "left" / "right"，给运行记录和得分快照用
         # 上一次 step() 的时刻：用来发现"我们被从外面踢掉了"（见 STALE_STEP_GAP）
         self._last_step_at = None
         # 第一次被调用的时刻：启动预热用（STARTUP_GRACE_SECONDS，默认 0 即关闭）
@@ -671,16 +705,23 @@ class ObstacleTask:
         if self._first_step_at is None:
             self._first_step_at = now
         if self.stage != "IDLE" and self._was_cut_short(now):
-            # 协调器在外面把控制权拿走了（视频中断 / 人工按键 / 硬超时），
-            # 而且不会通知模块。发现断档就作废重来，绝不从半路接着走。
-            self._abandon()
+            # 【v8】断档：协调器在外面把控制权拿走又还回来，但**不会通知模块**。
+            #
+            # 这里**绝不能**清成 IDLE 就直接走 _step_idle —— 实车记录里一共 12 次
+            # `obstacle returned NOT_TRIGGERED while owning motion` 就是这么来的：
+            # 协调器认为我们还拿着控制权，我们却说不想要了，于是判违约、强制收回。
+            #
+            # 正确做法：保留控制权、先停一脚（RUNNING + 零速度），下一帧再重新判断。
+            # 见 _step_active 里的 RECONFIRM 分支。
+            self._enter("RECONFIRM", now)
+            self.started_at = now
         self._last_step_at = now
 
         if self.stage == "IDLE":
             detection = self.detect(frame.image)
             self.last_detection = detection
             return self._step_idle(detection, now)
-        # 绕行途中不再重复检测（结果只用于上报）；只有 SEEK 段还要看画面找线。
+        # 绕行途中不再重复检测（结果只用于上报）；只有 SEEK / RECONFIRM 要看画面。
         return self._step_active(frame.image, now)
 
     def _was_cut_short(self, now: float) -> bool:
@@ -689,18 +730,6 @@ class ObstacleTask:
             self._last_step_at is not None
             and (now - self._last_step_at) > STALE_STEP_GAP
         )
-
-    def _abandon(self) -> None:
-        """作废当前这一轮绕行：回到 IDLE，重新判断。
-
-        注意**不设冷却**（`finished_at` 不动）：这一轮本来就没绕成，
-        障碍多半还在，应该马上重新确认、重新绕，而不是干等 5 秒。
-        """
-        self.stage = "IDLE"
-        self.hit_frames = 0
-        self.line_frames = 0
-        self.started_at = None
-        self.segment_started_at = None
 
     # ---------------- 还没接管：判断要不要管 ----------------
 
@@ -771,6 +800,9 @@ class ObstacleTask:
 
         self.started_at = now
         self.segment_started_at = now
+        # 选边：障碍偏哪边就往另一边绕（PDF 要求"看清后自己选左或右"）
+        self._active_side = self._choose_side(detection)
+        self.last_side = self._side_name()
         if HOLD_BEFORE_GO > 0.0:
             self.stage = "HOLD"
             return TaskUpdate(
@@ -798,6 +830,30 @@ class ObstacleTask:
                 "obstacle still there after %d dodges; stopped for a human check"
                 % self.dodge_count,
                 now,
+            )
+
+        if self.stage == "RECONFIRM":
+            # 断档之后：**保留控制权**（返回 RUNNING），先停一脚，下一帧重新判断。
+            # 关键：这条路径**永远不能返回 NOT_TRIGGERED**（那是违约，见 step()）。
+            if now - self.segment_started_at < RECONFIRM_HOLD:
+                return self._running(
+                    MotionCommand(), "control was cut short; stopping to re-check"
+                )
+            detection = self.detect(image)
+            self.last_detection = detection
+            if detection.valid:
+                # 障碍还在：重新开始一轮完整的绕行（重新选边）
+                self._enter("OUT", now)
+                self.started_at = now
+                self._active_side = self._choose_side(detection)
+                self.last_side = self._side_name()
+                return self._running(
+                    MotionCommand(lateral=self._side() * SIDE_SPEED),
+                    "re-confirmed after a gap; stepping aside",
+                )
+            # 障碍没了：正常交回（COMPLETED 会走协调器的归还流程，不算违约）
+            return self._finish(
+                TaskStatus.COMPLETED, "takeover was cut short; handing back", now
             )
 
         if now - self.started_at > MAX_TOTAL_TIME:
@@ -905,7 +961,33 @@ class ObstacleTask:
         )
 
     def _side(self) -> float:
-        return 1.0 if DODGE_SIDE == "right" else -1.0
+        """这一轮往哪边绕（+1 右 / -1 左）。触发时由 _choose_side 定好。"""
+        return self._active_side
+
+    def _choose_side(self, detection) -> float:
+        """决定从左边还是右边绕。
+
+        PDF item 3 要求"看清后自己选左或右"，所以不能永远往左：
+        障碍明显**偏左**就从右边过、明显**偏右**就从左边过（远离它）；
+        基本在正中间（偏移不到 SIDE_DEADBAND）就按 DODGE_SIDE 的默认值。
+        """
+        default = 1.0 if DODGE_SIDE == "right" else -1.0
+        if not detection.valid or detection.center is None:
+            return default
+        roi = self.detector.last_roi
+        if roi is None:
+            return default
+        roi_left, _roi_top, roi_right, _roi_bottom = roi
+        half = max((roi_right - roi_left) / 2.0, 1.0)
+        offset = (detection.center[0] - (roi_left + roi_right) / 2.0) / half
+        if offset > SIDE_DEADBAND:
+            return -1.0        # 障碍偏右 -> 往左绕
+        if offset < -SIDE_DEADBAND:
+            return 1.0         # 障碍偏左 -> 往右绕
+        return default
+
+    def _side_name(self) -> str:
+        return "right" if self._active_side > 0 else "left"
 
 
 # =====================================================================
