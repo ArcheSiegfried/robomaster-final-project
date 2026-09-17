@@ -255,7 +255,10 @@ def _reading_from(
             if width > 0.0:
                 # 注意：``str`` 也有个 ``.center`` 方法，所以上面要先把字符串排掉。
                 branch = Branch.LEFT if float(candidate[0]) < width / 2.0 else Branch.RIGHT
-    return LightReading(color=color, branch=branch, confidence=confidence)
+    return LightReading(
+        color=color, branch=branch, confidence=confidence,
+        box=getattr(value, "box", None),
+    )
 
 
 def _iter_probe_values(value):

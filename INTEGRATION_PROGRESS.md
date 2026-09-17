@@ -4,7 +4,7 @@
 - 起点：个人仓库 `chore/integration-snapshot-20260918`，`a38293b76a69475f558a06e97636f27d5d4264f1`（团队 `integration` 同一提交）。
 - 工作分支：`fix/integrated-evidence-and-resume`。
 - 工作树起始状态：干净。个人仓库 `main` 和团队仓库均不作为本轮推送目标。
-- 规则依据：`C:\Users\sigso\Downloads\RoboMaster_期末项目规则书.md`；已阅读并区分硬规则与工程建议。
+- 规则依据：项目根目录 `RoboMaster_期末项目规则书.md`（与下载目录原件 SHA256 一致）；已阅读并区分硬规则与工程建议。
 
 ## 已知问题
 
@@ -21,7 +21,7 @@
 | 2 全任务证据 | 已完成代码检查，待实车 | 核对现场照片内容、触发时刻与写盘失败路径 |
 | 3 一种红绿灯岔路模式 | 已完成代码检查，待实车 | 现场核对单侧绿灯的识别、选边、进入和照片 |
 | 4 拼合状态交接审查 | 已完成代码检查，待实车 | 验证完整入口下的接管顺序和照片失败停车 |
-| 5 有限检查与交付 | 未开始 | 语法、安全导入、目标用例、静态检查和实车清单 |
+| 5 有限检查与交付 | 已完成代码与文档检查，待实车 | 提交、推送并提出 PR；小组按联调清单逐级验证 |
 
 ## 当前记录
 
@@ -39,5 +39,8 @@
 - 阶段 4 审查：六项任务都在 `task_registry.MOTION_TASK_CLASSES`；协调器每帧只将一个 `RUNNING` 任务设为 `active_task`，完成/失败均硬停、归还 `line` owner、清巡线故障并经 `RELEASING` 等待云台归位和新鲜有效线路。人工停止与视频失效仍在原安全路径；SDK 底盘调用仍只在 `motion_output.py`，生产相机入口只在 `main.py`。长断线仅在基础底座允许的丢线状态后接管。
 - 阶段 4 确认并修复的接线错误：完整 `main.py` 原来注册旧 `RouteTask` 且使用普通 `GimbalOutput`，云台侧视实车专项版只在 `route_only_main.py`；现注册 `GimbalAlignedRouteTask`，完整入口使用它需要的 `RouteGimbalOutput`，保留 route-only 入口。普通绿灯在其他任务持有控制权时只作为红灯否决解除条件，原计分 tracker 看不到该任务完成；现绿灯与红灯一样由 `TrafficLightTask` 自己提出一次性证据请求，主循环每帧服务，避免漏图。红/绿灯最终写盘失败会明确暂停。
 - 阶段 4 最小检查：相关 53 项定向用例通过；安全导入输出六个注册任务，第 4 个为 `GimbalAlignedRouteTask`；静态检查仅发现 `main.py` 建视频源、`motion_output.py` 下发底盘命令。没有运行完整合成赛道或实车。
-- 尚未完成：阶段 5、完整实车联调和 PR。`RoboMaster_期末项目规则书.md` 是用户放在项目根目录的未跟踪文件，当前保留原样。
-- 下一步准确操作：做有限语法/导入/状态检查，核对文档和规则，写实车分阶段清单；检查 diff 和凭据，再提交推送、提出 PR。
+- 阶段 4 提交：`4c9e54c`，已推送个人仓库工作分支。
+- 阶段 5 检查：`python -m unittest tests.test_route_gimbal tests.test_gimbal_release_closure tests.test_single_green_fork tests.test_integrated_score_evidence -q`，26 项通过；项目生产 Python 文件 `py_compile` 通过；安全导入 `main` 不加载 `robomaster`；静态检索显示正常底盘调用仅在 `motion_output.py`、唯一生产视频入口在 `main.py`，逐帧任务代码没有新增 `sleep` 或无界循环；`git diff --check` 通过。没有运行完整离线套件、虚拟赛道或实车。
+- 本轮已阅读的规则书原件由用户放在项目根目录；第五阶段将其作为项目依据原样纳入分支。额外创建 `INTEGRATION_TEST_CHECKLIST.md` 作为逐级实车待验证项，不宣称任何实车结果。
+- 尚未完成：完整实车联调和团队仓库 PR 审核/合并。单任务历史实车成功不等于本分支整场验证通过。
+- 下一步准确操作：核对最终 diff/敏感信息，提交阶段 5 并推送；在团队仓库创建以 `integration` 为 base 的 PR，等待负责人审批。现场按清单逐级测试，并反馈精确 SHA 与失败日志。
