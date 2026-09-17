@@ -677,9 +677,13 @@ class _FakeCandidate(object):
 class OfficialSdkCriterionTests(unittest.TestCase):
     """**官方 SDK 识别结果当判据**（`blockage_source="sdk"`）。
 
-    官方读数走的是 `main.py` 的 `feed_marker_observations()` → 任务上的
-    `update_candidates()`（和 6 号 `number_marker` 同一条通路），
+    官方读数走的是 `main.py` 的 `feed_robot_observations()`（`robot_source.py` 订阅
+    SDK 的**机器人识别**）→ 任务上的 `update_robot_observations()`
+    （和 5 号 `obstacle.py` 同一条通路），
     本模块只消费纯数据、不碰 SDK。所以这里全部用假读数离线验证。
+
+    ⚠️ 别把这条通路接回 `update_robot_observations()`：那是 `number_marker` 的**视觉标签**
+    通道，标签不是车（接线回归在 `tests/test_free_junction_observation_wiring.py`）。
 
     重点证明一件事：**这条路上判据只有官方读数** ——
     画面里没有车（`fork_frame()`）也能判对，画面里画了车也不作数。
@@ -694,7 +698,7 @@ class OfficialSdkCriterionTests(unittest.TestCase):
         records = []
         now = start
         for index in range(frames):
-            task.update_candidates(sightings, now=now)
+            task.update_robot_observations(sightings, now=now)
             update = task.step(FramePacket(image, index + 1, now), now)
             records.append((task.state, update, now))
             now += dt
@@ -736,7 +740,7 @@ class OfficialSdkCriterionTests(unittest.TestCase):
         now = 1.0
         stale = [(0.20, 0.40, 0.18, 0.26)]
         for index in range(40):
-            task.update_candidates(stale, now=now - 1.0)      # 时间戳整整旧了 1 秒
+            task.update_robot_observations(stale, now=now - 1.0)      # 时间戳整整旧了 1 秒
             update = task.step(FramePacket(fork_frame(), index + 1, now), now)
             self.assertIs(update.status, TaskStatus.NOT_TRIGGERED)
             now += 0.05
@@ -861,15 +865,15 @@ class OfficialSdkCriterionTests(unittest.TestCase):
         """快照是"整体替换"：官方改口说"什么也没看到"，读数就得跟着变。"""
         task = self._task()
         image = fork_frame()
-        task.update_candidates([(0.20, 0.40, 0.18, 0.26)], now=1.0)
+        task.update_robot_observations([(0.20, 0.40, 0.18, 0.26)], now=1.0)
         task.step(FramePacket(image, 1, 1.0), 1.0)
         self.assertEqual(task.last_blockage.reading, BLOCKAGE_LEFT)
 
-        task.update_candidates([], now=1.05)          # 官方这一帧什么也没看到
+        task.update_robot_observations([], now=1.05)          # 官方这一帧什么也没看到
         task.step(FramePacket(image, 2, 1.05), 1.05)
         self.assertEqual(task.last_blockage.reading, BLOCKAGE_NONE)
 
-        task.update_candidates([(0.80, 0.40, 0.18, 0.26)], now=1.10)   # 换成右边
+        task.update_robot_observations([(0.80, 0.40, 0.18, 0.26)], now=1.10)   # 换成右边
         task.step(FramePacket(image, 3, 1.10), 1.10)
         self.assertEqual(task.last_blockage.reading, BLOCKAGE_RIGHT)
 
