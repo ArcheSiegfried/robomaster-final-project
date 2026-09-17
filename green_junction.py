@@ -118,6 +118,16 @@ A21           锁死的分支偏角是**转动目标**，不是"对齐了没有"
               1.8 秒转过约 80° 把巡线带转出画面，最后以
               ``line did not return after the turn`` 失败；而偏角恰好 ≤6° 的那次
               却能成功 —— 成功与否取决于岔路几何的巧合。
+A23           转向的**收尾判据与场地无关**：不认"转了多少度"，只认"选中的那条带子
+              是不是已经在车正前方"——(1) 岔路还看得见时，看那条分支的**带子方向**
+              是否已在画面里竖直（``tilt``，与相机光轴平行的地面直线，消失点在画面
+              中线、成像是竖直的，不需要标定俯仰）；(2) 岔路形态已经散掉、而近处那条
+              带子居中时，说明口子已在车后、车压上了新带子（这时检测散掉是预期的）。
+              两者都不成立就继续转，只有 ``turn_max_deg``（默认 90°，很宽的安全上限）
+              兜底 —— **正常场地永远碰不到，所以现场不需要试任何角度**。
+              单独"近处带子居中"不算数：还没转的时候那条居中带子就是车自己上来的主带
+              （2026-09-17 22:28 就是这么误判成"进了分支"、结果拐上另一条路）。
+              到上限还没对准 → 明确失败停车，绝不交回巡线去猜一条边。
 A21b          转到位之后**不许再加转**，而且岔路口的“进了分支”要用分支几何来判：
               (1) ``_turn_command`` 在 ``_turn_still_needed()`` 为假时 yaw 直接给 0
               （SETTLE 只保留 ``_SETTLE_CREEP`` 那一档爬行，不带角速度）——
@@ -678,7 +688,7 @@ class JunctionConfig:
     #: 单次转向的**转角封顶**（度，0 = 不封顶）。带子接近水平时 tilt 会量到
     #: 80°+，实测直接照它转会转过头（2026-09-17 22:47/22:52：转过 60~100°、
     #: 带子被转出画面 → line did not return）。现场用 --turn-max-deg 调。
-    turn_max_deg: float = 0.0
+    turn_max_deg: float = 90.0
     horizontal_fov_deg: float = 70.0 # 相机水平视野，用于像素→角度
 
     # --- 判据（见 A6、A7） ---
@@ -1601,8 +1611,10 @@ class GreenJunctionTask:
         #: 常量要么一开始就小于阈值（碰巧成功），要么永远不成立（转到线飞出画面）。
         self._turn_rotated_deg = 0.0
         self._turn_last_at: Optional[float] = None
-        #: 最近一帧近处带子是否已经居中（=车真的压在线上）。转向的上限之一（A22c）。
+        #: 最近一帧近处带子是否已经居中（=车真的压在线上）。A23 的判据之一。
         self._line_is_centered = False
+        #: 最近一帧岔路形态是否还看得见（A23：看不见了 + 近处居中 = 口子已在车后）。
+        self._fork_visible = True
         self._rearm_ready_at: Optional[float] = None
 
     # -- 对外状态 ---------------------------------------------------------
@@ -1678,6 +1690,7 @@ class GreenJunctionTask:
         self._turn_rotated_deg = 0.0
         self._turn_last_at = None
         self._line_is_centered = False
+        self._fork_visible = True
         self._rearm_ready_at = None
 
     # -- 内部工具 ---------------------------------------------------------
@@ -1794,7 +1807,16 @@ class GreenJunctionTask:
         # → `line did not return after the turn`。
         # 上限有两层：转过"决策时锁下的目标角度"就不再加转；近处带子已经居中
         # （车真的压在线上）也不再加转。
-        if not self._turn_still_needed() or self._line_is_centered:
+        # A23：什么时候"不用再转"——
+        #   1) 转向量已到上限（turn_max_deg / 锁死目标角度）；
+        #   2) 选中的那条带子已经在画面里竖直（=车头与它平行，真正的"对准了"）；
+        #   3) 岔路形态已经消失、而近处那条带子居中（口子已在车后，车压上新带子）。
+        # **不能**拿"近处带子居中"单独当条件：还没转的时候，那条居中的带子就是车
+        # 自己上来的主带 —— A22c 就是这么把转向一帧掐死的（离线复现：tilt 一直卡在
+        # 39.1°，车再也不转，最后卡到 turn_timeout）。
+        aligned_now, _ = self._aligned_now()
+        past_fork = self._line_is_centered and not self._fork_visible
+        if not self._turn_still_needed() or aligned_now or past_fork:
             creep = (
                 settings.forward_speed * _SETTLE_CREEP
                 if self.state is JunctionState.SETTLE
@@ -2193,28 +2215,34 @@ class GreenJunctionTask:
 
         centered, line_source = self._line_centered(frame, now)
         self._line_is_centered = bool(centered)
-        # 三种"转到位"都算（A21/A22）：
-        #   1) 线回到画面中央（最可靠，能看见就直接用）；
-        #   2) 选中分支的**带子方向**已经在画面里竖直（车头与它平行）；
-        #   3) 只有算不出带子方向时，才允许"已转过锁死的偏角"当兜底 ——
-        #      算得出方向时它不能当退出条件，否则又会出现"A22 那次转了 20° 就
-        #      宣布已在正前方、其实还横着"的错。
+        self._fork_visible = bool(detection.valid)
+        # A23 自标定收尾（场地无关）：不认"转了多少度"，只认"选中的那条带子
+        # 是不是已经在车正前方"：
+        #   1) aligned  —— 岔路形态还看得见：那条分支的带子已经在画面里竖直
+        #      （与相机光轴平行的地面直线，其消失点在画面中线、成像是竖直的 ——
+        #        不需要知道相机俯仰，也不需要任何手调的角度）；
+        #   2) past_fork —— 岔路形态已经看不见了，而近处那条带子居中：口子已在车后，
+        #      车压上了新的带子（这时岔路检测散掉是**预期**的，不算失败）；
+        #   3) rotated  —— 转向量已经到达安全上限（默认 90°，正常场地碰不到）：
+        #      进 SETTLE 去判，绝不在 TURN 里干等（2026-09-17 23:17 实车就是在这里
+        #      卡住的：yaw 早被上限按成 0，状态机却还在等"带子竖直"）。
+        # 单独"近处带子居中"**不算数** —— 还没转的时候，那条居中带子就是车自己上来的
+        # 主带（22:28 那次就是这么误判成"进了分支"、结果拐上另一条路的）。
         aligned, aligned_why = self._aligned_now()
-        # 只有当**当前帧再也算不出带子方向**（检测丢了）时，才允许"转过目标角度"
-        # 当退出条件；方向还看得见时，唯一标准就是那条带子竖直了。
-        # A22e 死角修复（2026-09-17 23:17 实车）：yaw 被上限/target 停住之后，
-        # 状态机不能还留在 TURN 里等「带子竖直」——那会既不转也不走，
-        # 干等到 turn_timeout 判失败，车就卡在岔路口（日志：failed turn did not
-        # finish inside turn_timeout，而 yaw 早已是 0）。停住就进 SETTLE 去判。
+        past_fork = bool(centered) and not detection.valid
         rotated = not self._turn_still_needed()
         settled = (
             self._turn_elapsed(now) >= settings.turn_min_duration
-            and (centered or aligned or rotated)
+            and (aligned or past_fork or rotated)
         )
         if settled:
             self._enter(JunctionState.SETTLE, now)
-            whose = "line" if centered else (aligned_why if aligned
-                                             else "rotated %.1f deg" % self._turn_rotated_deg)
+            if aligned:
+                whose = aligned_why
+            elif past_fork:
+                whose = "fork passed, line centred (%s)" % line_source
+            else:
+                whose = "rotation ceiling %.1f deg" % self._turn_rotated_deg
             return self._running(
                 now,
                 "branch entered, checking line stability (%s)" % whose,
@@ -2235,28 +2263,37 @@ class GreenJunctionTask:
 
         centered, line_source = self._line_centered(frame, now)
         self._line_is_centered = bool(centered)
+        self._fork_visible = bool(detection.valid)
         # A21b：岔路口上"线回中央"这个判据**根本不可能成立** —— 路口处整条 Y 形
         # 是**一个**连通块（离线对照：`junction_frame` 的 conf=1.00 就是整块 Y），
         # 近处窄带里也常是劈开的两条，所以 2026-09-17 22:20 那次 settle 整整
         # 1.5 秒都等不到、最后 `line did not return after the turn` 失败。
         # 因此这里补一条等价判据：**选中分支已经在车头正前方**（当前帧算出来的
         # 偏角收敛到 branch_align_deg 以内）就算进了分支，交回巡线去跟。
-        live = self.chosen_bearing_deg
+        # A23：完成判据与 TURN 同一套 —— "选中的带子已经在车正前方"：
+        #   aligned（岔路还看得见、带子已竖直）或 past_fork（岔路散了、近处带子居中）。
         aligned, aligned_why = self._aligned_now()
+        past_fork = bool(centered) and not detection.valid
         stable = (
-            (centered or aligned)
+            (aligned or past_fork)
             and self._turn_elapsed(now) >= settings.turn_min_duration
         )
         if stable:
             self._rearm_ready_at = now + settings.rearm_cooldown
             return self._completed(
                 "junction passed; %s"
-                % ("line reacquired (%s)" % line_source
-                   if centered else "branch aligned (%s)" % aligned_why)
+                % (aligned_why if aligned
+                   else "fork passed, line centred (%s)" % line_source)
             )
 
         if self._elapsed(now) > settings.settle_timeout:
-            return self._failed("line did not return after the turn (%s)" % line_source)
+            # 转到上限还没对准：**宁可失败停车，也不交回巡线去"猜"一条边** ——
+            # 猜错就是走上非绿灯的那条路（22:28 的教训）。
+            return self._failed(
+                "could not align with the %s branch (rotated %.1f deg, %s)"
+                % ("?" if self.chosen_branch is None else self.chosen_branch.value,
+                   self._turn_rotated_deg, line_source)
+            )
 
         return self._running(now, "settling on the new branch")
 
