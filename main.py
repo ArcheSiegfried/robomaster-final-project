@@ -11,6 +11,7 @@ from evidence import DEFAULT_CAPTURE_DIRECTORY
 from gimbal_output import GimbalOutput
 from marker_source import MarkerObservationSource
 from motion_output import MotionOutput
+from robot_source import RobotObservationSource
 from runtime import LineFollower
 from task_registry import build_motion_tasks, build_observers
 
@@ -49,12 +50,15 @@ def _find_evidence_sink(coordinator):
     return None
 
 
-def record_runtime_diagnostics(coordinator, marker_source) -> None:
+def record_runtime_diagnostics(coordinator, marker_source, robot_source=None) -> None:
     """把接线层的自检结果写进本次运行记录（report.md 的独立小节）。
 
     为什么要有这一步：时间线只能告诉你"某个模块没接管"，看不出原因。数字标识
     尤其依赖 SDK 的 marker 订阅，而订阅可能**静默失败**——颜色过滤器只能设一个、
     坐标模式猜错、回调频率不够。跑一次就把这些一起写进记录，下次不用靠猜。
+
+    障碍物模块（v10 起）拿 SDK 的"机器人识别"当主路径，同理由集成层订阅后喂给它；
+    订阅失败时它会退回灰度结构判据（误触发率明显更高），所以这一小节必须记下来。
 
     **必须在 `coordinator.close()` 之前调用**（close 会写 report.md）。
     和 main 里其它辅助函数一样：绝不抛异常，绝不影响开车。
@@ -69,12 +73,26 @@ def record_runtime_diagnostics(coordinator, marker_source) -> None:
                 "数字标识观测（SDK marker 订阅）",
                 {"状态": "本次运行没有建立 marker 订阅，数字标识不会接管"},
             )
-            return
-        values = dict(marker_source.stats())
-        warning = marker_source.rate_warning()
-        if warning:
-            values["提醒"] = warning
-        record("数字标识观测（SDK marker 订阅）", values)
+        else:
+            values = dict(marker_source.stats())
+            warning = marker_source.rate_warning()
+            if warning:
+                values["提醒"] = warning
+            record("数字标识观测（SDK marker 订阅）", values)
+    except Exception:
+        pass
+    try:
+        if robot_source is None:
+            record(
+                "障碍物观测（SDK 机器人识别）",
+                {"状态": "本次运行没有建立 robot 订阅，障碍模块退回灰度结构判据"},
+            )
+        else:
+            values = dict(robot_source.stats())
+            warning = robot_source.rate_warning()
+            if warning:
+                values["提醒"] = warning
+            record("障碍物观测（SDK 机器人识别）", values)
     except Exception:
         pass
 
@@ -143,6 +161,35 @@ def feed_marker_observations(coordinator, source, frame, now) -> int:
             continue
         try:
             push(candidates)
+            fed += 1
+        except Exception:
+            pass
+    return fed
+
+
+def feed_robot_observations(coordinator, source, frame, now) -> int:
+    """把 SDK"机器人识别"的新鲜观测推给需要它的任务（障碍模块的主路径）。
+
+    **必须每帧在 coordinator.step() 之前调用**：任务自己不能碰 SDK，而且它靠
+    `observed_at` 判断观测是否过期，所以这里必须把**回调接收时刻**原样传下去，
+    不能刷新成 now —— 否则一个早就开走的车会被当成新鲜观测。
+
+    空元组表示"这一帧没有识别到机器人"，同样要推下去，任务会据此清掉旧框。
+    返回这一帧被喂到的任务数（给日志和测试用）。绝不抛异常。
+    """
+    if source is None:
+        return 0
+    try:
+        rows, observed_at = source.observations(frame)
+    except Exception:
+        rows, observed_at = (), None
+    fed = 0
+    for task in getattr(coordinator, "motion_tasks", ()):
+        push = getattr(task, "update_robot_observations", None)
+        if not callable(push):
+            continue
+        try:
+            push(rows, observed_at)
             fed += 1
         except Exception:
             pass
@@ -481,6 +528,7 @@ def _align_camera(ep_robot, output, robot_module) -> None:
 def main(
     motion_task_names=None,
     marker_subscription=True,
+    robot_subscription=True,
     run_label="FULL",
 ) -> None:
     # Keeping this import inside main makes every offline import hardware-safe.
@@ -491,6 +539,7 @@ def main(
     output = None
     gimbal_output = None
     marker_source = None
+    robot_source = None
     stream_started = False
     follower = LineFollower(CONFIG)
     coordinator = None
@@ -536,6 +585,11 @@ def main(
                 CONFIG.marker_coordinate_mode,
             )
             marker_source.start()
+        # 障碍物模块的观测来源：SDK 的"机器人识别"（v10 起是它的主路径）。
+        # 同样在视频流起来之后订阅；订阅失败它只是退回灰度结构判据，不影响巡线。
+        if robot_subscription:
+            robot_source = RobotObservationSource(ep_robot.vision)
+            robot_source.start()
         source = LatestFrameSource(
             ep_robot.camera,
             CONFIG.camera_strategy,
@@ -567,6 +621,11 @@ def main(
             % ("成功" if marker_source is not None and marker_source.enabled
                else "未订阅")
         )
+        console.note(
+            "robot 订阅（障碍模块主路径）：%s"
+            % ("成功" if robot_source is not None and robot_source.enabled
+               else "未订阅（障碍会退回灰度结构判据，误触发率更高）")
+        )
         console.note("提示：丢线/接管/异常都会打在这里，不用盯 cv2 窗口。")
 
         while True:
@@ -588,6 +647,7 @@ def main(
                 last_sequence = packet.sequence
                 # 先把新鲜观测喂给任务，再让它 step，否则它看到的是上一帧的数据。
                 feed_marker_observations(coordinator, marker_source, packet, now)
+                feed_robot_observations(coordinator, robot_source, packet, now)
                 decision = coordinator.step(packet, now)
                 # Final 的得分截图链：任务交出请求 -> 证据层画框写字存盘 ->
                 # 回传真实结果。放在 step() 之后，任务在等回执期间会保持接管。
@@ -631,7 +691,7 @@ def main(
             output.hard_stop()
         if coordinator is not None:
             # 先把自检结果写进记录，再 close（close 会生成 report.md）。
-            record_runtime_diagnostics(coordinator, marker_source)
+            record_runtime_diagnostics(coordinator, marker_source, robot_source)
             # Flush and close the evidence recorder after the chassis stop.
             coordinator.close()
         if gimbal_output is not None:
@@ -644,6 +704,9 @@ def main(
         if marker_source is not None:
             # 退订 marker 识别：不能把 SDK 的订阅留给下一次运行。
             marker_source.stop()
+        if robot_source is not None:
+            # 退订机器人识别：同样不能把 SDK 的订阅留给下一次运行。
+            robot_source.stop()
         if stream_started:
             try:
                 ep_robot.camera.stop_video_stream()
