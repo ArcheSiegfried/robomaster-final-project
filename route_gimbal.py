@@ -19,7 +19,11 @@ from models import (
 )
 from route import (
     KIND,
+    MAX_ENDPOINT_GAP_DISTANCE,
+    MIN_ENDPOINT_GAP_DISTANCE,
     MIN_LOCK_BRANCH_PIXELS,
+    RIGHT_ANGLE_MAX_DEG,
+    RIGHT_ANGLE_MIN_DEG,
     TOTAL_RECOVERY_SECONDS,
     RouteTask,
 )
@@ -44,6 +48,7 @@ SIDE_LOSS_SECONDS = 0.55
 SIDE_ADVANCE_MAX_SECONDS = 3.8
 SIDE_ADVANCE_SPEED = 0.15
 SIDE_MAX_ENDPOINT_JUMP = 0.20
+SIDE_AIM_ENDPOINT_MIN_ROW = 0.77
 BODY_TURN_SPEED = 24.0
 BODY_TURN_TOLERANCE_DEG = 3.0
 BODY_TURN_MAX_SECONDS = 5.0
@@ -70,6 +75,34 @@ class GimbalAlignedRouteTask(RouteTask):
     def reset(self) -> None:
         super().reset()
         self._clear_side_state()
+
+    def _candidate_ready(self, frame: FramePacket) -> Tuple[bool, str]:
+        ready, reason = super()._candidate_ready(frame)
+        if ready or reason != "waiting for gap endpoint to enter the near band":
+            return ready, reason
+        # The raised camera saw the real end repeatedly at row 0.79 in the
+        # field log, but the legacy docking gate demanded row 0.80. For a
+        # one-look aim we need the tangent, not a near-field docking pose.
+        candidate = self._candidate
+        endpoint = candidate.entry_endpoint
+        if candidate.bottom_ratio < SIDE_AIM_ENDPOINT_MIN_ROW:
+            return False, reason
+        if self._old_tangent_world is not None:
+            world_tangent = self._heading_offset + endpoint.tangent_deg
+            turn = self._angle_difference(world_tangent, self._old_tangent_world)
+            if not RIGHT_ANGLE_MIN_DEG <= turn <= RIGHT_ANGLE_MAX_DEG:
+                return False, "candidate is not a right-angle new route"
+        endpoint_x, endpoint_y = self._candidate_world_position(candidate, frame)
+        gap_distance = (endpoint_x * endpoint_x + endpoint_y * endpoint_y) ** 0.5
+        if endpoint_x <= 0.02:
+            return False, "candidate lies behind old-route departure gate"
+        if not MIN_ENDPOINT_GAP_DISTANCE <= gap_distance <= MAX_ENDPOINT_GAP_DISTANCE:
+            return False, "candidate endpoint is outside bounded gap gate"
+        # Unlike a near-field dock, a raised-view endpoint must have been
+        # observed farther away before it can become the fixed side-look aim.
+        if not self._candidate_seen_far:
+            return False, "candidate has no far-to-near history"
+        return True, "raised-view endpoint confirmed for one side look"
 
     def _start_low_approach(self, now: float) -> None:
         """Lock the raised-view endpoint and make one side-looking request."""

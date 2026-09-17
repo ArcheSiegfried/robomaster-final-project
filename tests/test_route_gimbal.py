@@ -44,6 +44,44 @@ class SideLookingRouteTests(unittest.TestCase):
     def test_task_has_no_sdk_or_second_camera_access(self):
         assert_module_source_is_clean(self, "route_gimbal.py")
 
+    def test_logged_endpoint_just_below_old_near_band_starts_side_aim(self):
+        task = GimbalAlignedRouteTask()
+        image = segment_frame((130, 280), (430, 280))
+        packet = FramePacket(image, 1, 1.0)
+        candidates = task._candidate_variants(
+            RouteVision(CONFIG.vision).candidates(image), 640, 360
+        )
+        task._candidate = next(
+            item for item in candidates if item.entry_endpoint.tangent_deg < 0
+        )
+        task._candidate_frames = 3
+        task._candidate_seen_far = True
+        task._pose_forward = 0.16
+        task._old_tangent_world = 0.0
+        self.assertLess(task._candidate.bottom_ratio, 0.80)
+        self.assertTrue(task._candidate_ready(packet)[0])
+        task.started_at = 1.0
+        task._start_low_approach(1.0)
+        self.assertEqual(task.state, SIDE_AIM)
+        self.assertLess(task._aim_yaw, -75.0)
+        self.assertEqual(task.step(packet, 1.4).gimbal.yaw, task._aim_yaw)
+
+    def test_side_aim_does_not_accept_unconfirmed_fragment(self):
+        task = GimbalAlignedRouteTask()
+        image = segment_frame((130, 280), (430, 280))
+        candidate = task._candidate_variants(
+            RouteVision(CONFIG.vision).candidates(image), 640, 360
+        )[0]
+        task._candidate = candidate
+        task._candidate_frames = 3
+        task._pose_forward = 0.16
+        task._old_tangent_world = 0.0
+        packet = FramePacket(image, 1, 1.0)
+        self.assertFalse(task._candidate_ready(packet)[0])
+        task._candidate_seen_far = True
+        task._candidate_frames = 2
+        self.assertFalse(task._candidate_ready(packet)[0])
+
     def test_one_aim_forward_crossing_then_body_turn(self):
         task = aimed_task()
         self.assertEqual(task.state, SIDE_AIM)
