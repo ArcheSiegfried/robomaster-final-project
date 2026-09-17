@@ -19,6 +19,10 @@ def endpoint_frame(row):
     return segment_frame((310, row), (610, row))
 
 
+def left_endpoint_frame(endpoint_x, row):
+    return segment_frame((endpoint_x - 125, row), (endpoint_x, row))
+
+
 class LowViewApproachTests(unittest.TestCase):
     def test_full_task_path_enters_low_view_before_turn(self):
         task, harness, _ = start_and_trigger()
@@ -93,6 +97,54 @@ class LowViewApproachTests(unittest.TestCase):
         for sequence, now in ((2, 1.8), (3, 1.85), (4, 1.9)):
             self.feed(sequence, now, 260)
         self.assertLess(self.task._candidate.entry_endpoint.point[0], 400)
+
+    def test_near_but_far_left_endpoint_cannot_trigger_early_turn(self):
+        task = RouteTask()
+        task._candidate = RouteVision(CONFIG.vision).candidates(
+            left_endpoint_frame(145, 310)
+        )[0]
+        task._start_low_approach(1.0)
+        for sequence, now in ((1, 1.8), (2, 1.85), (3, 1.9), (4, 1.95)):
+            update = task._step_low_approach(
+                FramePacket(left_endpoint_frame(145, 325), sequence, now), now
+            )
+        self.assertEqual(task.state, LOW_APPROACH)
+        self.assertEqual(update.motion.forward, 0.0)
+        self.assertLess(update.motion.lateral, 0.0)
+        self.assertEqual(task._low_turn_frames, 0)
+
+        # Simulate the image endpoint moving toward the centre as the chassis
+        # strafes. Only then may forward approach and turn confirmation resume.
+        for sequence, now, x in ((5, 2.0, 220), (6, 2.05, 300)):
+            update = task._step_low_approach(
+                FramePacket(left_endpoint_frame(x, 310), sequence, now), now
+            )
+        self.assertEqual(update.motion.lateral, 0.0)
+        self.assertGreater(update.motion.forward, 0.0)
+        for sequence, now in ((7, 2.10), (8, 2.15), (9, 2.20)):
+            update = task._step_low_approach(
+                FramePacket(left_endpoint_frame(300, 325), sequence, now), now
+            )
+        self.assertEqual(task.state, ALIGNING)
+        self.assertEqual(update.motion.forward, 0.0)
+
+    def test_off_center_endpoint_times_out_stopped_instead_of_turning(self):
+        task = RouteTask()
+        task._candidate = RouteVision(CONFIG.vision).candidates(
+            left_endpoint_frame(145, 310)
+        )[0]
+        task._start_low_approach(1.0)
+        for sequence, now in ((1, 1.8), (2, 1.85), (3, 1.9)):
+            task._step_low_approach(
+                FramePacket(left_endpoint_frame(145, 325), sequence, now), now
+            )
+        failed = task._step_low_approach(
+            FramePacket(left_endpoint_frame(145, 325), 4, 5.0), 5.0
+        )
+        self.assertEqual(failed.status, TaskStatus.FAILED)
+        self.assertEqual(failed.motion.forward, 0.0)
+        self.assertEqual(failed.motion.lateral, 0.0)
+        self.assertEqual(failed.motion.yaw, 0.0)
 
 
 if __name__ == "__main__":

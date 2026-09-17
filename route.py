@@ -78,6 +78,11 @@ LOW_SLOW_ROW_RATIO = 0.78
 LOW_APPROACH_SPEED = 0.11
 LOW_NEAR_SPEED = 0.07
 LOW_TURN_CONFIRM_FRAMES = 3
+LOW_CENTER_ENTER_ERROR = 0.16
+LOW_CENTER_EXIT_ERROR = 0.10
+LOW_LATERAL_GAIN = 0.20
+LOW_LATERAL_MIN_SPEED = 0.04
+LOW_LATERAL_MAX_SPEED = 0.12
 FRAGMENT_LOSS_SECONDS = 0.35
 
 SEARCH_YAW_SPEED = 45.0
@@ -216,6 +221,7 @@ class RouteTask:
         self._low_turn_frames = 0
         self._low_turn_last_sequence: Optional[int] = None
         self._low_target_tangent: Optional[float] = None
+        self._low_centering = False
         self._reacquire_view_already_low = False
 
     @property
@@ -277,6 +283,7 @@ class RouteTask:
         self._low_turn_frames = 0
         self._low_turn_last_sequence = None
         self._low_target_tangent = None
+        self._low_centering = False
         self._reacquire_view_already_low = False
         self.last_detection = VisualDetection.no_result(KIND)
         self._line_detector.reset()
@@ -657,6 +664,7 @@ class RouteTask:
         self._low_missing_at = None
         self._low_turn_frames = 0
         self._low_turn_last_sequence = None
+        self._low_centering = False
         # The raised and lowered views have different image coordinates.
         # Keeping the old pixel tracker would reject the real endpoint.
         self._candidate = None
@@ -676,7 +684,10 @@ class RouteTask:
             )
         if elapsed >= LOW_APPROACH_MAX_SECONDS:
             return self._finish(
-                TaskStatus.FAILED, "low-view endpoint approach timed out"
+                TaskStatus.FAILED,
+                "low-view endpoint centering timed out"
+                if self._low_centering
+                else "low-view endpoint approach timed out",
             )
 
         self._observe_candidate(frame, now)
@@ -703,6 +714,41 @@ class RouteTask:
 
         self._low_missing_at = None
         ratio = candidate.bottom_ratio
+        horizontal_error = self._candidate_target_error(candidate, frame)
+        if self._low_centering:
+            self._low_centering = abs(horizontal_error) > LOW_CENTER_EXIT_ERROR
+        elif (
+            abs(horizontal_error) >= LOW_CENTER_ENTER_ERROR
+            or (
+                ratio >= LOW_TURN_ROW_RATIO
+                and abs(horizontal_error) > LOW_CENTER_EXIT_ERROR
+            )
+        ):
+            self._low_centering = True
+        if self._low_centering:
+            # The real logs reached the bottom-row gate with the gap endpoint
+            # around x=143 in a 640 px frame. Turning there leaves the route
+            # far to one side; preserve the endpoint in view and strafe first.
+            self._low_turn_frames = 0
+            self._low_turn_last_sequence = None
+            lateral = max(
+                -LOW_LATERAL_MAX_SPEED,
+                min(
+                    horizontal_error * LOW_LATERAL_GAIN,
+                    LOW_LATERAL_MAX_SPEED,
+                ),
+            )
+            if abs(lateral) < LOW_LATERAL_MIN_SPEED:
+                lateral = (
+                    LOW_LATERAL_MIN_SPEED
+                    if lateral > 0.0 else -LOW_LATERAL_MIN_SPEED
+                )
+            return self._line_view_motion(
+                now,
+                MotionCommand(lateral=lateral),
+                f"centering visible gap endpoint; x error {horizontal_error:+.2f}",
+                candidate.detection,
+            )
         if frame.sequence != self._low_turn_last_sequence:
             self._low_turn_frames = (
                 self._low_turn_frames + 1
@@ -717,7 +763,7 @@ class RouteTask:
             self._align_phase = "base_rotate"
             self._align_phase_started_at = now
             return self._line_view_running(
-                now, "low-view gap endpoint reached turn band; starting turn"
+                now, "gap endpoint centered and reached low-view turn band"
             )
         speed = (
             LOW_NEAR_SPEED if ratio >= LOW_SLOW_ROW_RATIO
@@ -726,7 +772,8 @@ class RouteTask:
         return self._line_view_motion(
             now,
             MotionCommand(forward=speed),
-            f"following low-view gap endpoint at row {ratio:.2f}; "
+            f"following low-view gap endpoint at row {ratio:.2f}, "
+            f"x error {horizontal_error:+.2f}; "
             f"turn confirmation {self._low_turn_frames}/{LOW_TURN_CONFIRM_FRAMES}",
             candidate.detection,
         )
@@ -773,6 +820,7 @@ class RouteTask:
         self._low_turn_frames = 0
         self._low_turn_last_sequence = None
         self._low_target_tangent = None
+        self._low_centering = False
         self._line_detector.reset()
 
     def _begin_search(self, now: float) -> None:
