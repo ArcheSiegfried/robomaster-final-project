@@ -16,26 +16,30 @@ from green_junction import GreenJunctionTask
 from number_marker import NumberMarkerTask
 from obstacle import ObstacleTask
 from route import RouteTask
+from traffic_light import TrafficLightTask
 
 # 功能模块：一个文件 = 一个名额 = 一个人。顺序即接管优先级。
 #
-# 2026-09-16 变更（集成负责人确认）：
-# 1. **删除 `traffic_light.py`**（原第 1 位）：它在实车上反复把红色物体判成红灯并锁停
-#    （今天运行记录里多次 `red confirmed; holding` → `stop timeout; failed`），而赛题没有
-#    红绿灯这一项。删除后：
-#      * `coordinator.py` 的"红灯否决权"是通用机制，找不到名为 traffic_light 的模块时
-#        自动失效（`light_task=None`），代码保留、不再生效；
-#      * 绿岔路 `green_junction` 原本靠它提供灯色判据，现在没有判据来源 →
-#        按它自己的 A14 规则**不会接管**（惰性、不会抢岔路口）。
-# 2. 其余顺序保持：红绿灯岔路 → 障碍物绕行 → 短线巡回 → 障碍物岔路 → 数字识别。
-# 注意顺序的代价：`obstacle` 仍然优先于岔路/巡回/标识接管，而它的误触发率还不低，
-# 修判据之前要留意。
+# 2026-09-17 变更（集成负责人确认）：**`traffic_light.py` 回来了**（3 号 ASmoon540 重新提交）。
+# 它 09-16 被删的理由是"实车上反复把红色物体判成红灯并原地锁停"，这版把那条治了：
+#   * 红灯 2 帧就停、绿灯 5 帧 + 0.30s 丢帧宽限才放行（停得快、放得慢，偏向安全）；
+#   * **"总停车时钟"（`max_hold_seconds=15`）不被绿灯闪断重置** → 卡死最终一定 FAILED，
+#     不会像老版本那样无限锁停；
+#   * **绿灯从 IDLE 状态永不接管**（绿灯只用来"放行"，不抢正在开车的车）；
+#   * 顺带把红灯的得分截图接上了 evidence 通道（`Team 03 detects a red light and stops the robot`）。
+# 位置放回第 1 位（红绿灯是安全项）。两个副作用都要知道：
+#   1. `coordinator.py` 的"红灯否决权"**重新生效**：任何任务在开车时遇到红灯都会被暂停
+#      （暂停时间不计入任务预算），红灯消失后原任务继续；
+#   2. 灯色判据现在**两个模块都有**（本模块 + `green_junction` 的内置认灯器）；岔路口的
+#      绿灯仍归 `green_junction`（本模块绿灯不接管）。
+# 老提醒仍然成立：`obstacle` 优先于岔路/巡回/标识接管。
 MOTION_TASK_CLASSES = (
-    GreenJunctionTask,  # 1 红绿灯岔路（目前没有灯色来源 → 不接管）
-    ObstacleTask,  # 2 障碍物绕行
-    RouteTask,  # 3 短线巡回
-    FreeJunctionTask,  # 4 障碍物岔路
-    NumberMarkerTask,  # 5 数字识别
+    TrafficLightTask,  # 1 红绿灯（红灯停、绿灯确认后放行）
+    GreenJunctionTask,  # 2 红绿灯岔路
+    ObstacleTask,  # 3 障碍物绕行
+    RouteTask,  # 4 短线巡回
+    FreeJunctionTask,  # 5 障碍物岔路
+    NumberMarkerTask,  # 6 数字识别
 )
 
 # 基础设施观察者：每帧都能看到，但永远不能接管运动。

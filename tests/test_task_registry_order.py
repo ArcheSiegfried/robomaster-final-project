@@ -1,7 +1,10 @@
 """注册表顺序 = 撞车时的裁判顺序。这里把它钉死，改顺序必须先看见这条红。
 
-2026-09-16 按实车反馈调整：`number_marker` 从第 2 位降到第 5 位
-（它在"看到了标识"时不会让车停下，实际表现是抢在岔路/红绿灯前面却不干活）。
+2026-09-17：`traffic_light` 恢复（3 号重新提交，治好了"反复误判锁停"），放回 **第 1 位**
+（与集成负责人确认过的优先顺序一致：红绿灯 → 红绿灯岔路 → 障碍物绕行 → 短线巡回 →
+障碍物岔路 → 数字识别）。它一回来，`coordinator.py` 的"红灯否决权"也随之重新生效。
+2026-09-16：`number_marker` 从第 2 位降到最末（它在"看到了标识"时不接管，实际表现是抢在
+岔路/红绿灯前面却不干活）。
 """
 
 import pathlib
@@ -15,6 +18,7 @@ if str(ROOT) not in sys.path:
 import task_registry  # noqa: E402
 
 EXPECTED_ORDER = (
+    "traffic_light",    # 1 红绿灯（红灯停、绿灯确认后放行）
     "green_junction",   # 2 红绿灯岔路
     "obstacle",         # 3 障碍物绕行
     "route",            # 4 短线巡回
@@ -28,17 +32,28 @@ class RegistryOrderTests(unittest.TestCase):
         names = tuple(cls.name for cls in task_registry.MOTION_TASK_CLASSES)
         self.assertEqual(names, EXPECTED_ORDER)
 
+    def test_traffic_light_is_first(self):
+        """红灯排第 1：停车是安全项，不能被任何"正在开车"的模块挡住。"""
+        names = [cls.name for cls in task_registry.MOTION_TASK_CLASSES]
+        self.assertEqual(names.index("traffic_light"), 0)
+
     def test_number_marker_is_last(self):
         """数字识别排最后：它目前在实车上"看到标识却不接管"，先让会动作的模块先上。"""
         names = [cls.name for cls in task_registry.MOTION_TASK_CLASSES]
         self.assertEqual(names.index("number_marker"), len(names) - 1)
 
     def test_obstacle_outranks_the_junctions_and_the_marker(self):
-        """障碍物绕行在第 3 位：车前方的障碍必须先处理。"""
+        """障碍物绕行在叉路之前：车前方的障碍必须先处理。"""
         names = [cls.name for cls in task_registry.MOTION_TASK_CLASSES]
         self.assertLess(names.index("obstacle"), names.index("free_junction"))
         self.assertLess(names.index("obstacle"), names.index("route"))
         self.assertLess(names.index("obstacle"), names.index("number_marker"))
+
+    def test_red_light_veto_has_a_module_to_ask(self):
+        """红灯否决权靠"注册表里有个叫 traffic_light 的模块"生效，把它钉住。"""
+        import coordinator
+        names = [cls.name for cls in task_registry.MOTION_TASK_CLASSES]
+        self.assertIn(coordinator.LIGHT_TASK_NAME, names)
 
     def test_every_registered_task_appears_once(self):
         names = [cls.name for cls in task_registry.MOTION_TASK_CLASSES]

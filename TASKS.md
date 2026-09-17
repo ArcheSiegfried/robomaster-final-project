@@ -13,7 +13,7 @@
 |---|---|---|---|---|
 | 基础底座 | `config.py` + 实车验证记录（不新增文件） | — | 基础巡线实车验证与参数 | — |
 | 功能 1 | `number_marker.py` | `NumberMarkerTask` | 数字标识 1~5 | 难 |
-| 功能 2 | `traffic_light.py` | `TrafficLightTask` | 红绿灯 | 易 |　（2026-09-16 已删除：实车上反复把红色物体判成红灯并锁停，赛题没有这一项）
+| 功能 2 | `traffic_light.py` | `TrafficLightTask` | 红绿灯 | 易 |　（2026-09-17 **恢复**：09-16 曾因"反复误判红灯并原地锁停"删除；这版红灯 2 帧就停、绿灯 5 帧 + 0.30s 丢帧宽限才放行，总停车时钟不被闪断重置，绿灯从 IDLE 永不接管，并接入红灯得分截图）
 | 功能 3 | `obstacle.py` | `ObstacleTask` | 障碍检测与绕行 | 难 |
 | 功能 4 | `route.py`、`route_detector.py` | `RouteTask` | 长断线巡回 | 难 |
 | 功能 5 | `green_junction.py` | `GreenJunctionTask` | 绿灯岔路 | 难 |
