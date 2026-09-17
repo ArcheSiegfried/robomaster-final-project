@@ -69,7 +69,7 @@ BRIDGE_MIN_SECONDS = 0.80
 BRIDGE_FORWARD_SPEED = 0.15
 # The endpoint is followed in the *low* view. These are image-space gates,
 # not a claim to measure centimetres from a monocular camera.
-LOW_APPROACH_MAX_SECONDS = 4.0
+LOW_APPROACH_MAX_SECONDS = 6.0
 LOW_ENDPOINT_LOSS_SECONDS = 0.70
 # Stop before the skeleton endpoint reaches the 28 px image-border gate.
 # This is a visual event threshold to tune in real tests, not a distance scale.
@@ -78,8 +78,8 @@ LOW_SLOW_ROW_RATIO = 0.78
 LOW_APPROACH_SPEED = 0.11
 LOW_NEAR_SPEED = 0.07
 LOW_TURN_CONFIRM_FRAMES = 3
-LOW_CENTER_ENTER_ERROR = 0.16
-LOW_CENTER_EXIT_ERROR = 0.10
+LOW_CENTER_ENTER_ERROR = 0.28
+LOW_CENTER_EXIT_ERROR = 0.20
 LOW_LATERAL_GAIN = 0.20
 LOW_LATERAL_MIN_SPEED = 0.04
 LOW_LATERAL_MAX_SPEED = 0.12
@@ -726,9 +726,11 @@ class RouteTask:
         ):
             self._low_centering = True
         if self._low_centering:
-            # The real logs reached the bottom-row gate with the gap endpoint
-            # around x=143 in a 640 px frame. Turning there leaves the route
-            # far to one side; preserve the endpoint in view and strafe first.
+            # Do not let lateral correction starve the approach: real logs
+            # spent the entire phase strafing while the gap end was still
+            # above the turn row, so the committed turn never began. Continue
+            # a bounded slow approach until the visible endpoint reaches the
+            # turn band, then finish centering without advancing past it.
             self._low_turn_frames = 0
             self._low_turn_last_sequence = None
             lateral = max(
@@ -743,10 +745,12 @@ class RouteTask:
                     LOW_LATERAL_MIN_SPEED
                     if lateral > 0.0 else -LOW_LATERAL_MIN_SPEED
                 )
+            forward = LOW_NEAR_SPEED if ratio < LOW_TURN_ROW_RATIO else 0.0
             return self._line_view_motion(
                 now,
-                MotionCommand(lateral=lateral),
-                f"centering visible gap endpoint; x error {horizontal_error:+.2f}",
+                MotionCommand(forward=forward, lateral=lateral),
+                f"approaching and centering gap endpoint at row {ratio:.2f}; "
+                f"x error {horizontal_error:+.2f}",
                 candidate.detection,
             )
         if frame.sequence != self._low_turn_last_sequence:

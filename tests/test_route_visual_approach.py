@@ -104,7 +104,15 @@ class LowViewApproachTests(unittest.TestCase):
             left_endpoint_frame(145, 310)
         )[0]
         task._start_low_approach(1.0)
-        for sequence, now in ((1, 1.8), (2, 1.85), (3, 1.9), (4, 1.95)):
+        for sequence, now in ((1, 1.8), (2, 1.85), (3, 1.9)):
+            update = task._step_low_approach(
+                FramePacket(left_endpoint_frame(145, 300), sequence, now), now
+            )
+        self.assertEqual(task.state, LOW_APPROACH)
+        self.assertEqual(update.motion.forward, LOW_NEAR_SPEED)
+        self.assertLess(update.motion.lateral, 0.0)
+
+        for sequence, now in ((4, 1.95), (5, 2.0), (6, 2.05)):
             update = task._step_low_approach(
                 FramePacket(left_endpoint_frame(145, 325), sequence, now), now
             )
@@ -115,13 +123,13 @@ class LowViewApproachTests(unittest.TestCase):
 
         # Simulate the image endpoint moving toward the centre as the chassis
         # strafes. Only then may forward approach and turn confirmation resume.
-        for sequence, now, x in ((5, 2.0, 220), (6, 2.05, 300)):
+        for sequence, now, x in ((7, 2.10, 220), (8, 2.15, 300)):
             update = task._step_low_approach(
                 FramePacket(left_endpoint_frame(x, 310), sequence, now), now
             )
         self.assertEqual(update.motion.lateral, 0.0)
         self.assertGreater(update.motion.forward, 0.0)
-        for sequence, now in ((7, 2.10), (8, 2.15), (9, 2.20)):
+        for sequence, now in ((9, 2.20), (10, 2.25), (11, 2.30)):
             update = task._step_low_approach(
                 FramePacket(left_endpoint_frame(300, 325), sequence, now), now
             )
@@ -139,7 +147,7 @@ class LowViewApproachTests(unittest.TestCase):
                 FramePacket(left_endpoint_frame(145, 325), sequence, now), now
             )
         failed = task._step_low_approach(
-            FramePacket(left_endpoint_frame(145, 325), 4, 5.0), 5.0
+            FramePacket(left_endpoint_frame(145, 325), 4, 7.1), 7.1
         )
         self.assertEqual(failed.status, TaskStatus.FAILED)
         self.assertEqual(failed.motion.forward, 0.0)
