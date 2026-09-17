@@ -28,6 +28,7 @@ from free_junction import (  # noqa: E402
     BLOCKAGE_NONE,
     BLOCKAGE_RIGHT,
     Branch,
+    ForkDetection,
     FreeJunctionConfig,
     FreeJunctionDetector,
     FreeJunctionTask,
@@ -114,10 +115,15 @@ def fork_frame(car_left=False, car_right=False, stem_top=300, tips=(200, 440), x
 
 
 def noise_split_frame():
-    """一条很宽的带子被"竖直噪声"等宽切开：上下间距完全一样，不是岔路。"""
+    """一条很宽的带子被"竖直噪声"等宽切开：上下间距完全一样，不是岔路。
+
+    注意 `cv2.rectangle` 的颜色必须写成**三元组**：给标量 `FLOOR`（一个 int）时，
+    OpenCV 只往第一个通道写，填出来是 `[210,0,0]` —— 那**仍然是蓝色**（HSV 在蓝线
+    区间内），于是"被切开的带子"根本没被切开，这条测试就成了空转（2026-09-17 发现）。
+    """
     image = np.full((360, 640, 3), FLOOR, np.uint8)
     cv2.rectangle(image, (290, 194), (350, 350), BLUE, -1)
-    cv2.rectangle(image, (305, 194), (335, 350), FLOOR, -1)
+    cv2.rectangle(image, (305, 194), (335, 350), (FLOOR, FLOOR, FLOOR), -1)
     return image
 
 
@@ -862,9 +868,95 @@ class AimDirectionTests(unittest.TestCase):
         )
 
     def test_the_aim_is_strong_when_the_right_branch_is_chosen(self):
-        """选右支时不能只给一个"几乎直行"的 yaw（实车那次只有 +2.5）。"""
+        """选右支时不能只给一个"几乎直行"的 yaw（实车那次只有 +2.5）。
+
+        注：这张合成图里"车"是画在左分支上的，挡住了左分支的上半段，
+        所以可见的分支方向偏弱 —— 这里只要求"明显往右"，比例关系由
+        `test_the_aim_follows_the_offset_proportionally` 精确守住。
+        """
         _task, _fork, yaw = self._aim(fork_frame(car_left=True))
-        self.assertGreater(yaw, 5.0, "选右支时的 yaw 太弱：%+.1f" % yaw)
+        self.assertGreater(yaw, 3.0, "选右支时的 yaw 太弱：%+.1f" % yaw)
+
+    def test_handback_needs_one_clean_line_not_just_some_blue(self):
+        """交回巡线要求"脚下只有**一段**胶带"（单根清晰的线），不只是"有蓝线像素"。
+
+        车还压在岔路口上时脚下常常同时有主干和分支两段，底层巡线拿到这种画面会
+        自己判丢线 —— 交回也没用。所以两段时必须再等，等到只有一段（或到时间上限）。
+        """
+
+        def run_into_exit(task, image, now, limit=200):
+            for index in range(limit):
+                update = task.step(FramePacket(image, index + 1, now), now)
+                now += 0.05
+                if task.state is JunctionState.EXIT or update.status in (
+                    TaskStatus.COMPLETED, TaskStatus.FAILED,
+                ):
+                    return now, update
+            return now, update
+
+        # ① 干净的单根线 → 走"条件满足"这条路交回
+        clean = FreeJunctionTask()
+        now, _update = run_into_exit(clean, fork_frame(car_left=True), 1.0)
+        for index in range(20):
+            update = clean.step(FramePacket(line_frame(), 500 + index, now), now)
+            now += 0.05
+            if update.status is TaskStatus.COMPLETED:
+                break
+        self.assertIs(update.status, TaskStatus.COMPLETED)
+        self.assertIn("the line is back", clean.last_message)
+
+        # ② 脚下是两段（还压在岔路口上）→ 不能靠"有线"交回，只能到时间上限
+        split = FreeJunctionTask()
+        now, _update = run_into_exit(split, fork_frame(car_left=True), 1.0)
+        for index in range(30):
+            update = split.step(FramePacket(noise_split_frame(), 900 + index, now), now)
+            now += 0.05
+            if update.status is TaskStatus.COMPLETED:
+                break
+        self.assertIs(update.status, TaskStatus.COMPLETED)
+        self.assertIn("junction cleared", split.last_message,
+                      "两段胶带时不该按'线回来了'交回：%s" % split.last_message)
+
+    def test_the_aim_follows_the_offset_proportionally(self):
+        """瞄准是**比例控制**：偏角翻倍 yaw 翻倍，偏得太多才封顶。
+
+        满舵（一路顶在限幅上）正是"转过头再拉回"的成因 ——
+        2026-09-17 12:13~12:18 四次实车都是这个形状，所以增益 45→22、限幅 18→12。
+
+        这里直接喂几何给 `_approach_yaw()`（不依赖合成画面的像素），
+        参考点取"分叉点"（脚下看不到线时的回退），所以下面是精确可算的。
+        """
+        settings = FreeJunctionConfig()
+
+        def aim(right_x):
+            task = FreeJunctionTask(settings)
+            task.last_detection = ForkDetection(
+                valid=True, split_x=280, left_x=200, right_x=right_x, frame_width=640
+            )
+            task.chosen_branch = Branch.RIGHT
+            return task._approach_yaw()
+
+        near = aim(300)          # 偏角 (300-280)/320 = 0.0625
+        far = aim(360)           # 偏角 0.25 —— 正好 4 倍
+        self.assertGreater(near, 0.0)
+        self.assertGreater(far, near)
+        self.assertAlmostEqual(far / near, 4.0, delta=0.1, msg="不是比例控制")
+        self.assertLess(far, settings.max_approach_yaw, "中等偏角就被限幅顶住了")
+        self.assertGreater(
+            aim(520), settings.max_approach_yaw,
+            "偏角很大时比例输出应该超过限幅（限幅在 _motion 里裁）",
+        )
+
+        # 真正发出去的命令必须被裁到限幅内
+        task = FreeJunctionTask(settings)
+        task.state = JunctionState.APPROACH
+        task.last_detection = ForkDetection(
+            valid=True, split_x=280, left_x=200, right_x=520, frame_width=640
+        )
+        task.chosen_branch = Branch.RIGHT
+        self.assertAlmostEqual(
+            task._motion(1.0).yaw, settings.max_approach_yaw, delta=1e-6
+        )
 
     def test_an_off_center_fork_still_aims_at_the_chosen_branch(self):
         """整条岔路偏在画面左边时，选右支仍然要**往右**打。

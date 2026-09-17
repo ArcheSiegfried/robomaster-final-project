@@ -466,11 +466,15 @@ class FreeJunctionConfig:
     # 所以下面所有速度/角速度都比骨架限幅小一个量级。
     decide_timeout: float = 0.25      # 原地稳定判据的最长时间（求快：0.6 -> 0.25）
     approach_forward: float = 0.08
-    approach_yaw_gain: float = 45.0
-    max_approach_yaw: float = 18.0
+    #: 对准阶段的增益与限幅。**2026-09-17 12:13~12:18 四次实车全部"转过头再拉回"**
+    #: （对准 2 s 一直被 18 deg/s 打满 → 转过头 → 后面靠脚下那条线拉回来，
+    #: 用掉 3.2~3.7 s）。所以增益 45→28、限幅 18→12：让它是"比例控制"、
+    #: 快对准时自动慢下来，而不是一路满舵。
+    approach_yaw_gain: float = 22.0
+    max_approach_yaw: float = 12.0
     approach_seconds_max: float = 2.0
     turn_forward: float = 0.04        # 微前进
-    turn_yaw: float = 20.0            # 微转（最大角速度，原来是 45）
+    turn_yaw: float = 14.0            # 微转（最大角速度；45 -> 20 -> 14，越改越稳）
     turn_seconds: float = 2.5         # 只是**上限**：正常会提前收工
     turn_timeout: float = 3.5
     #: 转向至少要转这么久，才允许"看到线回到中央就收工"。
@@ -478,16 +482,19 @@ class FreeJunctionConfig:
     #: 闭环转向的增益：yaw = 增益 × 偏角（-1..1），再限幅到 `turn_yaw`。
     #: 看得到岔路就朝"选中那条分支"转；岔路没了就朝车头前那条胶带转。
     #: 越接近正前方转得越慢 —— 这样不会转过头（真车 2026-09-16 17:26 的教训）。
-    turn_steer_gain: float = 30.0
+    turn_steer_gain: float = 20.0
     #: "线回到画面中央"的容差（相对画面宽度）与需要的连续帧数。
-    center_tolerance_ratio: float = 0.18
+    #: 0.18 → 0.22：**宁可早一点收工**，剩下的对准交给 EXIT 段顺线完成 ——
+    #: 转过头再拉回比"稍微欠一点再补"更难看不安全。
+    center_tolerance_ratio: float = 0.22
     center_confirm_frames: int = 2
     exit_forward: float = 0.10        # 交回前也走得很慢
     exit_seconds: float = 1.0
     exit_timeout: float = 2.5
     #: EXIT 阶段顺线修正的增益（比转向更温柔）：交回巡线时车头尽量正对着线。
     exit_steer_gain: float = 25.0
-    #: 交回条件：岔路标志已经离开视野、而且视野里重新有蓝线，连续这么多帧 → COMPLETED。
+    #: 交回条件：岔路标志已经离开视野、视野里重新有**一条清晰的单根蓝线**，
+    #: 连续这么多帧 → COMPLETED（"只有蓝线像素"不够，见 `_finish_exit`）。
     handback_confirm_frames: int = 3
 
     # ---- 自己先裁一遍限幅（骨架还会再裁一次）----
@@ -823,25 +830,33 @@ class FreeJunctionDetector:
 
         # 分叉行 = 最靠下（y 最大）那一行；最上面一行用来验"越往上越张开"（A3）。
         split_row, first, last, separation = rows[-1]
-        top_row, top_first, top_last, top_separation = rows[0]
+        top_row, _top_first, _top_last, top_separation = rows[0]
         divergence = 0.0
         if separation > 0.0:
             divergence = top_separation / separation - 1.0
         if top_row >= split_row or divergence < settings.min_divergence_ratio:
             return empty
 
-        # **`left_x` / `right_x` 要的是"两条分支各自往哪边走"，所以取最上面那一行
-        # （张开最大处）的段中心。** 分叉行上两条分支刚分开、几乎重合，拿它的中心
-        # 当瞄准点等于"几乎直行" —— 2026-09-17 实车就是这么翻的：选了右支，但右支
-        # 在分叉行的中心只比画面中心偏 18 px，yaw 只有 +2.5，车最后开进了左边那条
-        # "有车"的分支。`split_x`（分左右走廊用）仍然是分叉行的中点。
-        # （下面 `to_frame` 把缩放图的坐标换算回整帧像素。）
+        # **`left_x` / `right_x` 要的是"两条分支各自往哪边走"**，所以取**张开最大的
+        # 那几行**（最上面那四分之一，至少 3 行）的段中心平均。
+        #
+        # * 不能取分叉行：那两行上分支刚分开、几乎重合，拿它的中心当瞄准点等于
+        #   "几乎直行" —— 2026-09-17 实车就是这么翻的（选了右支、yaw 只有 +2.5，
+        #   车最后开进左边那条有车的分支）；
+        # * 也不能只取最上面一行：单行会被噪声带偏，2026-09-17 12:18 那次实车
+        #   TURN 阶段的 yaw 出现过 20/12/20 来回跳。
+        # `split_x`（分左右走廊用）仍然是分叉行的中点。
+        head = rows[: max(1, min(len(rows), max(3, len(rows) // 4)))]
+
         def to_frame(value: float) -> int:
             return int(round(float(value) / scale))
 
+        def centre(run) -> float:
+            return (run[0] + run[1]) / 2.0
+
         split_x = to_frame((first[0] + first[1] + last[0] + last[1]) / 4.0) + left
-        left_x = to_frame((top_first[0] + top_first[1]) / 2.0) + left
-        right_x = to_frame((top_last[0] + top_last[1]) / 2.0) + left
+        left_x = to_frame(sum(centre(row[1]) for row in head) / len(head)) + left
+        right_x = to_frame(sum(centre(row[2]) for row in head) / len(head)) + left
         confidence = min(1.0, separation / max(1.0, min_separation * 2.0))
         return ForkDetection(
             valid=True,
@@ -1805,7 +1820,18 @@ class FreeJunctionTask:
 
         if self.state is JunctionState.APPROACH:
             gone = self._fork_gone(fork)
-            if gone or self._elapsed(now) >= settings.approach_seconds_max * 0.75:
+            # 已经对准了就别再转完整个 APPROACH：原来一定要转满 1.5 s（或等岔路消失），
+            # 结果带着满舵转过头，还得靠后面一段把车身拉回来
+            # （2026-09-17 12:13~12:18 四次实车都是这个形状）。
+            offset = self._turn_offset(fork)
+            if offset is not None and abs(offset) <= float(settings.center_tolerance_ratio):
+                self._center_count += 1
+            else:
+                self._center_count = 0
+            aligned = self._center_count >= max(1, int(settings.center_confirm_frames))
+            if (gone
+                    or aligned
+                    or self._elapsed(now) >= settings.approach_seconds_max * 0.75):
                 self._enter(JunctionState.TURN, now)
             else:
                 return self._running(now, "aligning with the %s branch" % self._branch_name())
@@ -1836,15 +1862,20 @@ class FreeJunctionTask:
     def _finish_exit(self, now: float, fork: Optional[ForkDetection] = None) -> TaskUpdate:
         """EXIT 阶段：**微微前进 + 顺线**，直到可以安全交回巡线。
 
-        交回条件（要求 3）：**岔路标志已经离开视野**，而且**视野里重新有蓝线**
-        （巡线要的条件回来了），连续 `handback_confirm_frames` 帧 → COMPLETED。
+        交回条件（要求 3）：**岔路标志已经离开视野**，而且视野里重新有
+        **一条清晰、单根的蓝线**（脚下那一小条里恰好只有一段胶带），
+        连续 `handback_confirm_frames` 帧 → COMPLETED。
+
+        为什么不是"有蓝线像素就行"：车还压在岔路口上时，脚下常常同时有一段主干和
+        一段分支（两段），底层巡线拿到这种画面会自己判丢线 —— 交回也没用。
         时间到了但条件还没满足 → 也交回（COMPLETED），把控制权还给巡线；
         拖过 `exit_timeout` → FAILED 停车。
         """
         settings = self.settings
         fork_gone = fork is None or not fork.valid
         line_back = self._last_blue_ratio >= settings.min_blue_ratio
-        if fork_gone and line_back:
+        single_line = self._tape_offset() is not None
+        if fork_gone and line_back and single_line:
             self._handback_count += 1
         else:
             self._handback_count = 0
