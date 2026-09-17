@@ -675,6 +675,10 @@ class JunctionConfig:
     #: 转向时车头已经对准选中分支的角度门槛：岔路口上线回中央可能一直不成立
     #: （2026-09-16 实测：yaw 收敛到 0 了却因为看不到单条居中的线而转向超时）。
     branch_align_deg: float = 6.0
+    #: 单次转向的**转角封顶**（度，0 = 不封顶）。带子接近水平时 tilt 会量到
+    #: 80°+，实测直接照它转会转过头（2026-09-17 22:47/22:52：转过 60~100°、
+    #: 带子被转出画面 → line did not return）。现场用 --turn-max-deg 调。
+    turn_max_deg: float = 0.0
     horizontal_fov_deg: float = 70.0 # 相机水平视野，用于像素→角度
 
     # --- 判据（见 A6、A7） ---
@@ -1867,11 +1871,14 @@ class GreenJunctionTask:
         严重低估（同一画面只有 -18.7°）。锁死的量在岔路检测中途丢失时仍然可用 ——
         这正是 22:28 那次"只转 20° 就交回巡线"的兜底修正。
         """
+        cap = max(0.0, float(getattr(self.settings, "turn_max_deg", 0.0) or 0.0))
         if self._chosen_tilt is not None:
-            return abs(float(self._chosen_tilt))
-        if self._chosen_bearing is not None:
-            return abs(float(self._chosen_bearing))
-        return 0.0
+            target = abs(float(self._chosen_tilt))
+        elif self._chosen_bearing is not None:
+            target = abs(float(self._chosen_bearing))
+        else:
+            return 0.0
+        return min(target, cap) if cap > 0.0 else target
 
     def _turn_still_needed(self) -> bool:
         """还要不要继续转（A21）：转过目标角度减去 ``branch_align_deg`` 就够了。"""
