@@ -216,11 +216,14 @@ class LightReading:
 
     ``branch`` 为 ``None`` 表示这一读数没有位置信息（只知道"看到绿灯"，
     不知道是哪一边的绿灯）——这时按 A7 的 ``fallback_rule`` 处理。
+    ``radius`` 只是给日志/自测看的尺寸信息（像素），判据不看它。
     """
 
     color: LightColor = LightColor.UNKNOWN
     branch: Optional[Branch] = None
     confidence: float = 0.0
+    radius: float = 0.0
+    center: Optional[Tuple[float, float]] = None   # 整幅图像素坐标，只给日志/自测用
 
 
 #: 灯判据的读取接口。3 号/1 号把它的函数注入进来即可，不需要本模块依赖 3 号的文件。
@@ -634,6 +637,9 @@ class JunctionConfig:
     turn_timeout: float = 3.5        # 转向阶段最长耗时
     turn_min_duration: float = 0.40  # 至少转这么久再判断线是否回来
     settle_timeout: float = 1.5      # 转完后等线回中央的最长时间
+    #: 转向时车头已经对准选中分支的角度门槛：岔路口上线回中央可能一直不成立
+    #: （2026-09-16 实测：yaw 收敛到 0 了却因为看不到单条居中的线而转向超时）。
+    branch_align_deg: float = 6.0
     horizontal_fov_deg: float = 70.0 # 相机水平视野，用于像素→角度
 
     # --- 判据（见 A6、A7） ---
@@ -1310,6 +1316,8 @@ class LampSpotter:
                         color=light_colour,
                         branch=Branch.LEFT if center[0] < center_x else Branch.RIGHT,
                         confidence=confidence,
+                        radius=radius,
+                        center=(float(center[0]), float(center[1])),
                     )
                 )
         found.sort(key=lambda item: -item.confidence)
@@ -2001,11 +2009,20 @@ class GreenJunctionTask:
                 return self._failed("lost the junction while turning")
 
         centered, line_source = self._line_centered(frame, now)
-        settled = self._turn_elapsed(now) >= settings.turn_min_duration and centered
+        bearing = self.chosen_bearing_deg
+        # 车头已经对准选中的分支（偏角收敛）也算转到位：岔路口上"线回中央"可能一直不成立
+        # （2026-09-16 实测：yaw 都收敛到 0 了，却因为近处一直看不到"单条居中的线"而转向超时）。
+        aligned = bearing is not None and abs(bearing) <= settings.branch_align_deg
+        settled = (
+            self._turn_elapsed(now) >= settings.turn_min_duration
+            and (centered or aligned)
+        )
         if settled:
             self._enter(JunctionState.SETTLE, now)
             return self._running(
-                now, "branch entered, checking line stability (%s)" % line_source
+                now,
+                "branch entered, checking line stability (%s)"
+                % ("line" if centered else "bearing %.1f deg" % (bearing or 0.0)),
             )
 
         return self._running(
