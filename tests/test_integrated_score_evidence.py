@@ -62,7 +62,7 @@ class IntegratedScoreEvidenceTests(unittest.TestCase):
             name="green_junction", chosen_branch=branch, last_readings=(lamp,)),
             "circle")
 
-    def test_ordinary_green_is_independent_of_red_photo(self):
+    def test_ordinary_green_uses_the_light_tasks_own_request_path(self):
         visual = VisualDetection(True, "traffic_light", color="green",
                                  box=(10, 12, 50, 52))
         tracker = IntegratedScoreEvidence()
@@ -70,16 +70,18 @@ class IntegratedScoreEvidenceTests(unittest.TestCase):
         coordinator = SimpleNamespace(motion_tasks=())
         self.assertEqual(tracker.process(self.frame,
             decision("traffic_light", TaskStatus.COMPLETED, visual),
-            coordinator, recorder), 1)
-        self.assertEqual(recorder.requests[0].shape, "circle")
-        self.assertIn("continues", recorder.requests[0].annotation)
+            coordinator, recorder), 0)
+        self.assertEqual(recorder.requests, [])
 
     def test_missing_or_failed_write_has_bounded_failure_result(self):
         tracker = IntegratedScoreEvidence()
         coordinator = SimpleNamespace(motion_tasks=())
-        visual = VisualDetection(True, "traffic_light", color="green",
-                                 box=(10, 12, 50, 52))
-        complete = decision("traffic_light", TaskStatus.COMPLETED, visual)
+        visual = VisualDetection(True, "obstacle", box=(10, 12, 50, 52))
+        task = SimpleNamespace(name="obstacle", last_side="left")
+        coordinator.motion_tasks = (task,)
+        tracker.process(self.frame, decision("obstacle", TaskStatus.RUNNING, visual),
+                        coordinator, Recorder())
+        complete = decision("obstacle", TaskStatus.COMPLETED, visual)
         self.assertEqual(tracker.process(self.frame, complete, coordinator,
                                          Recorder(saved=False)), 0)
         self.assertEqual(len(tracker.failures), 1)

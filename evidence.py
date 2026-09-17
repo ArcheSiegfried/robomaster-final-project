@@ -240,13 +240,12 @@ class IntegratedScoreEvidence:
             return 0
         if status != "COMPLETED" or name in self._saved:
             return 0
+        if name == "traffic_light":
+            # The light task owns both red and green requests so the latter
+            # also works when green releases a vetoed *other* task.
+            return 0
         request = self._candidate.pop(name, None)
-        if name == "traffic_light" and update.detection is not None:
-            detection = update.detection
-            if detection.valid and detection.color == "green" and detection.box:
-                request = self._request(frame, "traffic_green_go", detection,
-                    "Team 10 detects a green light and continues", "circle")
-        elif name == "route":
+        if name == "route":
             # A connected corner or the old line returning is not a scored
             # long-gap recovery, even though RouteTask also says COMPLETED.
             if update.message != "base line detector confirmed centered new route":
@@ -265,7 +264,7 @@ class IntegratedScoreEvidence:
                 request = self._request(frame, name, detection,
                     "Team 10 finds the correct line to follow")
         if request is None:
-            if name in ("traffic_light", "green_junction", "free_junction", "obstacle", "route"):
+            if name in ("green_junction", "free_junction", "obstacle", "route"):
                 self.failures.append("{} completed without valid scoring image".format(name))
             return 0
         try:

@@ -319,6 +319,7 @@ class TrafficLightTask:
         self._queued_evidence = None
         self._active_evidence = None
         self._evidence_done = False
+        self._green_evidence_done = False
         self._evidence_outcome = None
 
     def _enter_hold(self, now: float) -> None:
@@ -344,6 +345,10 @@ class TrafficLightTask:
         """Inspect the queued request without consuming it."""
         return self._queued_evidence
 
+    @property
+    def evidence_failed(self) -> bool:
+        return self._evidence_outcome is False
+
     def take_evidence_request(self) -> Optional[EvidenceRequest]:
         """Transfer one request to the integration-owned evidence writer."""
         request = self._queued_evidence
@@ -362,7 +367,10 @@ class TrafficLightTask:
         ):
             return False
         if saved:
-            self._evidence_done = True
+            if self._active_evidence.marker_id == "traffic_light_green":
+                self._green_evidence_done = True
+            else:
+                self._evidence_done = True
             self._evidence_outcome = True
             self._active_evidence = None
             return True
@@ -414,6 +422,26 @@ class TrafficLightTask:
             text_anchor=(width // 2, height // 2),
             image=frame.image.copy(),
         )
+
+    def _queue_green_evidence(self, frame: FramePacket,
+                              detection: VisualDetection) -> None:
+        if self._green_evidence_done or self._active_evidence is not None:
+            return
+        height, width = frame.image.shape[:2]
+        request = EvidenceRequest(
+            request_id="traffic_light:green:frame:{}:attempt:1".format(frame.sequence),
+            marker_id="traffic_light_green",
+            frame_sequence=frame.sequence,
+            captured_at=frame.captured_at,
+            detection=detection,
+            annotation="Team {} detects a green light and continues".format(
+                self.settings.team_number),
+            text_anchor=(width // 2, height // 2),
+            image=frame.image.copy(),
+        )
+        self._active_evidence = request
+        self._queued_evidence = request
+        self._evidence_outcome = None
 
     def step(self, frame: FramePacket, now: float) -> TaskUpdate:
         detection = self.detector.detect(frame.image)
@@ -483,6 +511,7 @@ class TrafficLightTask:
             self._green_streak += 1
             self._last_green_at = now
             if self._green_streak >= s.green_confirm_frames:
+                self._queue_green_evidence(frame, detection)
                 self._back_to_idle()
                 return TaskUpdate(
                     TaskStatus.COMPLETED,
