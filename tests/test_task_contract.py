@@ -41,6 +41,15 @@ EXPECTED_MODULE_FILES = {
     "evidence.py": "observe",
 }
 
+# 只从实验入口启用的任务文件：**故意不进生产注册表**。
+# 为什么要有这个名单：`route_gimbal.py`（2026-09-17 的和田直角断口云台侧视实验版）
+# 定义了一个任务类，但它只由 `route_only_main.py` 单独启用，**默认 main.py 不装配它** ——
+# 也就是它绝不能悄悄进入生产接管顺序（会影响 obstacle/route 的优先级与实车行为）。
+# 因此这里显式豁免登记要求，并**反向下一条断言**：它必须仍然不在注册表里。
+EXPERIMENT_ONLY_MODULES = {
+    "route_gimbal.py": "route_only_main.py",
+}
+
 
 def synthetic_frame():
     return FramePacket(line_frame(), 1, 1.0)
@@ -62,6 +71,13 @@ class RegistryTests(unittest.TestCase):
             registered.add(pathlib.Path(source).name)
 
         for filename, kinds in scan_module_files().items():
+            if filename in EXPERIMENT_ONLY_MODULES:
+                self.assertNotIn(
+                    filename,
+                    registered,
+                    f"{filename} 是仅实验入口启用的任务，不许登记进生产注册表",
+                )
+                continue
             if kinds == {"observe"}:
                 self.assertIn(
                     filename,

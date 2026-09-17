@@ -178,6 +178,18 @@ GimbalCommand(
 任务完成、失败、超时、异常、人工停止或视频失效后，协调器恢复 `CONFIG.gimbal_pitch/gimbal_yaw`，
 等云台真的到位并 settle 之后才尝试恢复巡线。
 
+#### 实验入口专用的第二个云台出口（2026-09-17 豁免说明）
+
+`route_only_main.py`（直角长断口"云台侧视"实验入口）会注入
+`route_gimbal_output.RouteGimbalOutput` —— 它**继承** `GimbalOutput`，增加了"相对车头 yaw +
+云台角度遥测"模式。这是**唯一被批准的第二个云台出口**，边界如下：
+
+* **只允许实验入口使用**：默认 `main.py` 仍然只用 `GimbalOutput`（`gimbal_output_factory=None`）；
+* 它**不得**直接 import SDK，也不得绕过集中出口的限幅；
+* 实验任务 `route_gimbal.py`（`GimbalAlignedRouteTask`）**不登记进 `task_registry.py`**
+  （默认接管顺序与实车行为不受影响），只从该入口启用；契约测试用
+  `tests/test_task_contract.py::EXPERIMENT_ONLY_MODULES` 显式豁免，并**反向断言它不在注册表里**。
+
 ### 巡线暂停和恢复
 
 ```python
