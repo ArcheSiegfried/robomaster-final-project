@@ -52,6 +52,10 @@ OWNER_LINE = "line"
 OWNER_EXTERNAL = "external"
 
 #: 红绿灯模块的注册名。有任务在接管时，协调器仍然每帧单独问它一次（红灯否决）。
+#: 2026-09-17：`traffic_light.py` 回来了（3 号重新提交，位置在注册表第 1 位），
+#: 所以下面这套"红灯否决权"**重新生效**：任何任务开车时遇到红灯都会被暂停
+#: （暂停的秒数不计入任务的超时预算），红灯消失后原任务继续。
+#: 机制本身没变过，找不到名为 traffic_light 的模块时会自动失效（`light_task=None`）。
 LIGHT_TASK_NAME = "traffic_light"
 
 # The base line must be armed before any module may claim motion from it.
@@ -127,6 +131,10 @@ class TaskCoordinator:
         )
         #: 被红灯暂停掉的累计时间：等红灯不该算进任务的 max_task_seconds。
         self._paused_seconds = 0.0
+        #: 最近一次"竞争探测"的结果（只有探测帧非空）。给终端显示用：
+        #: 那一刻**每个**模块各自想不想接管，以及最后判给了谁。
+        self.last_claims: tuple = ()
+        self._last_claim_probe_at: Optional[float] = None
         self._previous_frame_time: Optional[float] = None
         self._view_changed = False
         self._view_ready_at: Optional[float] = None
@@ -162,14 +170,31 @@ class TaskCoordinator:
         for observer in self.observers:
             self._call(observer.observe, observer.name, frame, now, errors)
 
-    def _find_takeover(self, frame, now, errors):
+    def _find_takeover(self, frame, now, errors, probe_all: bool = False):
+        """按顺序问模块，返回第一个"想接管"的。
+
+        `probe_all=True` 时**问完所有模块**（胜负规则不变，仍是第一个 RUNNING 赢），
+        并把各自的想法记进 `self.last_claims` 供终端显示"竞争实况"。
+        """
+        winner = None
+        claims = []
         for task in self.motion_tasks:
             update = self._call(task.step, task.name, frame, now, errors)
-            if update is None:
-                continue
-            if update.status is TaskStatus.RUNNING:
-                return task, update
-        return None
+            if update is not None and update.status is TaskStatus.RUNNING:
+                if winner is None:
+                    winner = (task, update)
+                if not probe_all:
+                    # 正常帧：遇到第一个 RUNNING 就停（保持既有开销与状态推进）。
+                    self.last_claims = ()
+                    return winner
+            if probe_all:
+                claims.append({
+                    "name": task.name,
+                    "status": "ERROR" if update is None else update.status.name,
+                    "message": "" if update is None else str(update.message or ""),
+                })
+        self.last_claims = tuple(claims) if probe_all else ()
+        return winner
 
     def _apply_task_motion(self, update: TaskUpdate, errors) -> MotionCommand:
         if update.motion is None:
@@ -236,10 +261,43 @@ class TaskCoordinator:
             self._view_restore_failed = True
             self._view_ready_at = None
             return False
+        # 【v0.3 接口】出口可能只是把"回巡线视角"排进队列（上一个绝对动作还没跑完），
+        # 这时**不能**当成已恢复：保持"意图"，由每帧的 _poll_gimbal 补发，等出口自己
+        # 报告 at_line_view 之后才开始 settle 计时。老出口没有 at_line_view -> 视为已到位。
+        if not self._gimbal_at_line_view():
+            self._view_changed = True
+            self._view_ready_at = None
+            return True
         self._view_changed = False
         self._view_restore_failed = False
         self._view_ready_at = now + self.settings.gimbal_settle_seconds
         return True
+
+    def _gimbal_at_line_view(self) -> bool:
+        """出口是否真的停在巡线视角。老出口（无该属性）视为已到位，保持旧行为。"""
+        value = getattr(self.gimbal_output, "at_line_view", None)
+        if value is None:
+            return True
+        try:
+            return bool(value)
+        except Exception:
+            return True
+
+    def _poll_gimbal(self, errors) -> None:
+        """每帧推进一次云台出口（收割在飞动作 + 补发队列里的最新目标）。
+
+        【v0.3 接口】这一步必须**每帧、在任何状态分支之前**发生一次：出口在忙时只
+        排队不发送，如果没有周期性的 poll，队列里的"回巡线视角"就永远补发不出去，
+        车会一直停在 "waiting for gimbal to return to line view"（实车已复现）。
+        老出口没有 poll -> 什么都不做，行为与今天一致。绝不抛异常。
+        """
+        poll = getattr(self.gimbal_output, "poll", None)
+        if not callable(poll):
+            return
+        try:
+            poll()
+        except Exception as error:
+            errors.append(f"gimbal poll failed: {error}")
 
     # -- per-cycle entry point -----------------------------------------
     def step(self, frame: FramePacket, now: float) -> CoordinatorDecision:
@@ -247,22 +305,45 @@ class TaskCoordinator:
         delta = 0.0 if self._previous_frame_time is None else max(
             0.0, now - self._previous_frame_time)
         self._previous_frame_time = now
+        self._poll_gimbal(errors)
         self._observe(frame, now, errors)
 
         if self.active_task is not None:
             return self._step_active(frame, now, errors, delta)
         if self.state == RELEASING:
             return self._step_releasing(frame, now, errors)
-        return self._step_line(frame, now, errors)
+        probe = self._claim_probe_due(now)
+        if probe:
+            self._last_claim_probe_at = now
+        return self._step_line(frame, now, errors, probe=probe)
 
-    def _step_line(self, frame, now, errors) -> CoordinatorDecision:
+    def _claim_probe_due(self, now: float) -> bool:
+        """该不该做一次"竞争探测"（把所有模块都问一遍并记录各自的想法）。
+
+        正常情况下协调器遇到第一个 RUNNING 就停，后面的模块**根本不会被问**，
+        操作员看不到"还有谁想接管、为什么判给它"。这个探测帧就是为调优先级准备的：
+        每 `claim_probe_seconds` 秒一次（默认 3 秒，设 0 关闭），**胜负规则不变**
+        （仍是顺序里第一个 RUNNING）；代价只是那一帧会让未接管的模块多推进一次
+        内部计数，所以频率低、并且可以关。
+        """
+        interval = float(getattr(self.settings.tasks, "claim_probe_seconds", 0.0) or 0.0)
+        if interval <= 0.0:
+            return False
+        if self._last_claim_probe_at is None:
+            # 第一帧只记时、不探测：保持"正常帧只问到自己为止"的既有契约，
+            # 第一次竞争实况在 interval 秒之后出现。
+            self._last_claim_probe_at = now
+            return False
+        return now - self._last_claim_probe_at >= interval
+
+    def _step_line(self, frame, now, errors, probe: bool = False) -> CoordinatorDecision:
         # Process the frame first so the base state machine stays current, but
         # hold its command until we know no task is taking over this cycle.
         decision = self.follower.process_frame(frame.image, frame.captured_at)
         self.last_line_decision = decision
 
         if self.takeover_allowed:
-            takeover = self._find_takeover(frame, now, errors)
+            takeover = self._find_takeover(frame, now, errors, probe_all=probe)
             if takeover is not None:
                 task, update = takeover
                 return self._begin_takeover(task, update, now, errors)
@@ -307,6 +388,8 @@ class TaskCoordinator:
 
     def _step_active(self, frame, now, errors, delta: float = 0.0) -> CoordinatorDecision:
         task = self.active_task
+        # 有人在开车时不再报"竞争"（这一帧只有它被问，报出来会误导操作员）。
+        self.last_claims = ()
         elapsed = now - self._active_started - self._paused_seconds
         if elapsed > self.settings.tasks.max_task_seconds:
             errors.append(
@@ -447,6 +530,34 @@ class TaskCoordinator:
                 message="waiting for line-view restore",
                 errors=tuple(errors),
             )
+
+        # 【v0.3 接口】释放期间只做两件事，**不要每帧重发 restore**（那会在
+        # "已到位"和"重新发一次"之间无限循环，出口永远显示忙）：
+        #   1. 恢复请求在 _end_task 里已经发出（出口忙时它只是排进了队列），
+        #      由 step() 里的 _poll_gimbal 每帧把它补发出去；
+        #   2. 这里每帧检查出口是否真的回到了巡线视角，没到就继续停车等，
+        #      而且**有界**：超过 release_resume_timeout 转进既有的"需要人工复位"路径。
+        if self._view_changed:
+            self.output.hard_stop()
+            if self._gimbal_at_line_view():
+                self._view_changed = False
+                self._view_restore_failed = False
+                self._view_ready_at = now + self.settings.gimbal_settle_seconds
+            elif self._release_started is not None and (
+                now - self._release_started
+                > self.settings.tasks.release_resume_timeout
+            ):
+                self._view_restore_failed = True
+                errors.append("gimbal did not return to line view in time")
+            if self._view_changed:
+                return CoordinatorDecision(
+                    state=RELEASING,
+                    owner=self.output.owner,
+                    line=self.last_line_decision,
+                    command=STOP_COMMAND,
+                    message="waiting for gimbal to return to line view",
+                    errors=tuple(errors),
+                )
 
         if self._view_ready_at is not None and now < self._view_ready_at:
             self.output.hard_stop()

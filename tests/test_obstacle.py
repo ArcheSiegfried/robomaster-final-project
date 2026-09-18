@@ -24,36 +24,66 @@ from tests.task_harness import (  # noqa: E402
 )
 
 import obstacle  # noqa: E402
+from evidence import render_task_evidence  # noqa: E402
 from obstacle import ObstacleTask  # noqa: E402
 
 # 合成画面约定：蓝线是 (255, 0, 0)，灰度地面是 210，尺寸 640x360。
-# 障碍都画在**新的 ROI**（x 160..480, y 108..270）里面。
-OBSTACLE_BGR = (0, 165, 255)     # 橙色道具
+# 障碍都画在 ROI（x 160..480, y 108..270）里面。
+#
+# 官方信息：障碍是**一辆静止的同型小车**（深色、有轮子/云台）。
+# 所以合成障碍也照小车画 —— 结构判据既要对比度、也要框内有结构（过闸六那一关）。
+BODY_BGR = (105, 105, 105)       # 灰车身
+WHEEL_BGR = (25, 25, 25)         # 深色轮子
+TOP_BGR = (230, 230, 230)        # 车身顶上的亮色件（云台）
 SKIN_BGR = (140, 170, 220)       # 手掌/手臂的典型肤色（BGR）
 
+# v7 之前的合成障碍是"亮橙色扁平块"。v8 把 Canny 前的模糊调大之后，
+# 那种低对比度的扁平块结构判据抓不到（亮橙块灰色约 173，浅色地面 210，只差 37）。
+# 这是 v8 的已知代价，写在模块顶部；真障碍是深色小车，对比度足够。
+OBSTACLE_BGR = (0, 165, 255)     # 只留给"颜色判据"相关的用例
 
-def obstacle_frame(x=320, center=(320, 200), size=(80, 60)):
-    """蓝线 + 一块橙色障碍。"""
-    image = line_frame(x)
+
+def _draw_car(image, center=(320, 200), size=(120, 90)):
+    """在一张图上画一辆停着的同型小车（车身 + 两个轮子 + 云台）。"""
     cx, cy = center
     half_w, half_h = size[0] // 2, size[1] // 2
-    cv2.rectangle(
-        image, (cx - half_w, cy - half_h), (cx + half_w, cy + half_h), OBSTACLE_BGR, -1
-    )
+    left, top = cx - half_w, cy - half_h
+    cv2.rectangle(image, (left, top), (cx + half_w, cy + half_h), BODY_BGR, -1)
+    # 轮子放在框内部（不贴下缘），保证"框内有结构"那一关能过
+    cv2.rectangle(image, (left + 8, top + 12), (left + 28, cy + half_h - 8), WHEEL_BGR, -1)
+    cv2.rectangle(image, (cx + half_w - 28, top + 12), (cx + half_w - 8, cy + half_h - 8),
+                  WHEEL_BGR, -1)
+    cv2.rectangle(image, (cx - 18, top + 4), (cx + 18, top + 26), TOP_BGR, -1)
+
+
+def obstacle_frame(x=320, center=(320, 220), size=(170, 160)):
+    """**已经贴到车前的障碍**：它把近处的蓝线挡住了。
+
+    v10 的触发条件是"视野里有车 **且** 蓝线消失"，所以合成障碍必须真的挡住
+    `LINE_CHECK_ROI`（y 162..288）那一段的蓝线 —— 这正是车开到障碍跟前的样子。
+    """
+    image = line_frame(x)
+    _draw_car(image, center=center, size=size)
+    return image
+
+
+def car_visible_frame(x=320, center=(320, 200), size=(120, 90)):
+    """**远处就看到的车**：蓝线还看得见（不该触发）。
+
+    用户要求：不要一看见车就开始位移。这一帧就是"看到了但还没到跟前"。
+    """
+    image = line_frame(x)
+    _draw_car(image, center=center, size=size)
     return image
 
 
 def car_frame(center=(330, 200)):
-    """**另一台车**当障碍：灰白车身 + 深色轮子，一个橙色像素都没有。
+    """**另一台车**当障碍：灰车身 + 深色轮子，一个橙色像素都没有。
 
-    这是 2026-09-11 实车实测失败的场景。注意位置要落在新 ROI 里：
-    ROI 下沿抬到 0.75 之后，太近（画面太低）的东西不在检测区里。
+    2026-09-11 实车实测失败的场景，也是官方口径里障碍的样子。
     """
     image = line_frame()
-    cx, cy = center
-    cv2.rectangle(image, (cx - 60, cy - 55), (cx + 60, cy + 45), (120, 120, 120), -1)
-    cv2.rectangle(image, (cx - 55, cy + 25), (cx - 30, cy + 45), (35, 35, 35), -1)
-    cv2.rectangle(image, (cx + 30, cy + 25), (cx + 55, cy + 45), (35, 35, 35), -1)
+    _draw_car(image, center=center, size=(120, 100))
     return image
 
 
@@ -98,6 +128,27 @@ def feed_image(harness, image, now):
     return decision
 
 
+def run_one_dodge(task, now, seq, limit=400):
+    """触发一次绕行并跑完：先用"挡住线的障碍帧"触发，之后喂干净的线帧。
+
+    v10 之后绕行途中不再看画面，所以触发完就可以喂线帧 ——
+    这正是实车"绕过去、线又出现了"的样子。
+    返回 (最后一次 update, now, seq)。
+    """
+    triggered = False
+    update = None
+    for _ in range(limit):
+        seq += 1
+        image = line_frame() if triggered else obstacle_frame()
+        update = task.step(FramePacket(image, seq, now), now)
+        now += 0.05
+        if update.status is TaskStatus.RUNNING:
+            triggered = True
+        elif update.status in (TaskStatus.COMPLETED, TaskStatus.FAILED):
+            break
+    return update, now, seq
+
+
 class ObstacleContractTests(unittest.TestCase):
     def test_module_source_obeys_the_safety_rules(self):
         """不得碰 SDK、相机、MotionOutput，不得阻塞或写死绝对路径。"""
@@ -138,11 +189,12 @@ class ObstacleDetectorTests(unittest.TestCase):
         self.assertGreater(result.center[0], 250)
         self.assertLess(result.center[0], 420)
 
-    def test_detects_a_large_orange_obstacle(self):
+    def test_detects_a_car_like_obstacle(self):
+        """合成的小车（车身 + 轮子 + 云台）要能被认出来。"""
         result = self.detector.detect(obstacle_frame())
         self.assertTrue(result.valid)
         self.assertEqual(result.kind, obstacle.KIND)
-        self.assertAlmostEqual(result.center[0], 320, delta=10)
+        self.assertAlmostEqual(result.center[0], 320, delta=15)
         self.assertGreater(result.confidence, 0.0)
 
     # ---- 负样本（报告点名要的）----
@@ -270,14 +322,17 @@ class ObstacleDetectorTests(unittest.TestCase):
         self.assertTrue(self.detector.detect(image).valid, "有结构的灰色物体被拒了")
 
     def test_picks_the_bigger_nearer_candidate(self):
-        """同时有两块时，选更大更靠下的那块。"""
+        """同时有两辆时，选更大更靠下的那辆。
+
+        注意两辆车要**分开**，贴在一起会合并成一个大块、反而被宽度上限拒掉。
+        """
         image = line_frame()
-        cv2.rectangle(image, (200, 170), (240, 195), OBSTACLE_BGR, -1)   # 又小又远
-        cv2.rectangle(image, (300, 180), (390, 240), OBSTACLE_BGR, -1)   # 又大又近
+        _draw_car(image, center=(215, 180), size=(70, 52))     # 又小又远
+        _draw_car(image, center=(345, 205), size=(130, 100))   # 又大又近
         result = self.detector.detect(image)
         self.assertTrue(result.valid)
-        self.assertGreater(result.center[0], 300)
-        self.assertGreater(result.center[1], 180)
+        self.assertGreater(result.center[0], 280)
+        self.assertGreater(result.center[1], 190)
 
     def test_returns_no_result_for_a_none_image(self):
         self.assertFalse(self.detector.detect(None).valid)
@@ -290,14 +345,39 @@ class ObstacleParameterTests(unittest.TestCase):
     不是拍脑袋；改了速度或时长，这几条会立刻告诉你还够不够。
     """
 
-    def test_dodge_distances_clear_a_car_sized_obstacle(self):
-        lateral = obstacle.SIDE_SPEED * obstacle.T_OUT_TIME
+    def test_official_dimensions_are_the_ones_we_use(self):
+        """尺寸必须照 DJI 官方技术参数来，不能估。
+
+        来源：https://www.dji.com/cn/robomaster-ep/specs 「机器人 - 尺寸」
+              步兵机器人 320×240×270 mm（长×宽×高）；障碍是同型号小车。
+        """
+        self.assertAlmostEqual(obstacle.OUR_LENGTH_M, 0.32, places=3)
+        self.assertAlmostEqual(obstacle.OUR_WIDTH_M, 0.24, places=3)
+        self.assertAlmostEqual(obstacle.OBSTACLE_LENGTH_M, 0.32, places=3)
+        self.assertAlmostEqual(obstacle.OBSTACLE_WIDTH_M, 0.24, places=3)
+
+    def test_pass_distance_clears_the_whole_car_not_just_the_nose(self):
+        """前进距离要按"**我们车尾也过去**"算：障碍车长 + 我们车长 + 余量。
+
+        只算"车头过了"是不够的 —— 车头刚过障碍时车尾还在它旁边，
+        一收回来就蹭上（用户实测就是这么蹭的）。
+        """
+        needed = obstacle.OBSTACLE_LENGTH_M + obstacle.OUR_LENGTH_M
         forward = obstacle.FWD_SPEED * obstacle.T_PASS_TIME
         self.assertGreaterEqual(
-            lateral, 0.34, "横移只有 %.2fm，两辆车（各 24cm 宽）错不开" % lateral
+            forward,
+            needed + 0.05,
+            "前进只有 %.2fm，而两车全长加起来要 %.2fm —— 车尾过不去" % (forward, needed),
         )
+
+    def test_side_distance_clears_both_widths(self):
+        """横移要错开两车的**宽度**：(我们宽 + 障碍宽) / 2 + 余量。"""
+        needed = (obstacle.OUR_WIDTH_M + obstacle.OBSTACLE_WIDTH_M) / 2.0
+        lateral = obstacle.SIDE_SPEED * obstacle.T_OUT_TIME
         self.assertGreaterEqual(
-            forward, 0.41, "前进只有 %.2fm，两辆车（各约 31cm 长）越不过去" % forward
+            lateral,
+            needed + 0.05,
+            "横移只有 %.2fm，而两车半宽和是 %.2fm —— 错不开" % (lateral, needed),
         )
 
     def test_total_timeout_is_long_enough_for_all_four_stages(self):
@@ -320,6 +400,197 @@ class ObstacleParameterTests(unittest.TestCase):
         for speed in (obstacle.SIDE_SPEED, obstacle.BACK_SPEED, obstacle.SEEK_SPEED):
             self.assertLessEqual(abs(speed), 0.25)
         self.assertLessEqual(abs(obstacle.FWD_SPEED), 0.30)
+
+
+class ObstacleRealSceneTests(unittest.TestCase):
+    """用审阅人那次实车留下的**真实画面裁片**做回归。
+
+    这是 2026-09-16 那次"半路没障碍却莫名开始避障"的直接证据：
+      * `samples/real_floor_roi.png`    —— 被误判那一帧的 ROI 区域（只有地板和胶带）
+      * `samples/real_obstacle_car.png` —— 同一批画面里那台真车
+    素材缺了就跳过，不让测试因为少一张图就红。
+    """
+
+    ROI = (160, 108, 480, 270)
+
+    def _asset(self, name):
+        path = pathlib.Path(__file__).resolve().parent / "samples" / name
+        if not path.exists():
+            self.skipTest("缺少样图 %s" % name)
+        data = np.fromfile(str(path), dtype=np.uint8)
+        image = cv2.imdecode(data, cv2.IMREAD_COLOR)
+        if image is None:
+            self.skipTest("读不出样图 %s" % name)
+        return image
+
+    @staticmethod
+    def _place(piece, at):
+        """把真实裁片贴进一张 640x360 的合成帧里（蓝线 + 浅色地面）。"""
+        frame = np.full((360, 640, 3), 210, np.uint8)
+        cv2.line(frame, (320, 350), (320, 190), (255, 0, 0), 24)
+        px, py = at
+        height, width = piece.shape[:2]
+        frame[py:py + height, px:px + width] = piece
+        return frame
+
+    def test_real_floor_does_not_trigger(self):
+        """真实地板（误判那一帧的 ROI 区域）不许触发 —— 本轮的核心回归。
+
+        v7 及以前：这块地板会被判成障碍（边缘密度 4.28%，真车才 14.28%，
+        只差 1.8 倍）。v8 把 Canny 前的模糊调到 9、阈值 60/160 之后降到 0.00%。
+        """
+        floor = self._asset("real_floor_roi.png")
+        frame = self._place(floor, (self.ROI[0], self.ROI[1]))
+        result = obstacle.ObstacleDetector().detect(frame)
+        self.assertFalse(result.valid, "真实地板又被当成障碍了")
+
+    def test_real_obstacle_car_is_detected(self):
+        """真实那台小车必须认出来 —— 认不出就没法绕（召回侧的断言）。"""
+        car = self._asset("real_obstacle_car.png")
+        for at in [(250, 150), (220, 160), (280, 140)]:
+            frame = self._place(car, at)
+            result = obstacle.ObstacleDetector().detect(frame)
+            self.assertTrue(result.valid, "真车贴在 %s 时没认出来" % (at,))
+            self.assertGreater(result.confidence, 0.5)
+
+
+class ObstacleTriggerTests(unittest.TestCase):
+    """v10 触发条件：**视野里有车 且 蓝线消失** 才动手。
+
+    用户实测：原来"一看到车就横移"，车会在很远的地方就早早开始绕，
+    结果每次都**正好停在障碍机器人前面**。所以必须等蓝线被障碍挡住再动。
+    """
+
+    def test_a_distant_car_does_not_trigger(self):
+        """看到车、但蓝线还看得见 -> 不许接管（"不要一看见车就开始位移"）。"""
+        task = ObstacleTask()
+        now = 1.0
+        seq = 0
+        update = None
+        for _ in range(40):
+            seq += 1
+            update = task.step(FramePacket(car_visible_frame(), seq, now), now)
+            now += 0.05
+        self.assertEqual(update.status, TaskStatus.NOT_TRIGGERED)
+        self.assertEqual(task.stage, "IDLE")
+
+    def test_a_blocking_car_triggers(self):
+        """车把近处蓝线挡住了 -> 这才是该绕的距离，接管。"""
+        task = ObstacleTask()
+        now = 1.0
+        seq = 0
+        update = None
+        for _ in range(20):
+            seq += 1
+            update = task.step(FramePacket(obstacle_frame(), seq, now), now)
+            now += 0.05
+            if update.status is TaskStatus.RUNNING:
+                break
+        self.assertEqual(update.status, TaskStatus.RUNNING, "车挡住了线却没接管")
+
+    def test_line_loss_alone_does_not_trigger(self):
+        """只有线没了（比如胶带缺口）、看不到车 -> 不许接管。"""
+        task = ObstacleTask()
+        blank = np.full((360, 640, 3), 210, np.uint8)
+        for index in range(30):
+            now = 1.0 + index * 0.05
+            update = task.step(FramePacket(blank, index + 1, now), now)
+            self.assertEqual(update.status, TaskStatus.NOT_TRIGGERED)
+        self.assertEqual(task.stage, "IDLE")
+
+    def test_the_dodge_ignores_the_obstacle_box_once_started(self):
+        """一旦开始绕，就不再管障碍框了 —— 中间几帧把车挪走也照样绕完。"""
+        task = ObstacleTask()
+        now = 1.0
+        seq = 0
+        for _ in range(20):
+            seq += 1
+            update = task.step(FramePacket(obstacle_frame(), seq, now), now)
+            now += 0.05
+            if update.status is TaskStatus.RUNNING:
+                break
+        self.assertEqual(update.status, TaskStatus.RUNNING)
+
+        # 障碍"消失"了（画面里只剩线），动作必须照走不误
+        stages = []
+        for _ in range(200):
+            seq += 1
+            update = task.step(FramePacket(line_frame(), seq, now), now)
+            now += 0.05
+            stages.append(task.stage)
+            if update.status is not TaskStatus.RUNNING:
+                break
+        self.assertIn("PASS", stages, "前进段没跑")
+        self.assertIn("SEEK", stages, "没有回到线上的收尾段")
+        self.assertEqual(update.status, TaskStatus.COMPLETED)
+
+
+class ObstacleRobotObservationTests(unittest.TestCase):
+    """【v9 主路径】DJI SDK 的机器人识别 —— **完全不看颜色**。
+
+    集成层订阅 `vision.sub_detect_info(name="robot")`，每帧把回调给的
+    `(x, y, w, h)`（中心点 + 宽高）推给模块；模块只用、不订（契约不允许碰 SDK）。
+    """
+
+    def test_sdk_robot_box_is_used_directly(self):
+        """画面里只有蓝线，但 SDK 说"那里有一台机器人" -> 就用 SDK 的框。"""
+        task = ObstacleTask()
+        task.update_robot_observations([(320, 200, 200, 150)], observed_at=1.0)
+        result = task.detect(line_frame(), now=1.05)
+        self.assertTrue(result.valid, "SDK 给了框却没认出来")
+        self.assertAlmostEqual(result.center[0], 320, delta=2)
+        self.assertAlmostEqual(result.center[1], 200, delta=2)
+        self.assertGreater(result.confidence, 0.9)
+        self.assertEqual(result.kind, obstacle.KIND)
+
+    def test_stale_observation_is_ignored(self):
+        """SDK 回调掉了一会儿了，不能拿旧框当新鲜目标。"""
+        task = ObstacleTask()
+        task.update_robot_observations([(320, 200, 200, 150)], observed_at=1.0)
+        late = 1.0 + obstacle.ROBOT_OBSERVATION_MAX_AGE + 0.10
+        self.assertFalse(task.detect(line_frame(), now=late).valid)
+
+    def test_empty_observation_clears_the_box(self):
+        """这一帧 SDK 没识别到机器人 -> 必须清掉旧框。"""
+        task = ObstacleTask()
+        task.update_robot_observations([(320, 200, 200, 150)], observed_at=1.0)
+        task.update_robot_observations([], observed_at=1.05)
+        self.assertFalse(task.detect(line_frame(), now=1.06).valid)
+
+    def test_too_far_robot_is_ignored(self):
+        """SDK 框只占画面宽 3%（太远）-> 还不到要绕的距离。"""
+        task = ObstacleTask()
+        task.update_robot_observations([(320, 200, 19, 14)], observed_at=1.0)
+        self.assertFalse(task.detect(line_frame(), now=1.05).valid)
+
+    def test_robot_off_to_the_side_is_ignored(self):
+        """识别到的机器人偏到画面边上（不挡路）-> 不接管。"""
+        task = ObstacleTask()
+        task.update_robot_observations([(40, 200, 200, 150)], observed_at=1.0)
+        self.assertFalse(task.detect(line_frame(), now=1.05).valid)
+
+    def test_nan_observation_is_dropped(self):
+        task = ObstacleTask()
+        task.update_robot_observations([(float("nan"), 200, 200, 150)], observed_at=1.0)
+        self.assertEqual(task.detector._robot_rows, ())
+
+    def test_sdk_robot_triggers_a_full_takeover(self):
+        """端到端：SDK 说前方有车 + 蓝线已被挡住 -> 接管并侧移。"""
+        task = ObstacleTask()
+        now = 1.0
+        seq = 0
+        blank = np.full((360, 640, 3), 210, np.uint8)   # 线被挡住了（看不见）
+        update = None
+        for _ in range(30):
+            seq += 1
+            task.update_robot_observations([(320, 200, 200, 150)], observed_at=now)
+            update = task.step(FramePacket(blank, seq, now), now)
+            now += 0.05
+            if update.status is TaskStatus.RUNNING:
+                break
+        self.assertEqual(update.status, TaskStatus.RUNNING, "SDK 报了车却没接管")
+        self.assertNotEqual(update.motion.lateral, 0.0)
+        self.assertIn(task.last_side, ("left", "right"))
 
 
 class ObstacleLineCheckTests(unittest.TestCase):
@@ -388,11 +659,9 @@ class ObstacleTakeoverTests(unittest.TestCase):
     # ---- 正样本端到端 ----
 
     def test_takes_over_for_another_car(self):
-        """实车实测场景的端到端回归：另一台车 -> 接管。"""
+        """实车实测场景的端到端回归：另一台车挡住线 -> 接管。"""
         self.assertEqual(self.harness.owner, "line")
-        decision, _ = self._feed_obstacle(
-            1.05, obstacle.CONFIRM_FRAMES, image=car_frame()
-        )
+        decision, _ = self._feed_obstacle(1.05, obstacle.CONFIRM_FRAMES)
         self.assertEqual(self.harness.owner, "external", "另一台车没有触发接管")
         self.assertEqual(self.harness.task_name, "obstacle")
 
@@ -435,11 +704,15 @@ class ObstacleTakeoverTests(unittest.TestCase):
         )
 
     def test_completes_then_hands_back_to_the_line(self):
-        """绕完 -> 主动找到线 -> COMPLETED -> 交回巡线 -> 恢复。"""
+        """绕完 -> 主动找到线 -> COMPLETED -> 交回巡线 -> 恢复。
+
+        v10 之后绕行途中不看画面，所以触发之后要喂**干净的线帧**
+        （实车就是"绕过去、线又出现了"）。
+        """
         _, now = self._feed_obstacle(1.05, obstacle.CONFIRM_FRAMES)
         completed = False
         for _ in range(300):
-            decision = feed_image(self.harness, obstacle_frame(), now)
+            decision = feed_image(self.harness, line_frame(), now)
             now += 0.05
             if decision.task_update and decision.task_update.status is TaskStatus.COMPLETED:
                 completed = True
@@ -465,10 +738,13 @@ class ObstacleTakeoverTests(unittest.TestCase):
         task = ObstacleTask()
         now = 1.0
         seq = 0
-        while task.stage == "IDLE":
+        for _ in range(300):
+            if task.stage != "IDLE":
+                break
             seq += 1
             task.step(FramePacket(obstacle_frame(), seq, now), now)
             now += 0.05
+        self.assertNotEqual(task.stage, "IDLE", "一直没接管")
         task.started_at -= obstacle.MAX_TOTAL_TIME + 1.0
         update = task.step(FramePacket(obstacle_frame(), seq + 1, now), now)
         self.assertEqual(update.status, TaskStatus.FAILED)
@@ -479,26 +755,106 @@ class ObstacleTakeoverTests(unittest.TestCase):
     def test_restarts_cleanly_after_an_external_release(self):
         """协调器从外面把控制权拿走时**不会通知模块**，再被问到时不许从半路接着走。
 
-        实车报告（2026-09-15）里"接管 0.1 秒后就 COMPLETED"就是这么造出来的：
-        stage 停在半路、每段时间都早已过期，于是一帧跳一段把流程"走"完，
-        看起来像绕过去了，其实一动没动。
+        实车记录（2026-09-15）里"接管 0.1 秒后就 COMPLETED"就是这么造出来的：
+        stage 停在半路、每段时间都早已过期，于是一帧跳一段把流程"走"完。
+
+        【v8 修法】断档时**保留控制权**（RUNNING + 零速度，进入 RECONFIRM），
+        下一帧重新判断；**绝不能返回 NOT_TRIGGERED** —— 实车记录里一共 12 次
+        `obstacle returned NOT_TRIGGERED while owning motion` 就是从那条路径来的。
         """
         task = ObstacleTask()
         now = 1.0
         seq = 0
-        while task.stage != "PASS":
+        for _ in range(300):
+            if task.stage == "PASS":
+                break
             seq += 1
             task.step(FramePacket(obstacle_frame(), seq, now), now)
             now += 0.05
-        self.assertEqual(task.stage, "PASS")
+        self.assertEqual(task.stage, "PASS", "没走到 PASS 段")
 
         # 模拟：中途被踢掉（视频中断 / 人工按键），2.6 秒之后才重新被问到
         now += 2.6
         seq += 40
         update = task.step(FramePacket(obstacle_frame(), seq, now), now)
-        self.assertIn(task.stage, ("IDLE", "OUT"), "被踢之后居然从半路接着走了")
-        if update.status is TaskStatus.RUNNING:
-            self.assertEqual(update.motion.forward, 0.0, "被踢之后居然直接往前开")
+        self.assertEqual(task.stage, "RECONFIRM")
+        self.assertIsNot(
+            update.status, TaskStatus.NOT_TRIGGERED,
+            "断档之后返回了 NOT_TRIGGERED —— 协调器会判违约",
+        )
+        self.assertEqual(update.status, TaskStatus.RUNNING)
+        self.assertEqual(update.motion.forward, 0.0)
+        self.assertEqual(update.motion.lateral, 0.0)
+
+        # 下一帧：障碍还在 -> 重新开始一轮完整的绕行
+        now += obstacle.RECONFIRM_HOLD + 0.05
+        seq += 1
+        update = task.step(FramePacket(obstacle_frame(), seq, now), now)
+        self.assertEqual(update.status, TaskStatus.RUNNING)
+        self.assertEqual(task.stage, "OUT")
+
+    def test_chooses_the_far_side_when_the_obstacle_is_off_centre(self):
+        """PDF 要求"看清后自己选左或右"，所以不能永远往左。
+
+        障碍明显偏左 -> 从右边绕（lateral 为正）；基本在正中间 -> 按默认往左。
+        注意障碍要够大，才能既挡住近处的线、又偏在一侧。
+        """
+        # 障碍偏左：横向偏移 -0.31（还在居中门槛 0.5 内），并且挡住了线
+        task = ObstacleTask()
+        now = 1.0
+        seq = 0
+        update = None
+        for _ in range(200):
+            seq += 1
+            update = task.step(
+                FramePacket(obstacle_frame(center=(270, 220), size=(190, 160)), seq, now),
+                now,
+            )
+            now += 0.05
+            if update.status is TaskStatus.RUNNING:
+                break
+        self.assertEqual(update.status, TaskStatus.RUNNING)
+        self.assertEqual(task.last_side, "right", "障碍偏左，应该从右边绕")
+        self.assertGreater(update.motion.lateral, 0.0, "往右绕应该是正的 lateral")
+
+        # 障碍在正中间 -> 默认往左
+        task2 = ObstacleTask()
+        now = 1.0
+        seq = 0
+        for _ in range(200):
+            seq += 1
+            update = task2.step(FramePacket(obstacle_frame(), seq, now), now)
+            now += 0.05
+            if update.status is TaskStatus.RUNNING:
+                break
+        self.assertEqual(task2.last_side, "left", "正中间的障碍应该按默认往左")
+        self.assertLess(update.motion.lateral, 0.0, "往左绕应该是负的 lateral")
+
+    def test_a_stale_gap_hands_back_cleanly_when_the_obstacle_is_gone(self):
+        """断档之后画面里已经没有障碍了：正常交回（COMPLETED），不是违约。"""
+        task = ObstacleTask()
+        now = 1.0
+        seq = 0
+        for _ in range(300):
+            if task.stage == "PASS":
+                break
+            seq += 1
+            task.step(FramePacket(obstacle_frame(), seq, now), now)
+            now += 0.05
+        self.assertEqual(task.stage, "PASS")
+
+        now += 2.6
+        seq += 40
+        update = task.step(FramePacket(line_frame(), seq, now), now)
+        self.assertIsNot(update.status, TaskStatus.NOT_TRIGGERED)
+        self.assertEqual(update.status, TaskStatus.RUNNING, "先停一脚")
+        # 过了"停一脚"的时长再判断：画面里没车了，正常交回
+        now += obstacle.RECONFIRM_HOLD + 0.05
+        seq += 1
+        update = task.step(FramePacket(line_frame(), seq, now), now)
+        self.assertIsNot(update.status, TaskStatus.NOT_TRIGGERED)
+        self.assertEqual(update.status, TaskStatus.COMPLETED)
+        self.assertEqual(task.stage, "IDLE")
 
     def test_never_completes_before_the_dodge_has_actually_run(self):
         """完整动作最短 1.7 + 1.6 + 1.2 = 4.5 秒，绝不允许更早报 COMPLETED。
@@ -510,13 +866,16 @@ class ObstacleTakeoverTests(unittest.TestCase):
         seq = 0
         takeover_at = None
         update = None
+        triggered = False
         for _ in range(400):
             seq += 1
-            update = task.step(FramePacket(obstacle_frame(), seq, now), now)
+            image = line_frame() if triggered else obstacle_frame()
+            update = task.step(FramePacket(image, seq, now), now)
             now += 0.05
             if takeover_at is None and update.status is TaskStatus.RUNNING:
                 takeover_at = now
-            if update.status is TaskStatus.COMPLETED:
+                triggered = True
+            elif update.status is TaskStatus.COMPLETED:
                 break
         self.assertIsNotNone(takeover_at, "一直没有接管")
         self.assertEqual(update.status, TaskStatus.COMPLETED)
@@ -532,69 +891,58 @@ class ObstacleTakeoverTests(unittest.TestCase):
 
         最多连绕 MAX_CONSECUTIVE_DODGES 次，再多就直接 FAILED 停车要人来看，
         并且**从此不再接管**（否则会变成每几秒停一下的走走停停）。
-        障碍就放在路中间（官方信息：障碍是一辆停在线上的小车），这样每次
-        绕完都能重新看到线、继续触发。
+        v10 之后每一轮都是"障碍挡住线 -> 绕 -> 线又出现"的完整循环。
         """
-        harness = TaskHarness(task=ObstacleTask())
-        harness.start_line(now=1.0)
-        now = 1.05
-        image = obstacle_frame(center=(320, 200))
+        task = ObstacleTask()
+        now = 1.0
+        seq = 0
         dodges = 0
         failed = False
-        takeovers = 0
-        was_owner = False
-        for _ in range(1200):                      # 模拟 60 秒
-            decision = feed_image(harness, image, now)
-            now += 0.05
-            owned = decision.task_name is not None
-            if owned and not was_owner:
-                takeovers += 1
-            was_owner = owned
-            if decision.task_update is None:
-                continue
-            if decision.task_update.status is TaskStatus.COMPLETED:
+        for _ in range(10):
+            update, now, seq = run_one_dodge(task, now, seq)
+            if update.status is TaskStatus.COMPLETED:
                 dodges += 1
-            elif decision.task_update.status is TaskStatus.FAILED:
+            elif update.status is TaskStatus.FAILED:
                 failed = True
+                break
+            else:
+                break
 
         self.assertTrue(failed, "连绕之后没有停下来，可能又在无限绕")
         self.assertLessEqual(
             dodges, obstacle.MAX_CONSECUTIVE_DODGES,
             "连绕次数超过了上限：%d 次" % dodges,
         )
-        self.assertEqual(
-            takeovers, obstacle.MAX_CONSECUTIVE_DODGES + 1,
-            "接管次数应该正好是 %d 次绕行 + 1 次失败锁停，实际 %d 次"
-            % (obstacle.MAX_CONSECUTIVE_DODGES, takeovers),
-        )
 
-        locked_takeovers = takeovers
-        for _ in range(600):                       # 再喂 30 秒：锁住之后不许再接管
-            decision = feed_image(harness, image, now)
+        # 锁住之后：障碍还在，但必须不再接管
+        locked_takeovers = 0
+        for _ in range(600):                       # 再喂 30 秒
+            seq += 1
+            update = task.step(FramePacket(obstacle_frame(), seq, now), now)
             now += 0.05
-            if decision.task_name is not None:
+            if update.status is TaskStatus.RUNNING:
                 locked_takeovers += 1
-        self.assertEqual(locked_takeovers, takeovers, "锁住之后又接管了，锁没生效")
+        self.assertEqual(locked_takeovers, 0, "锁住之后又接管了，锁没生效")
 
     def test_unlocks_once_the_obstacle_clears(self):
         """障碍消失够久之后，应该重新愿意干活（不是永久瘫掉）。"""
         task = ObstacleTask()
-        image = obstacle_frame(center=(320, 200))
         now = 1.0
         seq = 0
-        for _ in range(3000):                      # 最多模拟 150 秒
-            seq += 1
-            task.step(FramePacket(image, seq, now), now)
-            now += 0.05
+        for _ in range(10):
+            update, now, seq = run_one_dodge(task, now, seq)
             if task.locked:
                 break
         self.assertTrue(task.locked, "连绕到上限了却没锁住")
         self.assertEqual(task.dodge_count, obstacle.MAX_CONSECUTIVE_DODGES)
 
-        while task.stage != "IDLE":
+        for _ in range(50):
+            if task.stage == "IDLE":
+                break
             seq += 1
-            task.step(FramePacket(image, seq, now), now)
+            task.step(FramePacket(obstacle_frame(), seq, now), now)
             now += 0.05
+        self.assertEqual(task.stage, "IDLE", "锁停那一轮没有收尾")
 
         now += obstacle.CLEAR_SECONDS + 0.1
         seq += 1
@@ -604,30 +952,30 @@ class ObstacleTakeoverTests(unittest.TestCase):
 
     def test_rearm_cooldown_blocks_an_immediate_second_takeover(self):
         """刚绕完的这段时间里，同一个障碍不许把车再拉去绕一次。"""
-        _, now = self._feed_obstacle(1.05, obstacle.CONFIRM_FRAMES)
-        for _ in range(300):
-            decision = feed_image(self.harness, obstacle_frame(), now)
-            now += 0.05
-            if decision.task_update and decision.task_update.status is TaskStatus.COMPLETED:
-                break
-        for _ in range(10):
-            feed_image(self.harness, line_frame(), now)
-            now += 0.05
-            if self.harness.owner == "line" and self.harness.state == "LINE_FOLLOWING":
-                break
-        self.assertEqual(self.harness.state, "LINE_FOLLOWING")
+        task = ObstacleTask()
+        now = 1.0
+        seq = 0
+        update, now, seq = run_one_dodge(task, now, seq)
+        self.assertEqual(update.status, TaskStatus.COMPLETED)
+        finished_at = task.finished_at
+        self.assertIsNotNone(finished_at)
 
-        for _ in range(obstacle.CONFIRM_FRAMES):
-            feed_image(self.harness, obstacle_frame(), now)
+        # 冷却期内的障碍帧：不许接管
+        for _ in range(obstacle.CONFIRM_FRAMES + 2):
+            seq += 1
+            update = task.step(FramePacket(obstacle_frame(), seq, now), now)
             now += 0.05
-        self.assertEqual(self.harness.owner, "line")
+        self.assertEqual(update.status, TaskStatus.NOT_TRIGGERED)
+        self.assertEqual(task.stage, "IDLE")
 
-        now += obstacle.REARM_SECONDS + 0.1
+        # 冷却过去之后：同一个障碍应该重新能触发
+        now = finished_at + obstacle.REARM_SECONDS + 0.1
         for _ in range(obstacle.CONFIRM_FRAMES):
-            feed_image(self.harness, obstacle_frame(), now)
+            seq += 1
+            update = task.step(FramePacket(obstacle_frame(), seq, now), now)
             now += 0.05
-        self.assertEqual(self.harness.owner, "external")
-        self.assertEqual(self.harness.task_name, "obstacle")
+        self.assertEqual(update.status, TaskStatus.RUNNING)
+        self.assertEqual(task.stage, "OUT")
 
 
 class ObstacleStateTests(unittest.TestCase):
@@ -686,11 +1034,14 @@ class ObstacleStateTests(unittest.TestCase):
         task = ObstacleTask()
         now = 1.0
         seq = 0
-        while task.stage != "SEEK":
+        for _ in range(300):
+            if task.stage == "SEEK":
+                break
             seq += 1
             task.step(FramePacket(obstacle_frame(), seq, now), now)
             now += 0.05
             self.assertLess(now - 1.0, obstacle.MAX_TOTAL_TIME)
+        self.assertEqual(task.stage, "SEEK", "没走到 SEEK 段")
 
         blank = np.full((360, 640, 3), 210, np.uint8)
         laterals = []
@@ -713,10 +1064,13 @@ class ObstacleStateTests(unittest.TestCase):
         task = ObstacleTask()
         now = 1.0
         seq = 0
-        while task.stage != "SEEK":
+        for _ in range(300):
+            if task.stage == "SEEK":
+                break
             seq += 1
             task.step(FramePacket(obstacle_frame(), seq, now), now)
             now += 0.05
+        self.assertEqual(task.stage, "SEEK", "没走到 SEEK 段")
         update = None
         for _ in range(10):
             seq += 1
@@ -725,6 +1079,119 @@ class ObstacleStateTests(unittest.TestCase):
             if update.status is not TaskStatus.RUNNING:
                 break
         self.assertEqual(update.status, TaskStatus.COMPLETED)
+
+
+class ObstacleEvidencePhotoTests(unittest.TestCase):
+    """7.1 得分照片：在"确认绕行、下第一脚侧移"那一帧排一张标注图。
+
+    老师按**保存的图片张数**算分，这一组对应 7.1（15 分）：
+    图上必须看得清障碍（矩形框）**并且**有一行字写清"测到障碍 + 选了哪边绕"
+    （文案模板在证据层 `evidence.ANNOTATION_TEMPLATES`，模块不自己拼）。
+
+    但同时钉死一条边界：照片只是**证据**。写盘失败（回执 False）**绝不允许**
+    改变绕行本身 —— 不 FAILED、不停车、不把 11 秒的绕行预算耗在等回执上。
+    """
+
+    # 文案照老师样例：`Team 10 detects obstacle » the left side`；样例队号 10，
+    # 我们是 03。模板在证据层，这里钉死**渲染出来的那句话**。
+    LEFT_TEXT = "Team 10 detects obstacle » the left side"
+    RIGHT_TEXT = "Team 10 detects obstacle » the right side"
+
+    @staticmethod
+    def _drive_to_the_dodge(task, image=None, now=1.0, seq=0, limit=200):
+        """喂障碍帧直到"连续帧确认完成、接管"；返回 (update, now, seq)。"""
+        update = None
+        for _ in range(limit):
+            seq += 1
+            image = obstacle_frame() if image is None else image
+            update = task.step(FramePacket(image, seq, now), now)
+            now += 0.05
+            if update.status is TaskStatus.RUNNING:
+                break
+        return update, now, seq
+
+    def test_confirmed_dodge_queues_the_obstacle_photo(self):
+        """确认绕行那一帧就排出一张照片：文字写 left、有画面、有框。"""
+        task = ObstacleTask()
+        update, _, _ = self._drive_to_the_dodge(task)
+        self.assertEqual(update.status, TaskStatus.RUNNING, "没有接管，没有得分那一刻")
+        self.assertEqual(task.last_side, "left", "正中间的障碍应该按默认往左")
+
+        request = task.take_evidence_request()
+        self.assertIsNotNone(request, "确认绕行那一刻没有排出得分照片")
+        self.assertEqual(request.annotation, self.LEFT_TEXT)
+        self.assertEqual(request.kind, obstacle.KIND)
+        self.assertEqual(request.shape, "rect", "障碍要用矩形框（圆圈是红绿灯的）")
+        self.assertIsNotNone(request.image, "请求里没有画面，证据层写不出图")
+        self.assertTrue(request.detection.valid)
+        self.assertIsNotNone(request.detection.box, "照片上没有框住障碍的矩形")
+
+        # 画框 + 写字真的能落到图上（证据层的画图函数认得这个请求）
+        rendered = render_task_evidence(request)
+        self.assertEqual(rendered.shape, request.image.shape)
+
+        # 同一个事件只排一张：取过一次就没了，继续绕也不会重新排
+        self.assertIsNone(task.take_evidence_request())
+        self.assertIsNone(task.pending_evidence_request)
+
+    def test_the_photo_writes_the_side_we_actually_dodge_to(self):
+        """障碍明显偏左 -> 从右边绕 -> 图上那句话必须写 right。"""
+        task = ObstacleTask()
+        update, _, _ = self._drive_to_the_dodge(
+            task, image=obstacle_frame(center=(270, 220), size=(190, 160))
+        )
+        self.assertEqual(update.status, TaskStatus.RUNNING)
+        self.assertEqual(task.last_side, "right")
+        request = task.take_evidence_request()
+        self.assertIsNotNone(request)
+        self.assertEqual(request.annotation, self.RIGHT_TEXT)
+
+    def test_a_failed_write_never_changes_the_dodge(self):
+        """回执 False（写盘失败）之后绕行行为不变：继续绕、不 FAILED、不停车。
+
+        老师按张数算分，但照片是**加分项**：证据层存不成，车也必须照原样绕过去，
+        而且不许把时间耗在重试上（重试次数有上限，超了就放弃照片）。
+        """
+        task = ObstacleTask()
+        update, now, seq = self._drive_to_the_dodge(task)
+        self.assertEqual(update.status, TaskStatus.RUNNING)
+        self.assertNotEqual(update.motion.lateral, 0.0, "确认那一帧就该在下发侧移")
+
+        # 别人家的 request_id 不该被当成我们自己的回执
+        self.assertFalse(task.acknowledge_evidence("not-this-request", True))
+
+        request = task.take_evidence_request()
+        self.assertIsNotNone(request)
+        # 证据层两次都报"没写成功"
+        self.assertTrue(task.acknowledge_evidence(request.request_id, False))
+        retry = task.take_evidence_request()
+        self.assertIsNotNone(retry, "第一次写盘失败应该重试一次")
+        self.assertEqual(retry.attempt, 2)
+        self.assertEqual(retry.annotation, self.LEFT_TEXT)
+        self.assertTrue(task.acknowledge_evidence(retry.request_id, False))
+        self.assertIsNone(task.take_evidence_request(), "重试次数用完就不该再排")
+        self.assertFalse(task.locked)
+
+        # 绕行照走：还在 OUT 段、还在往左让开
+        seq += 1
+        update = task.step(FramePacket(line_frame(), seq, now), now)
+        now += 0.05
+        self.assertEqual(update.status, TaskStatus.RUNNING, "照片写不成居然不绕了")
+        self.assertEqual(task.stage, "OUT")
+        self.assertEqual(update.motion.lateral, -obstacle.SIDE_SPEED)
+
+        # 整轮照常走完 -> COMPLETED（既没 FAILED，也没被照片拖到超时）
+        stages = []
+        for _ in range(400):
+            seq += 1
+            update = task.step(FramePacket(line_frame(), seq, now), now)
+            now += 0.05
+            stages.append(task.stage)
+            if update.status is not TaskStatus.RUNNING:
+                break
+        self.assertEqual(update.status, TaskStatus.COMPLETED, "写盘失败把绕行搞坏了")
+        self.assertIn("PASS", stages, "前进段没跑")
+        self.assertIn("SEEK", stages, "没有回到线上的收尾段")
 
 
 if __name__ == "__main__":

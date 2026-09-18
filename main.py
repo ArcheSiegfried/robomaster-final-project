@@ -11,6 +11,7 @@ from evidence import DEFAULT_CAPTURE_DIRECTORY
 from gimbal_output import GimbalOutput
 from marker_source import MarkerObservationSource
 from motion_output import MotionOutput
+from robot_source import RobotObservationSource
 from runtime import LineFollower
 from task_registry import build_motion_tasks, build_observers
 
@@ -22,6 +23,7 @@ def build_coordinator(
     capture_directory=DEFAULT_CAPTURE_DIRECTORY,
     gimbal_output=None,
     motion_task_names=None,
+    motion_tasks_override=None,
 ):
     """Wire every registered module into the coordinator.
 
@@ -35,7 +37,10 @@ def build_coordinator(
         settings,
         follower,
         output,
-        motion_tasks=build_motion_tasks(motion_task_names),
+        motion_tasks=(
+            build_motion_tasks(motion_task_names)
+            if motion_tasks_override is None else tuple(motion_tasks_override)
+        ),
         observers=build_observers(capture_directory),
         gimbal_output=gimbal_output,
     )
@@ -49,12 +54,15 @@ def _find_evidence_sink(coordinator):
     return None
 
 
-def record_runtime_diagnostics(coordinator, marker_source) -> None:
+def record_runtime_diagnostics(coordinator, marker_source, robot_source=None) -> None:
     """把接线层的自检结果写进本次运行记录（report.md 的独立小节）。
 
     为什么要有这一步：时间线只能告诉你"某个模块没接管"，看不出原因。数字标识
     尤其依赖 SDK 的 marker 订阅，而订阅可能**静默失败**——颜色过滤器只能设一个、
     坐标模式猜错、回调频率不够。跑一次就把这些一起写进记录，下次不用靠猜。
+
+    障碍物模块（v10 起）拿 SDK 的"机器人识别"当主路径，同理由集成层订阅后喂给它；
+    订阅失败时它会退回灰度结构判据（误触发率明显更高），所以这一小节必须记下来。
 
     **必须在 `coordinator.close()` 之前调用**（close 会写 report.md）。
     和 main 里其它辅助函数一样：绝不抛异常，绝不影响开车。
@@ -69,12 +77,26 @@ def record_runtime_diagnostics(coordinator, marker_source) -> None:
                 "数字标识观测（SDK marker 订阅）",
                 {"状态": "本次运行没有建立 marker 订阅，数字标识不会接管"},
             )
-            return
-        values = dict(marker_source.stats())
-        warning = marker_source.rate_warning()
-        if warning:
-            values["提醒"] = warning
-        record("数字标识观测（SDK marker 订阅）", values)
+        else:
+            values = dict(marker_source.stats())
+            warning = marker_source.rate_warning()
+            if warning:
+                values["提醒"] = warning
+            record("数字标识观测（SDK marker 订阅）", values)
+    except Exception:
+        pass
+    try:
+        if robot_source is None:
+            record(
+                "障碍物观测（SDK 机器人识别）",
+                {"状态": "本次运行没有建立 robot 订阅，障碍模块退回灰度结构判据"},
+            )
+        else:
+            values = dict(robot_source.stats())
+            warning = robot_source.rate_warning()
+            if warning:
+                values["提醒"] = warning
+            record("障碍物观测（SDK 机器人识别）", values)
     except Exception:
         pass
 
@@ -143,6 +165,35 @@ def feed_marker_observations(coordinator, source, frame, now) -> int:
             continue
         try:
             push(candidates)
+            fed += 1
+        except Exception:
+            pass
+    return fed
+
+
+def feed_robot_observations(coordinator, source, frame, now) -> int:
+    """把 SDK"机器人识别"的新鲜观测推给需要它的任务（障碍模块的主路径）。
+
+    **必须每帧在 coordinator.step() 之前调用**：任务自己不能碰 SDK，而且它靠
+    `observed_at` 判断观测是否过期，所以这里必须把**回调接收时刻**原样传下去，
+    不能刷新成 now —— 否则一个早就开走的车会被当成新鲜观测。
+
+    空元组表示"这一帧没有识别到机器人"，同样要推下去，任务会据此清掉旧框。
+    返回这一帧被喂到的任务数（给日志和测试用）。绝不抛异常。
+    """
+    if source is None:
+        return 0
+    try:
+        rows, observed_at = source.observations(frame)
+    except Exception:
+        rows, observed_at = (), None
+    fed = 0
+    for task in getattr(coordinator, "motion_tasks", ()):
+        push = getattr(task, "update_robot_observations", None)
+        if not callable(push):
+            continue
+        try:
+            push(rows, observed_at)
             fed += 1
         except Exception:
             pass
@@ -218,12 +269,17 @@ class ConsoleStatus:
         except Exception:
             pass
 
-    def update(self, decision, now: float, saved_evidence: int = 0) -> None:
-        """每帧调用一次。只在这里判断"要不要打"，绝不抛异常。"""
+    def update(self, decision, now: float, saved_evidence: int = 0,
+               claims=()) -> None:
+        """每帧调用一次。
+
+        `claims` 是协调器"竞争探测帧"的结果（那一刻每个模块各自想不想接管）。
+        只在这里判断"要不要打"，绝不抛异常。
+        """
         if not self.enabled:
             return
         try:
-            self._update(decision, now, saved_evidence)
+            self._update(decision, now, saved_evidence, claims)
         except Exception:
             pass
 
@@ -249,7 +305,7 @@ class ConsoleStatus:
         except Exception:
             pass
 
-    def _update(self, decision, now: float, saved_evidence: int) -> None:
+    def _update(self, decision, now: float, saved_evidence: int, claims=()) -> None:
         if self.started_at is None:
             self.started_at = now
         self.frames += 1
@@ -267,7 +323,7 @@ class ConsoleStatus:
                 self._task_started_at = now
                 self._say(
                     now,
-                    ">> %s 接管：%s" % (name or self._task_name or "?", message),
+                    ">>> 模块开始运行：%s ｜ %s" % (name or self._task_name or "?", message),
                 )
                 not_asked = self._modules_after(name or self._task_name)
                 if not_asked:
@@ -275,7 +331,7 @@ class ConsoleStatus:
                     # 这些模块这一帧根本没被问过。这就是"优先级被截断"的位置。
                     self._say(
                         now,
-                        "   优先级截断：排在它后面、这一帧没被问到的模块 → %s"
+                        "    优先级截断：排在它后面、这一帧没被问到的模块 → %s"
                         % ", ".join(not_asked),
                     )
             elif state == RELEASING and previous == TASK_ACTIVE:
@@ -283,7 +339,7 @@ class ConsoleStatus:
                 status = getattr(getattr(update, "status", None), "name", None)
                 self._say(
                     now,
-                    "<< %s 结束（%s，共 %.1fs）：%s"
+                    "<<< 模块结束运行：%s（%s，共 %.1fs）｜ %s"
                     % (
                         self._task_name or "?",
                         status or "-",
@@ -319,6 +375,9 @@ class ConsoleStatus:
                 ">>> 得分截图已保存（本次第 %d 张）" % self.saved_evidence,
             )
 
+        if claims:
+            self._say(now, self._competition_text(claims))
+
         if self._last_heartbeat is None:
             # 第一帧不打心跳：启动横幅已经说明"还活着"，再打一行是噪音。
             self._last_heartbeat = now
@@ -332,6 +391,26 @@ class ConsoleStatus:
             if now - self._last_heartbeat >= interval:
                 self._last_heartbeat = now
                 self._say(now, self._heartbeat_text(decision, now))
+
+    def _competition_text(self, claims) -> str:
+        """把"谁在竞争、最后判给谁"写成一行（只在协调器的探测帧出现）。
+
+        正常帧协调器遇到第一个 RUNNING 就停，后面的模块**根本不会被问**；
+        探测帧（默认每 3 秒一次）会把所有模块都问一遍，这里就把它如实打出来。
+        """
+        wanted = [c for c in claims if c.get("status") == "RUNNING"]
+        quiet = [c for c in claims if c.get("status") != "RUNNING"]
+        parts = ["竞争探测：本帧问了 %d 个模块" % len(claims)]
+        if wanted:
+            parts.append("想接管 → %s" % "、".join(
+                "%s(%s)" % (c.get("name"), (c.get("message") or "—")[:28]) for c in wanted))
+        else:
+            parts.append("无人想接管 → 继续巡线")
+        if quiet:
+            parts.append("不想 → %s" % "、".join(str(c.get("name")) for c in quiet))
+        if wanted:
+            parts.append("判给 %s（顺序里第一个想接管的）" % wanted[0].get("name"))
+        return "?? " + " ｜ ".join(parts)
 
     def _heartbeat_text(self, decision, now: float) -> str:
         bits = [
@@ -453,7 +532,10 @@ def _align_camera(ep_robot, output, robot_module) -> None:
 def main(
     motion_task_names=None,
     marker_subscription=True,
+    robot_subscription=True,
     run_label="FULL",
+    motion_tasks_override=None,
+    gimbal_output_factory=None,
 ) -> None:
     # Keeping this import inside main makes every offline import hardware-safe.
     from robomaster import camera, robot
@@ -463,6 +545,7 @@ def main(
     output = None
     gimbal_output = None
     marker_source = None
+    robot_source = None
     stream_started = False
     follower = LineFollower(CONFIG)
     coordinator = None
@@ -486,12 +569,17 @@ def main(
         output = MotionOutput(ep_robot.chassis, CONFIG)
         _align_camera(ep_robot, output, robot)
         print("[main] 云台就位，正在打开视频流 ...", flush=True)
-        gimbal_output = GimbalOutput(ep_robot.gimbal, CONFIG)
+        gimbal_output = (
+            GimbalOutput(ep_robot.gimbal, CONFIG)
+            if gimbal_output_factory is None
+            else gimbal_output_factory(ep_robot, CONFIG, robot)
+        )
         coordinator = build_coordinator(
             follower,
             output,
             gimbal_output=gimbal_output,
             motion_task_names=motion_task_names,
+            motion_tasks_override=motion_tasks_override,
         )
         resolution_name = f"STREAM_{CONFIG.camera_resolution.upper()}"
         resolution = getattr(camera, resolution_name)
@@ -508,6 +596,11 @@ def main(
                 CONFIG.marker_coordinate_mode,
             )
             marker_source.start()
+        # 障碍物模块的观测来源：SDK 的"机器人识别"（v10 起是它的主路径）。
+        # 同样在视频流起来之后订阅；订阅失败它只是退回灰度结构判据，不影响巡线。
+        if robot_subscription:
+            robot_source = RobotObservationSource(ep_robot.vision)
+            robot_source.start()
         source = LatestFrameSource(
             ep_robot.camera,
             CONFIG.camera_strategy,
@@ -539,6 +632,11 @@ def main(
             % ("成功" if marker_source is not None and marker_source.enabled
                else "未订阅")
         )
+        console.note(
+            "robot 订阅（障碍模块主路径）：%s"
+            % ("成功" if robot_source is not None and robot_source.enabled
+               else "未订阅（障碍会退回灰度结构判据，误触发率更高）")
+        )
         console.note("提示：丢线/接管/异常都会打在这里，不用盯 cv2 窗口。")
 
         while True:
@@ -560,6 +658,7 @@ def main(
                 last_sequence = packet.sequence
                 # 先把新鲜观测喂给任务，再让它 step，否则它看到的是上一帧的数据。
                 feed_marker_observations(coordinator, marker_source, packet, now)
+                feed_robot_observations(coordinator, robot_source, packet, now)
                 decision = coordinator.step(packet, now)
                 # Final 的得分截图链：任务交出请求 -> 证据层画框写字存盘 ->
                 # 回传真实结果。放在 step() 之后，任务在等回执期间会保持接管。
@@ -567,7 +666,8 @@ def main(
                 # 运行记录：把这一帧的接管/释放/限幅/异常写进本次运行的 report.md。
                 record_run_events(coordinator, decision, now)
                 # 终端反馈：状态变化 + 心跳。丢线、接管、异常都会打出来。
-                console.update(decision, now, saved)
+                # claims = 协调器"竞争探测帧"的结果（谁想接管、判给了谁）。
+                console.update(decision, now, saved, coordinator.last_claims)
                 if CONFIG.display:
                     cv2.imshow(
                         "Low-speed line base",
@@ -602,7 +702,7 @@ def main(
             output.hard_stop()
         if coordinator is not None:
             # 先把自检结果写进记录，再 close（close 会生成 report.md）。
-            record_runtime_diagnostics(coordinator, marker_source)
+            record_runtime_diagnostics(coordinator, marker_source, robot_source)
             # Flush and close the evidence recorder after the chassis stop.
             coordinator.close()
         if gimbal_output is not None:
@@ -610,11 +710,20 @@ def main(
                 gimbal_output.restore_line_view()
             except Exception:
                 pass
+            close_gimbal_output = getattr(gimbal_output, "close", None)
+            if callable(close_gimbal_output):
+                try:
+                    close_gimbal_output()
+                except Exception:
+                    pass
         if source is not None:
             source.close()
         if marker_source is not None:
             # 退订 marker 识别：不能把 SDK 的订阅留给下一次运行。
             marker_source.stop()
+        if robot_source is not None:
+            # 退订机器人识别：同样不能把 SDK 的订阅留给下一次运行。
+            robot_source.stop()
         if stream_started:
             try:
                 ep_robot.camera.stop_video_stream()

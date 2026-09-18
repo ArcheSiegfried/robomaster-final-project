@@ -65,6 +65,28 @@ def junction_frame(split_y: int = 220) -> np.ndarray:
     return image
 
 
+def junction_scene(car_yaw: float = 0.0, tilt0: float = 30.0,
+                   travel: float = 0.0, pass_at: float = 0.18) -> np.ndarray:
+    """按"车已经转过 ``car_yaw`` 度"画出岔路口（A23 的自标定收尾要求带子真的转竖直）。
+
+    偏斜角与转动量按实车量到的 1:1 关系给（车转 1°，带子偏斜减 1°）。
+    """
+    if float(travel) >= float(pass_at):
+        # A24：口子已经在车后 —— 画面里只剩选中的那条带子
+        image = _ground()
+        cv2.line(image, (WIDTH // 2, HEIGHT - 2), (WIDTH // 2, 20), TAPE, 24)
+        return image
+    image = _ground()
+    fork_y, far_y = 290, 120
+    rows = float(fork_y - far_y)
+    cv2.line(image, (WIDTH // 2, fork_y), (WIDTH // 2, HEIGHT - 2), TAPE, 24)
+    tilt = max(0.0, float(tilt0) - abs(float(car_yaw)))
+    dx = rows * float(np.tan(np.radians(tilt)))
+    cv2.line(image, (WIDTH // 2, fork_y), (int(round(WIDTH // 2 + dx)), far_y), TAPE, 24)
+    cv2.line(image, (WIDTH // 2, fork_y), (int(round(WIDTH // 2 - 170)), far_y), TAPE, 24)
+    return image
+
+
 def green_right(frame: FramePacket, now: float) -> Optional[LightReading]:
     """假的红绿灯模块：这里永远报"右边是绿灯"。"""
     return LightReading(color=LightColor.GREEN, branch=Branch.RIGHT)
@@ -92,13 +114,13 @@ def run_demo(light_probe=green_right) -> List[str]:
     output.claim("external")
     trace.append("owner:%s" % output.owner)
     now += FRAME_DT
-    update = task.step(FramePacket(junction_frame(), 2, now), now, tracking.detection)
+    update = task.step(FramePacket(junction_scene(0.0), 2, now), now, tracking.detection)
     if update.status is not TaskStatus.NOT_TRIGGERED:
         raise RuntimeError("junction confirmed on the first frame; expected confirmation")
     now += FRAME_DT
-    update = task.step(FramePacket(junction_frame(), 3, now), now, tracking.detection)
+    update = task.step(FramePacket(junction_scene(0.0), 3, now), now, tracking.detection)
     now += FRAME_DT
-    update = task.step(FramePacket(junction_frame(), 4, now), now, tracking.detection)
+    update = task.step(FramePacket(junction_scene(0.0), 4, now), now, tracking.detection)
     if update.status is not TaskStatus.RUNNING:
         if light_probe is None:
             # 一个判据来源都没有（没有探针、fallback_color 也是 "none"）：
@@ -110,8 +132,15 @@ def run_demo(light_probe=green_right) -> List[str]:
     trace.append("task:running")
 
     # 3) 转向：请求被送到唯一运动出口
-    now += FRAME_DT
-    update = task.step(FramePacket(junction_frame(), 5, now), now, tracking.detection)
+    #    "哪边是绿灯"要连续 light_confirm_frames 帧都成立才转身（A15），
+    #    所以这里最多走三帧等它确认完。
+    sequence = 5
+    for _ in range(3):
+        now += FRAME_DT
+        update = task.step(FramePacket(junction_scene(0.0), sequence, now), now, tracking.detection)
+        sequence += 1
+        if task.chosen_branch is not None:
+            break
     if task.chosen_branch is None:
         # 没有灯判据时模块只能停着等，最后必然失败；这是设计好的保守行为。
         trace.append("task:waiting:%s" % update.message)
@@ -122,13 +151,18 @@ def run_demo(light_probe=green_right) -> List[str]:
 
     # 4) 继续转够 turn_min_duration：车的相机在转向时仍能看到岔路，
     #    同时巡线模块已经在左/右分支上重新找到线并居中 → 完成
-    sequence = 6
     update = None
-    for _ in range(6):
+    car_yaw = 0.0
+    travel = 0.0
+    for _ in range(60):   # A28：偏置增益降到 0.6（偏置只当轻推），转完需要更多帧
         now += FRAME_DT
+        if update is not None and update.motion is not None:
+            car_yaw += float(update.motion.yaw) * FRAME_DT
+            travel += float(update.motion.forward) * FRAME_DT
         decision = follower.process_frame(straight_frame(), now)
         update = task.step(
-            FramePacket(junction_frame(), sequence, now), now, decision.detection
+            FramePacket(junction_scene(car_yaw, travel=travel), sequence, now),
+            now, decision.detection,
         )
         sequence += 1
         if update.status is TaskStatus.COMPLETED:

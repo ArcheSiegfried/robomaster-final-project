@@ -30,6 +30,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 import route_detector  # noqa: E402
+import route  # noqa: E402
 from route import RouteTask  # noqa: E402
 
 #: 旧线在世界坐标里的切向（0° = 与画面水平方向一致）。
@@ -41,10 +42,17 @@ SWEEP_OFFSETS = (0.0, 15.0, -15.0, 30.0, -30.0, 45.0, -45.0, 60.0, -60.0, 90.0, 
 
 
 def candidate_seen_at(sweep_deg: float, world_tangent: float = RIGHT_ANGLE_WORLD):
-    """车体转过 `sweep_deg` 之后，那条世界角 90° 的新线在**图像里**的样子。"""
+    """车体转过 `sweep_deg` 之后，那条世界角 90° 的新线在**图像里**的样子。
+
+    2026-09-17 更新夹具：作者的新线加了一道闸
+    ``route.MIN_LOCK_BRANCH_PIXELS``（"太小/太远的碎片不许进时序跟踪"），
+    所以样本的 ``branch_length`` 必须**不低于该常量**，否则会被那道闸（而不是被
+    角度判据）拒掉。这里直接引用模块常量，避免以后调参又让本测试莫名其妙变红。
+    """
     image_tangent = world_tangent - sweep_deg
     endpoint = route_detector.RouteEndpoint(
-        point=(300, 200), tangent_deg=image_tangent, internal=True, branch_length=40.0
+        point=(300, 200), tangent_deg=image_tangent, internal=True,
+        branch_length=float(route.MIN_LOCK_BRANCH_PIXELS) + 20.0,
     )
     return route_detector.RouteCandidate(
         detection=None, angle_deg=image_tangent, near=False, bottom_ratio=0.5,

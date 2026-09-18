@@ -21,8 +21,6 @@
 运行时判据不成立就 ``FAILED`` 停车，宁可不动也不瞎动。
 
 ============  ==========================================================
-假设编号       内容
-============  ==========================================================
 A1            岔路是"蓝色巡线带一分为二"，两条分支都是蓝色（``require_blue_branches``）。
               如果正式赛道用别的颜色/材质，改 HSV 区间即可。
 A2            岔路出现在画面上方：分叉带（同一行上被空隙拉开的蓝色带）落在 ROI 的
@@ -45,17 +43,20 @@ A4            分叉带的上沿离 ROI 底部还要有 ``min_branch_pixels_belo
               开过岔路，这时不触发。
 A5            图像中心 = 车头正前方。相机水平视野 ``horizontal_fov_deg`` 默认 70 度，
               用来把像素偏移换算成转向角；这个值只影响转多少，不影响选哪边。
-A6            灯的判据由 **3 号（traffic_light.py）** 提供。本模块通过注入的
-              ``light_probe(frame, now) -> LightReading`` 读取，自己不认红绿灯
-              （``LIGHT_OWNER`` 常量说明这个边界）。没有注入探针时，唯一可用的判据是
-              ``fallback_color``，默认 ``"none"`` 表示"没有判据"：**这种配置下本模块
-              连接管都不接管**（``require_rule_source``），把岔路让给后面注册的
-              ``free_junction``；否则它只可能白停 ``decision_timeout`` 秒再 FAILED。
+A6            "绿灯在哪一边"的来源，按优先级：**(1)** 注入的 ``light_probe(frame, now)``
+              （整合层还可以自己接，返回**一盏** ``LightReading``、**左右两盏**的列表、
+              或者空的 ``[]``）；**(2)** 没有注入时用本模块内置的 :class:`LampSpotter`
+              （``builtin_lamp_detection``，默认开，见 A17）；**(3)** 两者都没给出读数时
+              才轮到 ``fallback_color``（默认 ``"none"`` = 没有判据）。
+              一条读数都没有时 **本模块连接管都不接管**（``require_rule_source``），
+              岔路让给后面注册的 ``free_junction``；不会白停 ``decision_timeout`` 秒。
 A7            两条分支都是绿灯、或者灯只报了一个颜色没有报位置时，
               ``fallback_rule`` 决定走哪边；默认 ``"straightest"``（走最接近车头正前方的那边）。
 A8            转向是一段有限动作：yaw = 选中分支的偏角 × ``yaw_gain``，被
               ``max_turn_yaw`` 限幅，总时长不超过 ``turn_timeout``；
               转够了并且重新看到线，就 ``COMPLETED`` 交回巡线。
+              "转够了"的判据见 A21：转过的角度达到锁死偏角，而不是拿锁死偏角
+              本身当"对齐了没有"（那样大偏角会一直转到失控）。
 A9            走过一个岔路后 ``rearm_cooldown`` 秒内不再重复触发，避免同一次岔路被处理两遍。
 A10           转向时前进速度与转向量成比例（``forward = forward_speed × |yaw| / max_turn_yaw``）：
               没选出分支时 yaw 为 0，前进也必须是 0，也就是"等判据时原地停着"。
@@ -68,13 +69,82 @@ A11           "线回到画面中央"这个判据**不依赖框架传参**：协
 A12           只有"分叉带已经贴到最后一截画面"（``drove_past_fork_row_ratio``）
               才可能判"车已经开过岔路口"：正常进近时车头前方的带子是单条且居中，
               和"开过了"长得一样，不加上这一条就会把正常进近误判成失败。
-A13           灯的**位置**可以拿来选边：探针给的读数如果带画面里的像素坐标
-              （``center``），左半边 → 走左分支，右半边 → 走右分支；没有坐标时才用
-              ``fallback_rule``。见 :func:`make_light_probe`。
+A13           灯的**位置**可以拿来选边：读数带画面里的像素坐标（``center``）时，
+              左半边 → 走左分支，右半边 → 走右分支。
+              两盏灯分居两侧时用 :func:`make_two_lamp_probe`（它把画面竖着切成两半，
+              左右各问一次 3 号的检测器，见 A15/A16）。
 A14           "接了探针"不等于"有判据"：只有**这一帧真的拿到一个能用的读数**
-              （红灯或绿灯；``UNKNOWN`` / ``None`` / 探针抛异常都不算）才认为自己适用。
+              （红灯或绿灯；``UNKNOWN`` / 空列表 / 探针抛异常都不算）才认为自己适用。
               否则只要岔路一出现就会接管、白等 ``decision_timeout`` 再失败，
               把岔路从后面的模块手里抢走（``require_rule_source``）。
+A15           **本关卡的真实要求**：第一个岔路口在**两边各放一盏灯**（一边红一边绿），
+              灯立在**路旁边**（不挡在路中间）；车要往**绿灯那一侧**的路走。
+              所以判据是"绿灯在哪一边"，不是"有没有绿灯"：
+              绿灯在左 → 走左分支，绿灯在右 → 走右分支（A13 负责把位置翻成左右）。
+A16           只知道"看到绿灯"、不知道在哪边，但**知道某一边是红灯**时，
+              走另一边（例如"左边是红灯 + 某处有绿灯"→ 走右边）。
+              这是 A15 的降级判据，用在只有一盏灯被认出、另一盏被遮挡的时候。
+A17           **为什么灯判据归本模块**：2026-09-16 团队把 ``traffic_light.py`` 删了
+              （``6dc2c1f``：赛题里没有"独立的红绿灯停车"这一项，而它在实车上反复
+              把红色物体判成红灯、原地锁停）。可第一个岔路口两边各有一盏灯、
+              车要往绿灯那边走，这个判据必须有人给 —— 所以由 :class:`LampSpotter`
+              内置提供（算法取自 3 号那版 ``vision_tasks.py``：HSV 区间、半径 6~90、
+              圆度 ≥0.85、候选灯圆内的红/绿像素竞争）。与那个被删模块的**三点不同**：
+              (1) 一次扫描**两盏都报**（它只报一盏且红优先）；
+              (2) **从不为了红灯停车/占住控制权** —— 只有真的看到绿灯才接管；
+              (3) 只在**检测到岔路的帧**才调用，不给主循环加每帧一次的灯检测。
+A18           官方规则（2026-09-16）：岔道口可以**一红一绿**、也可以**只放红灯**或
+              **只放绿灯**。所以岔路选道判据补一条：**一个绿灯都没有、但知道某一边
+              是红灯** → 红的那边不能走，走另一边（``red_blocks_branch``，默认开）；
+              两边都红 → 不走。注意这条只对"这个岔路口从头到尾没见过绿灯"成立：
+              先看到绿灯、后来只剩红灯时**不许顺手猜另一边**，而是停车（FAILED）。
+A19           （留给别人）"自选地点红灯停绿灯行"是**另一个记分任务、由别人负责**，
+              本模块**不做**这件事：它只在岔道口选道。所以本模块**不会**为了红灯
+              在路中间把车按停 —— 那正是当初 ``traffic_light`` 被删掉的行为
+              （``6dc2c1f``）。
+A20           "左/右"只在灯**明显偏向一侧**时才可信：实车日志里灯举在车头正前方时，
+              灯心会在画面中线附近来回走（画面宽 640，``x=321 → 319`` 就翻边），
+              这个标签在决策那一瞬间就是噪声。``lamp_center_deadband``（占画面宽度
+              比例，默认 0 = 关闭）把中线两侧划成"不认边"的死区：死区里的灯只报
+              颜色、``branch=None``，由 ``fallback_rule`` 兜底 —— 配 ``"none"`` 就是
+              "分不清左右就原地等，宁可超时失败也不乱拐一条边"。
+A21           锁死的分支偏角是**转动目标**，不是"对齐了没有"的判据：决策时锁下
+              ``_chosen_bearing``（治 yaw 逐帧抖动），随后在 TURN 里积分
+              ``yaw × dt`` 到 ``_turn_rotated_deg``，转过
+              ``|锁死偏角| - branch_align_deg`` 就结束转向，并按剩余角度缓出。
+              退出 TURN 三条任一即可：线回画面中央 / **当前帧**算出的偏角已收敛
+              （live，不是那个常量）/ 已转过目标角度。实车教训（2026-09-17 22:09）：
+              拿锁死常量当收敛判据时，偏角 -22.5° 会让 yaw 恒为 -45°/s 一直转，
+              1.8 秒转过约 80° 把巡线带转出画面，最后以
+              ``line did not return after the turn`` 失败；而偏角恰好 ≤6° 的那次
+              却能成功 —— 成功与否取决于岔路几何的巧合。
+A24           **完成**（交回巡线）只有一个条件：**口子已经在车后** —— 岔路形态消失
+              ＋ 近处那条带子居中。``aligned``（选中的带子在画面里竖直）只用来**停止
+              转向**，不能当完成：在"直道 + 侧支"的场地上，绿灯那侧常常就是直着走的
+              那条带子，它本来就竖直，于是模块会在口子还在车头前面时就交回巡线，
+              巡线转头挑另一条带子（2026-09-18 新场地实测：一次选 left、一次选 right，
+              车**两次都走左边**，选边等于没生效）。对准之后 SETTLE 阶段以
+              ``forward_speed`` 往前开，把口子顶到车后；``settle_timeout`` 内顶不过去
+              就明确失败停车，绝不交回巡线去猜。
+A23           转向的**收尾判据与场地无关**：不认"转了多少度"，只认"选中的那条带子
+              是不是已经在车正前方"——(1) 岔路还看得见时，看那条分支的**带子方向**
+              是否已在画面里竖直（``tilt``，与相机光轴平行的地面直线，消失点在画面
+              中线、成像是竖直的，不需要标定俯仰）；(2) 岔路形态已经散掉、而近处那条
+              带子居中时，说明口子已在车后、车压上了新带子（这时检测散掉是预期的）。
+              两者都不成立就继续转，只有 ``turn_max_deg``（默认 90°，很宽的安全上限）
+              兜底 —— **正常场地永远碰不到，所以现场不需要试任何角度**。
+              单独"近处带子居中"不算数：还没转的时候那条居中带子就是车自己上来的主带
+              （2026-09-17 22:28 就是这么误判成"进了分支"、结果拐上另一条路）。
+              到上限还没对准 → 明确失败停车，绝不交回巡线去猜一条边。
+A21b          转到位之后**不许再加转**，而且岔路口的“进了分支”要用分支几何来判：
+              (1) ``_turn_command`` 在 ``_turn_still_needed()`` 为假时 yaw 直接给 0
+              （SETTLE 只保留 ``_SETTLE_CREEP`` 那一档爬行，不带角速度）——
+              实测残余角速度会让线在画面里越跑越远（settle 期间 y=-10.3°/s，``e`` 从 +0.41 漂到 +0.76）；
+              (2) ``_step_settle`` 的完成判据除“线回中央”外，也接受**当前帧**算出的
+              选中分支偏角 ≤ ``branch_align_deg``（分支已在车头正前方）。原因：
+              岔路口整条 Y 是**一个**连通块（离线对照：``junction_frame`` 的 conf=1.00 就是整块 Y），
+              巡线采样中心永远回不到 320，“线回中央”在路口根本不可能成立 ——
+              2026-09-17 22:20 那次就是这样白等到超时，失败后交回巡线，车跟着看到的带走了另一条分支。
 ============  ==========================================================
 
 修订说明（2026-09-15 实车测试报告）：本次改了三处，全部只在本文件里，
@@ -89,16 +159,43 @@ A14           "接了探针"不等于"有判据"：只有**这一帧真的拿到
    否则 ``TURN → SETTLE → COMPLETED`` 这两道门在实车上恒为 False，只能超时失败。
 3. ``_opens_upward`` 里 ``span`` 可能算成 0 → ``sum/span`` 除零（实车日志出现过
    34 条 ``float division by zero``）。新实现里 ``span <= 0`` 直接判否。
+
+修订说明（2026-09-16 之后，实车两灯场景 + ``traffic_light`` 被删）：
+
+4. 本关卡的真实要求是"岔路两边各一盏灯（一边红一边绿），往绿灯那边走"（A15）。
+   原来那个"整帧只报一盏、红优先"的灯模块在这种画面上永远只报红，接上也走不了；
+   所以判据改成"绿灯在哪一边就走哪边"（A15），并加了 A16 的降级规则。
+5. ``traffic_light.py`` 被团队删除（``6dc2c1f``）后，本模块内置 :class:`LampSpotter`
+   自己认灯（A17），**不需要任何别的模块或注册表接线**就能在实车上工作；
+   注入式 ``light_probe`` / ``make_light_probe`` / ``make_two_lamp_probe`` 仍然保留，
+   谁想自己接灯都可以接（优先级高于内置）。
+6. 适用性再收紧一档（A14）：**只有真的拿到绿灯读数才接管**。只有红灯时本模块
+   完全不接管（岔路交给后面的模块），绝不重演"为了红灯原地锁停"那件事；
+   只有在**已经接管之后**灯才变红的情况下，才会原地停 + 超时 FAILED。
+
+修订说明（2026-09-16 官方规则补充：红绿灯规则）：
+
+7. 官方明确：岔道口可以"一红一绿 / 只放绿灯 / 只放红灯"，**另外**还要在**自选地点**
+   实现"红灯停绿灯行"，**两个任务分别记分**。于是：
+   * 岔路选道补 A18（只放红灯 → 红的那边不能走，走另一边）；
+   * "自选地点的红灯停绿灯行"（官方说的第二个记分任务）**由别人负责**，本模块不做；
+     本模块只在岔道口选道，并且**绝不为红灯在路中间停车**。
 """
 
-from dataclasses import dataclass
+from __future__ import annotations
+
+import collections.abc
+from dataclasses import dataclass, replace
 from enum import Enum
 from typing import Callable, List, Optional, Sequence, Tuple
 
 import inspect
+import math
 
 import cv2
 import numpy as np
+
+from evidence import make_evidence_photo
 
 from models import (
     FramePacket,
@@ -109,8 +206,14 @@ from models import (
     VisualDetection,
 )
 
-#: 红绿灯判据的归属者。本模块只消费结果，不自己认灯（与 3 号的边界）。
-LIGHT_OWNER = "traffic_light.py"
+#: 灯判据的归属者。2026-09-16 之前是 ``traffic_light.py``（3 号那个模块），
+#: 但团队在 ``6dc2c1f`` 把它删了（理由：赛题里没有"独立的红绿灯停车"这一项，
+#: 而它在实车上反复把红色物体判成红灯、原地锁停）。而第一个岔路口**两边各有一盏灯**，
+#: "绿灯在哪一边"这个判据必须有人给 —— 现在归本模块（见 A17）。
+LIGHT_OWNER = "green_junction.py"
+
+#: 灯判据的来源可能来自外部注入，所以保留这个迁移点；见 ``LampSpotter``。
+LIGHT_OWNER_LEGACY = "traffic_light.py"
 
 #: 零速度。未触发、完成、失败时都返回它，coordinator 收到信号后可以随时硬停车。
 STOP = MotionCommand()
@@ -154,15 +257,20 @@ class LightReading:
 
     ``branch`` 为 ``None`` 表示这一读数没有位置信息（只知道"看到绿灯"，
     不知道是哪一边的绿灯）——这时按 A7 的 ``fallback_rule`` 处理。
+    ``radius`` 只是给日志/自测看的尺寸信息（像素），判据不看它。
     """
 
     color: LightColor = LightColor.UNKNOWN
     branch: Optional[Branch] = None
     confidence: float = 0.0
+    radius: float = 0.0
+    center: Optional[Tuple[float, float]] = None   # 整幅图像素坐标，只给日志/自测用
 
 
 #: 灯判据的读取接口。3 号/1 号把它的函数注入进来即可，不需要本模块依赖 3 号的文件。
-LightProbe = Callable[[FramePacket, float], Optional[LightReading]]
+#: 返回值可以是**一盏**读数（``LightReading``）、**左右两盏**的列表/元组/生成器、
+#: 空列表 ``[]``、``None``，或者 :func:`make_light_probe` 认得的那几种对象（A6）。
+LightProbe = Callable[[FramePacket, float], object]
 
 #: 3 号 ``VisualDetection.color`` / ``TaskUpdate`` 里的颜色字符串 → 本模块的枚举。
 _LIGHT_COLOR_NAMES = {"green": LightColor.GREEN, "red": LightColor.RED}
@@ -217,6 +325,62 @@ def _reading_from(
     return LightReading(color=color, branch=branch, confidence=confidence)
 
 
+def _iter_probe_values(value):
+    """把探针返回值拆成"一个一个待解释的对象"（支持一次给左右两盏）。"""
+    if value is None:
+        return []
+    if isinstance(value, (str, bytes, LightReading)):
+        return [value]
+    if isinstance(value, np.ndarray):  # 不是读数的数组，按"看不懂"处理
+        return [value]
+    if isinstance(value, collections.abc.Iterable):
+        items = []
+        for item in value:
+            items.extend(_iter_probe_values(item))
+        return items
+    return [value]
+
+
+def _as_readings(
+    value,
+    frame=None,
+    infer_branch: bool = True,
+    min_confidence: float = 0.0,
+) -> List[LightReading]:
+    """把探针返回值统一成 :class:`LightReading` 列表。
+
+    支持"一盏"和"左右两盏"两种给法（A6/A15）；看不懂的、置信度不够的丢掉。
+    """
+    readings: List[LightReading] = []
+    for item in _iter_probe_values(value):
+        converted = _reading_from(item, frame, infer_branch, min_confidence)
+        if converted is not None:
+            readings.append(converted)
+    return readings
+
+
+def _resolve_light_source(source):
+    """判断别人给的"灯来源"是什么形状，返回 ``(kind, reader)``。
+
+    ``kind`` 是 ``"detect"``（``reader(image)``）、``"step"``（``reader(frame, now)``）
+    或 ``"image"`` / ``"frame"``（可调用对象，按参数个数判断）。
+    """
+    if hasattr(source, "detect") and callable(getattr(source, "detect")):
+        return "detect", getattr(source, "detect")
+    if hasattr(source, "step") and callable(getattr(source, "step")):
+        return "step", getattr(source, "step")
+    if callable(source):
+        try:
+            single_argument = len(inspect.signature(source).parameters) <= 1
+        except (TypeError, ValueError):
+            single_argument = False
+        return ("image" if single_argument else "frame"), source
+    raise TypeError(
+        "expected a callable, a detector-like (detect(image)) or a task-like "
+        "(step(frame, now)) object"
+    )
+
+
 def make_light_probe(
     source,
     infer_branch_from_position: bool = True,
@@ -224,22 +388,21 @@ def make_light_probe(
 ) -> LightProbe:
     """把"别人给的灯读法"包成本模块要的探针 ``light_probe(frame, now)``（见 A13）。
 
-    3 号（``traffic_light.py``）**没有** ``reading()`` 这个方法，所以整合层不用等它
-    开新接口，下面两样现有东西都能直接接：
+    **一般不需要用它**：本模块内置 :class:`LampSpotter`（A17），什么都不注入就能在
+    实车上认灯。这个函数是留给"整合层手里已经有别处的灯读数"的情况：
 
     ```python
-    from green_junction import make_light_probe
-    from traffic_light import TrafficLightDetector, TrafficLightTask
+    from green_junction import GreenJunctionTask, make_light_probe
 
-    GreenJunctionTask(light_probe=make_light_probe(TrafficLightDetector()))
-    # 或者（用已经带状态、带确认逻辑的那个任务）
-    GreenJunctionTask(light_probe=make_light_probe(TrafficLightTask()))
+    GreenJunctionTask(light_probe=make_light_probe(<别人的检测器>))
+    GreenJunctionTask(light_probe=make_light_probe(<每帧返回 LightReading 的函数>))
     ```
 
     支持的 ``source``：
 
-    * 有 ``detect(image)`` 的对象（例如 ``traffic_light.TrafficLightDetector``）；
-    * 有 ``step(frame, now)`` 的对象（例如 ``traffic_light.TrafficLightTask``）；
+    * 有 ``detect(image)`` 的对象（例如 3 号那版 ``traffic_light.TrafficLightDetector``，
+      或者本模块自己的 :class:`LampSpotter`）；
+    * 有 ``step(frame, now)`` 的对象（每帧返回 ``TaskUpdate``）；
     * 可调用对象：按参数个数自动判断是 ``(frame, now)`` 还是 ``(image)``；
       返回值可以是 :class:`LightReading`、``VisualDetection``、``TaskUpdate``
       或直接是 ``"green"`` / ``"red"`` 字符串。
@@ -248,35 +411,213 @@ def make_light_probe(
     选边（A13）：读数带 ``center``（整幅图像素坐标）且 ``infer_branch_from_position``
     为真时，灯在画面左半边 → ``LEFT``，右半边 → ``RIGHT``；否则 ``branch=None``，
     由 ``fallback_rule`` 决定。看不懂的返回值、探针抛异常，一律按"没有判据"处理。
+
+    对方一次只报一盏、但**两盏灯分居两侧**时，用 :func:`make_two_lamp_probe`
+    把画面左右各问一次（A15）。
     """
-    reader = None
-    if hasattr(source, "detect") and callable(getattr(source, "detect")):
-        reader = lambda frame, now: source.detect(_frame_image(frame))  # noqa: E731
-    elif hasattr(source, "step") and callable(getattr(source, "step")):
-        reader = lambda frame, now: source.step(frame, now)  # noqa: E731
-    elif callable(source):
-        try:
-            parameters = inspect.signature(source).parameters
-            single_argument = len(parameters) <= 1
-        except (TypeError, ValueError):
-            single_argument = False
-        if single_argument:
-            # 例如直接传了绑定方法 detector.detect：它收的是图像，不是 FramePacket。
-            reader = lambda frame, now: source(_frame_image(frame))  # noqa: E731
-        else:
-            reader = source
-    else:
-        raise TypeError(
-            "make_light_probe expects a callable, a detector-like or a task-like object"
-        )
+    kind, reader = _resolve_light_source(source)
 
     def probe(frame, now) -> Optional[LightReading]:
         try:
-            value = reader(frame, now)
+            if kind in ("detect", "image"):
+                value = reader(_frame_image(frame))
+            else:
+                value = reader(frame, now)
         except Exception:
             # 别人的模块出错不能让车失控；按"没有判据"处理（A14）。
             return None
-        return _reading_from(value, frame, infer_branch_from_position, min_confidence)
+        readings = _as_readings(value, frame, infer_branch_from_position, min_confidence)
+        if not readings:
+            return None
+        # 一次给了多盏时，取第一盏绿的；没有绿的取第一盏（颜色信息仍然有用）。
+        for item in readings:
+            if item.color is LightColor.GREEN:
+                return item
+        return readings[0]
+
+    return probe
+
+
+def _packet_like(frame, image: np.ndarray) -> FramePacket:
+    """用同一帧的序号/时刻造一个新的 ``FramePacket``（给裁剪过的半幅图用）。"""
+    return FramePacket(
+        image=image,
+        sequence=int(getattr(frame, "sequence", 0) or 0),
+        captured_at=float(getattr(frame, "captured_at", 0.0) or 0.0),
+    )
+
+
+
+
+def _lamp_visual(reading):
+    """检测读数 → (VisualDetection 或 None, 圆圈 (cx, cy, r) 或 None)。**绝不编坐标。**
+
+    只用检测器真的量到的东西：`LightReading.center`（整幅图像素圆心）与
+    `LightReading.radius`（像素半径，作者 A13 加的字段）。有圆心没半径、
+    或者来源只给了 `box` 但没给坐标时——**画不出圈就不画**，照片只留文字，
+    绝不拿一个估出来的圆心去圈。
+    """
+    if reading is None:
+        return None, None
+    center = getattr(reading, "center", None)
+    cx = cy = None
+    if isinstance(center, (tuple, list)) and len(center) >= 2:
+        cx, cy = float(center[0]), float(center[1])
+    else:
+        inner = getattr(center, "center", None)
+        if isinstance(inner, (tuple, list)) and len(inner) >= 2:
+            cx, cy = float(inner[0]), float(inner[1])
+    radius = float(getattr(reading, "radius", 0.0) or 0.0)
+    if cx is None or cy is None or radius <= 0.0:
+        return None, None
+    color = getattr(reading, "color", None)
+    kind_color = getattr(color, "value", None)
+    detection = VisualDetection(
+        valid=True,
+        kind="green_junction",
+        center=(int(round(cx)), int(round(cy))),
+        confidence=float(getattr(reading, "confidence", 1.0) or 1.0),
+        color=kind_color,
+        box=(
+            int(round(cx - radius)),
+            int(round(cy - radius)),
+            int(round(cx + radius)),
+            int(round(cy + radius)),
+        ),
+    )
+    return detection, (cx, cy, radius)
+
+def _value_center(value):
+    """从别人给的读数里挖出 ``(x, y)``（相对于**传进去的那张图**）；没有就返回 ``None``。"""
+    if value is None or isinstance(value, (str, bytes)):
+        return None
+    inner = getattr(value, "detection", None)
+    if inner is not None:
+        return _value_center(inner)
+    centre = getattr(value, "center", None)
+    if isinstance(centre, (tuple, list)) and len(centre) >= 1:
+        try:
+            x = float(centre[0])
+            y = float(centre[1]) if len(centre) > 1 else 0.0
+        except (TypeError, ValueError):
+            return None
+        return x, y
+    return None
+
+
+def make_two_lamp_probe(
+    source,
+    split: float = 0.5,
+    min_confidence: float = 0.0,
+    overlap: float = 0.08,
+    dead_zone: float = 0.0,
+) -> LightProbe:
+    """左右各问一次，返回**两盏灯的读数列表**（A15：一边红一边绿）。
+
+    为什么需要它：本关卡在岔路口**两边各放一盏灯**（灯立在路边），而 3 号的
+    ``TrafficLightDetector.detect()`` 整帧只挑**一盏得分最高的**，并且
+    ``red_priority=True`` —— 两盏同时可见时它只会报红，直接用就会让车
+    "看到绿灯也不走"。这里改成左右各问一次检测器，再把读数归到左/右分支：
+
+    ```python
+    from green_junction import make_two_lamp_probe
+
+    GreenJunctionTask(light_probe=make_two_lamp_probe(<只报一盏、但带 center 的检测器>))
+    ```
+
+    一般不需要它：本模块内置的 :class:`LampSpotter` 一次就扫出两盏（A17）；
+    这个适配器是留给"整合层手里那个检测器只会报一盏"的情况（当年 3 号那版
+    ``TrafficLightDetector`` 就是这样，而且它还 ``red_priority=True``，
+    两盏同时可见时只会报红）。
+
+    实现上的三个坑（都在这台机器上实测过）：
+
+    * ``split``：切分位置（占画面宽度的比例，默认 0.5）；
+    * ``overlap``：两半之间留的重叠（默认 0.08），**必须有** —— 3 号的 ROI 是
+      按"传进去的那张图"算的，硬按 0.5 裁的话，正好骑在切分线附近的灯会掉到
+      半幅 ROI 外面、形状判据直接把它丢掉（整合侧 `test_green_junction_wiring.py`
+      里那盏 x=300..380 的灯就是这么丢的）。留一点重叠，两边都能看到它；
+    * 归边用灯的**整幅图坐标**（不是"它来自哪一半"）：整幅 x < 切分线 → 左，
+      否则右；同一侧、同一颜色的重复读数按置信度去重。
+    * ``dead_zone``：切分线两侧各留一条"不认边"的死区（占画面宽度比例，默认 0）。
+      灯正好骑在切分线上时，"左/右"其实只是噪声（实车日志里灯心 ``x=321→319``
+      就能翻边），这时读数只报颜色、``branch=None``，由 ``fallback_rule`` 兜底，
+      不要拿一个随机标签去选道。
+
+    ``split`` 在实车上怎么定：用配套工具 ``green_junction_selftest.py --captures``
+    看"左/右灯"那一列（打的就是这个探针的结果）。
+
+    返回 ``[LightReading, ...]``（0／1／2 盏都合法）；某一半看不懂 / 抛异常，
+    只丢那一半，不影响另一半。
+    """
+    kind, reader = _resolve_light_source(source)
+    ratio = min(max(float(split), 0.05), 0.95)
+    span = min(max(float(overlap), 0.0), 0.45)
+    dead = min(max(float(dead_zone), 0.0), 0.30)
+
+    def probe(frame, now) -> List[LightReading]:
+        image = _frame_image(frame)
+        if image is None or getattr(image, "ndim", 0) != 3:
+            return []
+        width = int(image.shape[1])
+        if width < 4:
+            return []
+        cut = int(round(width * ratio))
+        cut = max(1, min(width - 1, cut))
+        margin = int(round(width * span))
+        windows = (
+            (0, max(1, min(width, cut + margin))),
+            (max(0, min(width - 1, cut - margin)), width),
+        )
+        kept = {}
+        for start, stop in windows:
+            crop = image[:, start:stop]
+            if crop.size == 0:
+                continue
+            try:
+                if kind in ("detect", "image"):
+                    value = reader(crop)
+                else:
+                    value = reader(_packet_like(frame, crop), now)
+            except Exception:
+                continue
+            # 逐个读数取位置：一次给多盏时，每盏按它自己的整幅图坐标归边。
+            for raw in _iter_probe_values(value):
+                readings = _as_readings(raw, None, False, min_confidence)
+                if not readings:
+                    continue
+                centre = _value_center(raw)
+                if centre is not None:
+                    full_x = start + centre[0]
+                    full_y = float(centre[1]) if len(centre) > 1 else 0.0
+                else:
+                    # 读数不带位置（例如对方只返回颜色）：只能按这一半自己的中心算
+                    # —— 左半 → 左，右半 → 右。要知道真实位置就得让来源报 center。
+                    full_x = (start + stop) / 2.0
+                    full_y = 0.0
+                if dead > 0.0 and abs(full_x - cut) < dead * width:
+                    # 骑在切分线上：不认边（A20），只报"看到某色的灯"。
+                    side = None
+                else:
+                    side = Branch.LEFT if full_x < cut else Branch.RIGHT
+                for item in readings:
+                    reading = LightReading(
+                        color=item.color,
+                        branch=side,
+                        confidence=item.confidence,
+                        # 位置和尺寸要往下传：日志/自测靠它判断"这盏灯在哪、
+                        # 是哪一帧的哪一块"，丢了就只剩一个左/右的字。
+                        radius=float(getattr(item, "radius", 0.0) or 0.0),
+                        center=(float(full_x), full_y),
+                    )
+                    key = (side, item.color)
+                    previous = kept.get(key)
+                    if previous is None or reading.confidence > previous.confidence:
+                        kept[key] = reading
+        order = {Branch.LEFT: 0, Branch.RIGHT: 1}
+        return sorted(
+            kept.values(), key=lambda item: (order.get(item.branch, 2), -item.confidence)
+        )
 
     return probe
 
@@ -328,6 +669,9 @@ class JunctionConfig:
     min_split_row_offset: int = 1    # 距 ROI 顶部的安全边距（行）
     max_branch_center_offset: float = 0.85  # 分支中心相对 ROI 中心的允许偏移
     line_center_deadband: float = 0.18      # 线偏多少还算"在中央"
+    # ---- 得分照片（统一层，2026-09-18 集成侧接入）----
+    team_number: str = "10"          # 写进照片说明文字的队号
+    max_evidence_attempts: int = 2   # 写盘失败最多重试几次，之后放弃照片
     line_valid_confidence: float = 0.20     # 低于此置信度的线检测不算数
     min_junction_confidence: float = 0.25   # 综合置信度门槛
 
@@ -339,6 +683,35 @@ class JunctionConfig:
     near_row_min_run: int = 6     # 窄带里一行多宽才算"一条带"
     near_min_pixels: int = 40     # 窄带里至少要有这么多蓝像素，否则算没看到线
     near_error_deadband: float = 0.20   # 近处带中心的允许偏差（量纲同 line_center_deadband）
+
+    # --- 灯（A15/A17；数值沿用 3 号那版在实车上调过的 vision_tasks.py） ---
+    #: 没有注入 ``light_probe`` 时，用本模块内置的 :class:`LampSpotter` 认灯。
+    builtin_lamp_detection: bool = True
+    #: 红灯两个 H 区间（OpenCV 的 H 是 0~179）。S/V 比"宽松版"高，少误判。
+    lamp_red_hsv: tuple = (((0, 120, 70), (10, 255, 255)), ((170, 120, 70), (179, 255, 255)))
+    #: 绿灯区间。窄一点（H 40~85）是为了避开蓝带（H≈120）和偏黄的杂色。
+    lamp_green_hsv: tuple = (((40, 90, 60), (85, 255, 255)),)
+    lamp_blur_kernel: int = 5        # 先高斯模糊再取 HSV，压掉 LED 过曝的碎点
+    lamp_open_kernel: int = 3
+    lamp_close_kernel: int = 5
+    lamp_min_radius: float = 6.0     # 灯的最小/最大半径（像素），滤掉小亮点和大色块
+    lamp_max_radius: float = 90.0
+    lamp_min_circularity: float = 0.85  # 4πA/P²：路灯是圆的，长条状红/绿物不是
+    #: 像素竞争：候选灯的圆内，主色像素不得少于另一色（防红/绿互相误判）。
+    lamp_require_colour_dominance: bool = True
+    #: 内置检测器的置信度门槛（0 = 不卡）。
+    lamp_min_confidence: float = 0.0
+    #: 中线死区（A20）：灯心离画面中线的距离小于"画面宽度 × 这个比例"时，
+    #: **不说它是哪一边的灯**（读数 ``branch=None``），交给 ``fallback_rule``。
+    #: 为什么要它：实车日志里灯举在车头正前方时，灯心会在中线附近来回走
+    #: （``x=321 → 319`` 就翻边），"左/右"标签在决策那一瞬间是随机的；
+    #: 只有离中线足够远（灯真的立在路边）才敢认边。0 = 关闭（旧行为）。
+    lamp_center_deadband: float = 0.0
+    #: 同一个"哪边是绿灯"要连续几帧都成立才转身（单帧闪烁不算；0/1 = 关闭）。
+    light_confirm_frames: int = 2
+    #: 岔路口只放红灯、另一边没灯时：把红的那边当"不能走"，走另一边（A18）。
+    #: 依据 2026-09-16 官方规则说明：岔道口可以一红一绿，也可以只放红 / 只放绿。
+    red_blocks_branch: bool = True
 
     # --- 确认与再触发（见 A8、A9） ---
     confirm_frames: int = 3          # 连续几帧都看到才算真岔路
@@ -357,11 +730,27 @@ class JunctionConfig:
 
     # --- 转向（见 A5、A8） ---
     forward_speed: float = 0.10      # 转向时的前进速度（m/s），0 表示原地转
-    yaw_gain: float = 2.0            # 偏角(度) → yaw(deg/s) 的比例
-    max_turn_yaw: float = 75.0       # 转向 yaw 上限（deg/s）
-    turn_timeout: float = 3.5        # 转向阶段最长耗时
-    turn_min_duration: float = 0.40  # 至少转这么久再判断线是否回来
-    settle_timeout: float = 1.5      # 转完后等线回中央的最长时间
+    #: A28：岔路偏置只当「轻推」——巡线反馈（line_hold_gain）才是主力。
+    #: 原来是 2.0，偏置一直把 yaw 顶到上限，线保持项压不过它，车被带着转 68° 出线。
+    yaw_gain: float = 0.6            # 偏角(度) → yaw(deg/s) 的比例
+    # A26：转速**压慢**。2026-09-18 实测：75°/s 时按估计角度一口气转过去，转过头
+    # 63° 直接偏出带子；同一模块由组员写的版本是"慢慢转、边转边重判"（会卡顿一下），
+    # 反而能成。所以这里把上限降到 25°/s，并把时间放宽，让"边转边看"有机会生效。
+    max_turn_yaw: float = 25.0       # 转向 yaw 上限（deg/s）
+    turn_timeout: float = 8.0        # 转向阶段最长耗时（慢转需要更久）
+    turn_min_duration: float = 0.25  # 至少转这么久再判断线是否回来
+    settle_timeout: float = 3.0      # 对准之后往前开、把口子顶到车后的最长时间
+    #: （0.10 m/s × 3 秒 ≈ 30 cm，够把一个岔路口开过去；过不去就明确失败）
+    #: 转向时车头已经对准选中分支的角度门槛：岔路口上线回中央可能一直不成立
+    #: （2026-09-16 实测：yaw 收敛到 0 了却因为看不到单条居中的线而转向超时）。
+    branch_align_deg: float = 6.0
+    #: 转向时「带着巡线一起转」的增益（A27）：近处带子偏差 → yaw 的修正
+    #: （deg/s 每单位归一化偏差）。开环转向会让车一离开带子就再也回不来。
+    line_hold_gain: float = 60.0
+    #: 单次转向的**转角封顶**（度，0 = 不封顶）。带子接近水平时 tilt 会量到
+    #: 80°+，实测直接照它转会转过头（2026-09-17 22:47/22:52：转过 60~100°、
+    #: 带子被转出画面 → line did not return）。现场用 --turn-max-deg 调。
+    turn_max_deg: float = 90.0
     horizontal_fov_deg: float = 70.0 # 相机水平视野，用于像素→角度
 
     # --- 判据（见 A6、A7） ---
@@ -390,6 +779,54 @@ class BranchGeometry:
     center: Tuple[float, float]
     bearing_deg: float      # 相对图像中心的偏角，右为正
     rows: int               # 参与统计的采样行数
+    #: 这条分支**带子的方向**在画面里偏离竖直的角度（0 = 车头已经和它平行）。
+    #: 符号：负 = 这条分支在左边（要左转），正 = 右边。见 A22。
+    #: 为什么不能只看 ``bearing_deg``：分支越横（越靠侧面），它的**中心**偏角越接近 0，
+    #: 而实际要转的角度越大 —— 2026-09-17 22:28 实车，左分支在画面里几乎是水平的
+    #: （(390,215)→(150,230)），中心偏角只有 -23.9°，模块转了 20° 就宣布"已在正前方"，
+    #: 结果车还横着，交回巡线后跟上了另一条带子。
+    tilt_deg: Optional[float] = None
+
+
+def _branch_tilt(
+    xs: Sequence[float],
+    ys: Sequence[float],
+    side: Branch,
+) -> Optional[float]:
+    """分支带子在画面里的**方向**（相对竖直的偏斜，度，带符号）。
+
+    用最小二乘拟合 ``x = a + b·y``：``b`` 就是这条线在画面里的斜率。
+    ``|b|`` 越大 = 线越横 = 车头与这条分支差得越多；``b≈0`` = 线在画面里竖直
+    = 车头已经和这条分支平行（这才是"对准了"的真正判据，而且不需要知道相机俯仰：
+    与相机光轴平行的地面直线，其消失点就在画面中线，成像是竖直的）。
+
+    符号**取分支自己的左右身份**（``Branch.LEFT`` → 负），不用斜率的符号、也不用
+    "中心在哪一侧"：接近水平的分支其斜率符号会指向反方向；而用中心位置取符号时，
+    车一转过去中心就跨过中线，符号翻转 → yaw 在 ±上限之间来回翻
+    （2026-09-17 22:38 实车实测：`y=-75 → +75 → -75 → +75`）。
+    分支身份在整个转向过程中是稳定的。
+    """
+    if len(xs) < 2 or len(xs) != len(ys):
+        return None
+    span = max(ys) - min(ys)
+    if span < 1.0:
+        return None
+    # A25：只用**靠近分叉点那一小段**（y 最大的那几行）拟合方向。整条分支一起拟合时，
+    # 弯出去的那条是弧线、贴出去的那段又很短，平均下来方向会偏大 —— 2026-09-18 实测
+    # 就是被这个偏大的角带着转了 63°、然后偏出带子。车最先要跟上的本来就是近段。
+    order = np.argsort(np.asarray(ys, dtype=float))
+    nearest = order[-max(4, int(round(len(order) * 0.4))):]
+    fit_y = np.asarray(ys, dtype=float)[nearest]
+    fit_x = np.asarray(xs, dtype=float)[nearest]
+    if fit_y.max() - fit_y.min() < 1.0:
+        return None
+    try:
+        slope = float(np.polyfit(fit_y, fit_x, 1)[0])
+    except Exception:
+        return None
+    tilt = abs(math.degrees(math.atan(slope)))
+    sign = -1.0 if side is Branch.LEFT else 1.0
+    return sign * min(tilt, 89.0)
 
 
 @dataclass(frozen=True)
@@ -781,6 +1218,7 @@ class JunctionDetector:
                     center=(center_x, center_y),
                     bearing_deg=float(bearing),
                     rows=rows,
+                    tilt_deg=_branch_tilt(xs, ys, side),
                 )
             )
         return result[0], result[1], "ok"
@@ -894,57 +1332,194 @@ class JunctionDetector:
 # --------------------------------------------------------------------------
 
 
+def _hsv_ranges(value) -> List[Tuple[Tuple[int, int, int], Tuple[int, int, int]]]:
+    """把"单区间 / 区间列表"统一成区间列表（红灯有两个 H 区间）。"""
+    if not value:
+        return []
+    if len(value[0]) == 3:  # 单区间形式 ((h,s,v),(h,s,v))
+        value = [value]
+    ranges = []
+    for lower, upper in value:
+        lower = tuple(int(item) for item in lower)
+        upper = tuple(int(item) for item in upper)
+        if all(a <= b for a, b in zip(lower, upper)):
+            ranges.append((lower, upper))
+    return ranges
+
+
+def _mask_of(hsv: np.ndarray, ranges) -> np.ndarray:
+    mask = np.zeros(hsv.shape[:2], dtype=np.uint8)
+    for lower, upper in ranges:
+        mask = cv2.bitwise_or(
+            mask,
+            cv2.inRange(hsv, np.array(lower, np.uint8), np.array(upper, np.uint8)),
+        )
+    return mask
+
+
+class LampSpotter:
+    """内置的双灯检测器：一次找出画面里的红/绿灯，并给出"在哪一边"（A15/A17）。
+
+    算法来源：3 号那版 ``vision_tasks.detect_traffic_light`` +
+    ``_pixel_competition_ok``（他在实车上用过的 HSV 区间、半径范围 6~90、
+    圆度 0.85、以及"候选灯圆内主色像素不得少于另一色"的竞争判据）。
+    和它有三处**刻意的不同**：
+
+    1. 他那个整帧只返回**一盏**、而且红优先（两盏同时可见时永远报红）；
+       这里红、绿各扫一遍，**两盏都返回** —— 这正是本关卡需要的"哪边是绿灯"；
+    2. 他靠"红优先 + 停在原地等绿灯"来保证安全，而它在实车上反复误判锁停，
+       团队因此把那个模块删了（``6dc2c1f``）。这里**从不为了红灯停车**：
+       红灯只是"这一边不能走"，一个绿灯读数都没有时本模块**根本不接管**；
+    3. 这里只在**检测到岔路的帧**才被调用（见 ``GreenJunctionTask._read_probe``），
+       不是每帧都跑，省掉一路灯检测的开销。
+    """
+
+    def __init__(self, settings: Optional[JunctionConfig] = None) -> None:
+        self.settings = settings if settings is not None else JunctionConfig()
+
+    # -- 内部工具 ---------------------------------------------------------
+
+    def colour_pixels(self, image: np.ndarray, center, radius: float, colour: str) -> int:
+        """候选灯圆内、指定颜色的像素数（像素竞争用；``colour`` 是 ``"red"``/``"green"``）。"""
+        ranges = self._ranges(colour)
+        height, width = image.shape[:2]
+        left = max(0, int(center[0] - radius))
+        top = max(0, int(center[1] - radius))
+        right = min(width, int(center[0] + radius) + 1)
+        bottom = min(height, int(center[1] + radius) + 1)
+        if right - left < 2 or bottom - top < 2:
+            return 0
+        hsv = cv2.cvtColor(image[top:bottom, left:right], cv2.COLOR_BGR2HSV)
+        circle = np.zeros((bottom - top, right - left), dtype=np.uint8)
+        cv2.circle(
+            circle,
+            (int(center[0] - left), int(center[1] - top)),
+            max(1, int(radius)),
+            255,
+            -1,
+        )
+        return int(np.count_nonzero(cv2.bitwise_and(_mask_of(hsv, ranges), circle)))
+
+    def _ranges(self, colour: str):
+        settings = self.settings
+        return (
+            _hsv_ranges(settings.lamp_red_hsv)
+            if colour == "red"
+            else _hsv_ranges(settings.lamp_green_hsv)
+        )
+
+    @staticmethod
+    def _kernel(size: int) -> np.ndarray:
+        size = max(1, int(size))
+        if size % 2 == 0:
+            size += 1
+        return cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (size, size))
+
+    # -- 对外 -------------------------------------------------------------
+
+    def readings(self, image: Optional[np.ndarray]) -> List[LightReading]:
+        """返回这一帧所有认出来的灯（红、绿都算），按置信度从高到低。
+
+        ``branch``：灯在画面左半边 → ``LEFT``，右半边 → ``RIGHT``（A13）。
+        """
+        if image is None or getattr(image, "ndim", 0) != 3 or image.shape[2] != 3:
+            return []
+        settings = self.settings
+        blurred = image
+        if settings.lamp_blur_kernel and settings.lamp_blur_kernel >= 3:
+            blurred = cv2.GaussianBlur(image, (5, 5), 0)
+        hsv = cv2.cvtColor(blurred, cv2.COLOR_BGR2HSV)
+        width = float(image.shape[1])
+        center_x = width / 2.0
+        found: List[LightReading] = []
+        for colour, light_colour in (("red", LightColor.RED), ("green", LightColor.GREEN)):
+            mask = _mask_of(hsv, self._ranges(colour))
+            mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, self._kernel(settings.lamp_open_kernel))
+            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, self._kernel(settings.lamp_close_kernel))
+            contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            for contour in contours:
+                area = float(cv2.contourArea(contour))
+                if area <= 0.0:
+                    continue
+                radius = float(np.sqrt(area / np.pi))
+                if radius < settings.lamp_min_radius or radius > settings.lamp_max_radius:
+                    continue
+                perimeter = float(cv2.arcLength(contour, True))
+                if perimeter <= 0.0:
+                    continue
+                circularity = 4.0 * np.pi * area / (perimeter * perimeter)
+                if circularity < settings.lamp_min_circularity:
+                    continue
+                moments = cv2.moments(contour)
+                if moments["m00"] == 0:
+                    continue
+                center = (moments["m10"] / moments["m00"], moments["m01"] / moments["m00"])
+                dominance = 0
+                if settings.lamp_require_colour_dominance:
+                    other = "green" if colour == "red" else "red"
+                    dominance = self.colour_pixels(image, center, radius, colour) - (
+                        self.colour_pixels(image, center, radius, other)
+                    )
+                    if dominance < 0:
+                        # 像素证据不支持这个颜色（例如红灯光晕被当成绿灯）。
+                        continue
+                confidence = min(
+                    1.0,
+                    0.5 * min(radius / max(settings.lamp_min_radius, 1.0) / 4.0, 1.0)
+                    + 0.3 * min(max(circularity, 0.0), 1.0)
+                    + 0.2 * min(dominance / max(area, 1.0) + 0.5, 1.0),
+                )
+                if confidence < settings.lamp_min_confidence:
+                    continue
+                centre_x = float(center[0])
+                deadband = float(getattr(settings, "lamp_center_deadband", 0.0) or 0.0) * width
+                if deadband > 0.0 and abs(centre_x - center_x) < deadband:
+                    # 骑在画面中线上：这一帧不认边（A20），只报"看到绿灯"。
+                    side = None
+                else:
+                    side = Branch.LEFT if centre_x < center_x else Branch.RIGHT
+                found.append(
+                    LightReading(
+                        color=light_colour,
+                        branch=side,
+                        confidence=confidence,
+                        radius=radius,
+                        center=(centre_x, float(center[1])),
+                    )
+                )
+        found.sort(key=lambda item: -item.confidence)
+        return found
+
+    def detect(self, image: Optional[np.ndarray]) -> List[LightReading]:
+        """``readings`` 的别名：形状和 3 号那个 ``detect(image)`` 一样，
+        所以 :func:`make_light_probe` / :func:`make_two_lamp_probe` 都能直接包它。"""
+        return self.readings(image)
+
+    def probe(self, frame: FramePacket, now: float) -> List[LightReading]:
+        """探针形态：可以直接当 ``light_probe`` 塞给任务（A6）。"""
+        return self.readings(_frame_image(frame))
+
+
+#: 缓出下限：转到接近目标时 yaw 最低缩到这个倍数（A21）。太小会转不到位，
+#: 太大会冲过目标，0.25 是拿实测 yaw 曲线配的。
+_TURN_EASE_FLOOR = 0.25
+
+#: 转到位之后 SETTLE 阶段的爬行速度系数（A21b）：只往前走一点点让线回到
+#: 近处视野里，绝不带角速度（带角速度实测会把线推出画面）。
+_SETTLE_CREEP = 0.3
+
+
 def _straightest(branches: Sequence[BranchGeometry]) -> Optional[BranchGeometry]:
     if not branches:
         return None
     return min(branches, key=lambda item: abs(item.bearing_deg))
 
 
-def evaluate_branches(
+def _by_fallback_rule(
     branches: Sequence[BranchGeometry],
-    reading: Optional[LightReading],
     settings: JunctionConfig,
 ) -> Tuple[Optional[BranchGeometry], str]:
-    """按判据选出要走的分支；选不出来就返回 ``(None, 原因)``。
-
-    判据优先级：
-
-    1. 探针给了"哪一边是绿灯" → 走那一边；
-    2. 探针只知道颜色、不知道位置 → 颜色必须是绿的，再按 ``fallback_rule`` 选边；
-    3. 没有探针 → 用 ``fallback_color`` 当颜色（默认 ``"none"`` = 没有判据 → 失败）。
-    """
-    if not branches:
-        return None, "no branch geometry"
-
-    color: Optional[LightColor] = None
-    forced: Optional[BranchGeometry] = None
-    if reading is not None:
-        color = reading.color
-        if reading.branch is not None:
-            if reading.color is not LightColor.GREEN:
-                return None, f"{reading.branch.value} branch is {reading.color.value}"
-            forced = next(
-                (item for item in branches if item.side is reading.branch), None
-            )
-            if forced is None:
-                return None, "probe points at a missing branch"
-    else:
-        fallback = (settings.fallback_color or "none").strip().lower()
-        if fallback == "green":
-            color = LightColor.GREEN
-        elif fallback == "red":
-            color = LightColor.RED
-        else:
-            return None, "no light probe and fallback_color is none"
-
-    if color is LightColor.RED:
-        return None, "red light"
-    if color is not LightColor.GREEN:
-        return None, "light color unknown"
-
-    if forced is not None:
-        return forced, "probe selected branch"
-
+    """灯只给了颜色、没有给位置时怎么选边（A7）。"""
     rule = (settings.fallback_rule or "straightest").strip().lower()
     if rule == "left":
         chosen = next((item for item in branches if item.side is Branch.LEFT), None)
@@ -954,9 +1529,96 @@ def evaluate_branches(
         return (chosen, "fallback_rule=right") if chosen else (None, "no right branch")
     if rule == "none":
         return None, "light cannot tell left from right"
-
     chosen = _straightest(branches)
     return (chosen, "fallback_rule=straightest") if chosen else (None, "no branch")
+
+
+def evaluate_branches(
+    branches: Sequence[BranchGeometry],
+    reading,
+    settings: JunctionConfig,
+) -> Tuple[Optional[BranchGeometry], str]:
+    """按判据选出要走的分支；选不出来就返回 ``(None, 原因)``。
+
+    ``reading`` 可以是**一盏**读数、**左右两盏**的列表/元组/生成器、``None``。
+
+    判据优先级（本关卡的真实要求见 A15）:
+
+    1. **绿灯在哪一边就走哪边**（读数带 ``branch`` 时）；
+    2. 看到绿灯但不知道在哪边，而**知道某一边是红灯** → 走另一边（A16）；
+    3. 只知道颜色、没有位置 → 按 ``fallback_rule``（默认 ``straightest``）；
+    4. 只有红灯 → 不走，返回原因（原地等/超时失败）；
+    5. 什么都没有 → 用 ``fallback_color``（默认 ``"none"`` = 没有判据 → 失败）。
+    """
+    if not branches:
+        return None, "no branch geometry"
+
+    readings = _as_readings(reading, None, False, 0.0)
+    greens = [item for item in readings if item.color is LightColor.GREEN]
+    reds = [item for item in readings if item.color is LightColor.RED]
+
+    # 1) 绿灯的位置是明确的 → 就走那一边（A15/A13）
+    #    两边都是绿灯时没有可用的信息，交给 fallback_rule（A7）。
+    green_sides = []
+    for item in greens:
+        if item.branch is not None and item.branch not in green_sides:
+            green_sides.append(item.branch)
+    if len(green_sides) == 1:
+        chosen = next(
+            (branch for branch in branches if branch.side is green_sides[0]), None
+        )
+        if chosen is None:
+            return None, "probe points at a missing branch"
+        return chosen, "green light on the %s branch" % green_sides[0].value
+    if len(green_sides) > 1:
+        return _by_fallback_rule(branches, settings)
+
+    if not readings:
+        # 没有探针 / 探针这一帧什么都没给 → 退到 fallback_color（A6）
+        fallback = (settings.fallback_color or "none").strip().lower()
+        if fallback == "green":
+            return _by_fallback_rule(branches, settings)
+        if fallback == "red":
+            return None, "red light"
+        return None, "no usable light reading; fallback_color is %r" % fallback
+
+    red_sides = []
+    for item in reds:
+        if item.branch is not None and item.branch not in red_sides:
+            red_sides.append(item.branch)
+
+    # 2) 只看到绿灯、不知道哪边，但知道某一边是红的 → 走另一边（A16）
+    if greens:
+        if len(red_sides) == 1:
+            other = Branch.RIGHT if red_sides[0] is Branch.LEFT else Branch.LEFT
+            chosen = next((branch for branch in branches if branch.side is other), None)
+            if chosen is not None:
+                return chosen, "green seen; %s branch is red so take %s" % (
+                    red_sides[0].value,
+                    other.value,
+                )
+        return _by_fallback_rule(branches, settings)
+
+    # 3) 一个绿灯都没有，但知道某一边是红灯 → 红的那边不能走，走另一边（A18）
+    #    官方规则允许岔道口"只放红灯"，这时选道判据就是"避开红的那边"。
+    if reds and settings.red_blocks_branch:
+        if len(red_sides) == 1:
+            other = Branch.RIGHT if red_sides[0] is Branch.LEFT else Branch.LEFT
+            chosen = next((branch for branch in branches if branch.side is other), None)
+            if chosen is not None:
+                return chosen, "%s branch is red; take the other one" % red_sides[0].value
+        if len(red_sides) >= 2:
+            return None, "both branches are red"
+        return _by_fallback_rule(branches, settings)
+
+    # 4) 没看到绿灯
+    if reds:
+        if red_sides:
+            return None, "red light on the %s branch" % "/".join(
+                branch.value for branch in red_sides
+            )
+        return None, "red light"
+    return None, "light color unknown"
 
 
 # --------------------------------------------------------------------------
@@ -969,10 +1631,11 @@ class GreenJunctionTask:
 
     用法::
 
-        task = GreenJunctionTask(light_probe=traffic_light_module.reading)
+        task = GreenJunctionTask()                 # 什么都不用注入：内置认灯器（A17）
         update = task.step(frame_packet, now)      # 每帧一次，立即返回
         # update.status 是 NOT_TRIGGERED / RUNNING / COMPLETED / FAILED
         # update.motion 是给 MotionOutput 的速度请求（可能是 None）
+        # 整合层手里有别的灯读数时，也可以注入：GreenJunctionTask(light_probe=...)
 
     死规矩（红线 8）：一旦返回 ``RUNNING``，就必须持续返回 ``RUNNING``，
     直到 ``COMPLETED`` 或 ``FAILED``，中间不会改口成 ``NOT_TRIGGERED``。
@@ -984,25 +1647,54 @@ class GreenJunctionTask:
         settings: Optional[JunctionConfig] = None,
         detector: Optional[JunctionDetector] = None,
         light_probe: Optional[LightProbe] = None,
+        spotter: Optional[LampSpotter] = None,
     ) -> None:
         self.settings = settings if settings is not None else JunctionConfig()
         self.detector = detector if detector is not None else JunctionDetector(self.settings)
         self.light_probe = light_probe
+        #: 没注入探针时的内置认灯器（A17；`builtin_lamp_detection=False` 可关掉）。
+        self.spotter = spotter if spotter is not None else LampSpotter(self.settings)
         self.state = JunctionState.IDLE
         self.last_detection: Optional[JunctionDetection] = None
         self.last_line: Optional[LineDetection] = None
         self.last_reading: Optional[LightReading] = None
+        #: 本帧探针给的全部读数（A15：岔路两边各一盏灯，所以这里有 0/1/2 个）。
+        self.last_readings: List[LightReading] = []
+        # 得分照片（老师要求的那张）：证据层负责画/写/存，这里只排队。
+        self._queued_evidence = None
+        self._active_evidence = None
+        self._evidence_queued_kinds: set = set()
+        self._evidence_outcome: Optional[bool] = None
         self.chosen_branch: Optional[Branch] = None
         self.last_message = "idle"
         self.mask: Optional[np.ndarray] = None
 
         self._confirm_count = 0
         self._drove_past_frames = 0
+        self._rule_side: Optional[Branch] = None
+        self._rule_side_count = 0
+        self._chosen_bearing: Optional[float] = None
+        self._chosen_tilt: Optional[float] = None
+        self._saw_green = False
+        self._last_all_readings: List[LightReading] = []
         self._idle_since: Optional[float] = None
         self._state_since: Optional[float] = None
         self._last_seen_at: Optional[float] = None
         self._run_started_at: Optional[float] = None
         self._turn_started_at: Optional[float] = None
+        #: 进入 TURN 之后**已经转过的角度**（deg，带符号，由 yaw×dt 积分）。
+        #: A21：锁死的偏角只能当"要转多少度"的目标，不能当"对齐了没有"的判据 ——
+        #: 常量要么一开始就小于阈值（碰巧成功），要么永远不成立（转到线飞出画面）。
+        self._turn_rotated_deg = 0.0
+        self._turn_last_at: Optional[float] = None
+        #: 最近一帧近处带子是否已经居中（=车真的压在线上）。A23 的判据之一。
+        self._line_is_centered = False
+        #: 最近一帧岔路形态是否还看得见（A23：看不见了 + 近处居中 = 口子已在车后）。
+        self._fork_visible = True
+        #: 最近一次**有效**的岔路检测（车开过去之后仍能报出选中的分支）。
+        self._last_valid_detection: Optional[JunctionDetection] = None
+        #: 最近一帧近处带子的归一化偏差（A27：转向时的巡线反馈项）。
+        self._near_error: Optional[float] = None
         self._rearm_ready_at: Optional[float] = None
 
     # -- 对外状态 ---------------------------------------------------------
@@ -1024,22 +1716,82 @@ class GreenJunctionTask:
         branch = detection.branch(self.chosen_branch)
         return None if branch is None else branch.bearing_deg
 
+    @property
+    def chosen_tilt_deg(self) -> Optional[float]:
+        """**当前帧**算出的、选中分支带子的方向偏斜（A22）：0 = 车头已和它平行。
+
+        这是转向与"到位"判据的首选信号；看不到这条分支时返回 ``None``，
+        由调用方退回旧的中心偏角（:attr:`chosen_bearing_deg`）。
+        """
+        detection = self.last_detection
+        if detection is None or self.chosen_branch is None:
+            return None
+        branch = detection.branch(self.chosen_branch)
+        return None if branch is None else branch.tilt_deg
+
+    def _with_line_hold(self, yaw: float) -> float:
+        """A27：转向时**带着巡线一起转**（近处带子偏差也参与 yaw）。
+
+        开环地按岔路方向转过去，车一离开带子就再也没有线可以跟 —— 2026-09-18 实测：
+        主路到岔路之前本来就有个左弯，车体已经偏左，模块一转整车出线，之后
+        「线回中央」永远不成立 → 卡住/失败。这里把**近处带子的偏差**也加进 yaw：
+        带子偏右（``error > 0``）就往右修一点，于是车是**沿着带子拐过去**的，
+        而不是绕着原地转。
+        """
+        gain = float(getattr(self.settings, "line_hold_gain", 0.0) or 0.0)
+        error = self._near_error
+        if error is None or gain <= 0.0:
+            return yaw
+        limit = abs(self.settings.max_turn_yaw)
+        return max(-limit, min(limit, yaw + gain * float(error)))
+
+    def _aligned_now(self) -> Tuple[bool, str]:
+        """车头是否已经和选中的分支平行（走得了这条分支）。
+
+        优先用**带子的方向**（tilt）—— 这才是"平行"的定义；只有算不出方向
+        （带子行数不够等）才退回旧的中心偏角判据。
+        """
+        limit = abs(self.settings.branch_align_deg)
+        tilt = self.chosen_tilt_deg
+        if tilt is not None:
+            return abs(tilt) <= limit, "tilt %+.1f deg" % tilt
+        bearing = self.chosen_bearing_deg
+        if bearing is not None:
+            return abs(bearing) <= limit, "bearing %+.1f deg" % bearing
+        return False, "no branch geometry"
+
     def reset(self) -> None:
         """回到初始状态，供 coordinator 在复位时调用。"""
         self.state = JunctionState.IDLE
         self.last_detection = None
         self.last_line = None
         self.last_reading = None
+        self.last_readings = []
+        self._queued_evidence = None
+        self._active_evidence = None
+        self._evidence_queued_kinds = set()
+        self._evidence_outcome = None
         self.chosen_branch = None
         self.last_message = "idle"
         self.mask = None
         self._confirm_count = 0
         self._drove_past_frames = 0
+        self._rule_side = None
+        self._rule_side_count = 0
+        self._chosen_bearing = None
+        self._chosen_tilt = None
+        self._saw_green = False
+        self._last_all_readings = []
         self._idle_since = None
         self._state_since = None
         self._last_seen_at = None
         self._run_started_at = None
         self._turn_started_at = None
+        self._turn_rotated_deg = 0.0
+        self._turn_last_at = None
+        self._line_is_centered = False
+        self._fork_visible = True
+        self._last_valid_detection = None
         self._rearm_ready_at = None
 
     # -- 内部工具 ---------------------------------------------------------
@@ -1050,6 +1802,8 @@ class GreenJunctionTask:
         if state is JunctionState.TURN:
             # 转向总时长从进入 TURN 开始算，跨 TURN / SETTLE 两段都有效。
             self._turn_started_at = now
+            self._turn_rotated_deg = 0.0
+            self._turn_last_at = None
 
     def _elapsed(self, now: float) -> float:
         if self._state_since is None:
@@ -1069,6 +1823,8 @@ class GreenJunctionTask:
 
     def _visual(self, detection: Optional[JunctionDetection] = None) -> VisualDetection:
         payload = detection if detection is not None else self.last_detection
+        if detection is None and (payload is None or not payload.valid):
+            payload = self._last_valid_detection
         if payload is None or not payload.valid:
             return VisualDetection.no_result("green_junction")
         center = (
@@ -1131,12 +1887,105 @@ class GreenJunctionTask:
 
         前进速度与转向量成比例（A10）：还没选出分支时 yaw 为 0，前进也为 0，
         也就是等判据期间原地停着，绝不自己往前冲。
+
+        A21（2026-09-17 实车）：锁死的偏角在这里当**转动目标**用 ——
+        每帧把 ``yaw × dt`` 积进 ``_turn_rotated_deg``，并把 yaw 按"离目标还有
+        多远"缓出。原实现不管转了多少度都恒定 45°/s 地转，只要
+        ``|锁死偏角| > branch_align_deg``，车就会一直转到带子飞出画面
+        （实测：偏角 -22.5° → yaw 恒为 -45°/s → 1.8 秒转了约 80° → 全图蓝色像素
+        变成 0 → "line did not return after the turn"）。
         """
         settings = self.settings
-        bearing = self.chosen_bearing_deg or 0.0
-        yaw = bearing * settings.yaw_gain
+        bearing = self._chosen_bearing
+        if bearing is None:
+            bearing = self.chosen_bearing_deg or 0.0
+        # 兜底路径的转向量也优先按"带子方向"来（锁定值，A22）。
+        if self._chosen_tilt is not None:
+            bearing = math.copysign(abs(float(self._chosen_tilt)), float(bearing))
+        target = float(bearing)
+        # A22c：**先**判上限，再谈伺服。伺服信号（当前帧的 tilt）可能在车转过去之后
+        # 一直很大 —— 画面里留下的横段、别的带子都会被当成"这条分支还没竖直"，
+        # 没有上限就会转过头：2026-09-17 22:47 两次实测 yaw 被钉在 -75°/s 转了
+        # 1.0~1.3 秒（约 80~100°），最后 `巡线=无 蓝=0/0`（画面里一条蓝带都没有）
+        # → `line did not return after the turn`。
+        # 上限有两层：转过"决策时锁下的目标角度"就不再加转；近处带子已经居中
+        # （车真的压在线上）也不再加转。
+        # A23：什么时候"不用再转"——
+        #   1) 转向量已到上限（turn_max_deg / 锁死目标角度）；
+        #   2) 选中的那条带子已经在画面里竖直（=车头与它平行，真正的"对准了"）；
+        #   3) 岔路形态已经消失、而近处那条带子居中（口子已在车后，车压上新带子）。
+        # **不能**拿"近处带子居中"单独当条件：还没转的时候，那条居中的带子就是车
+        # 自己上来的主带 —— A22c 就是这么把转向一帧掐死的（离线复现：tilt 一直卡在
+        # 39.1°，车再也不转，最后卡到 turn_timeout）。
+        aligned_now, _ = self._aligned_now()
+        past_fork = self._line_is_centered and not self._fork_visible
+        if not self._turn_still_needed() or aligned_now or past_fork:
+            # 已经对准（或转向量到上限）：不再加转。SETTLE 阶段**往前开**，把口子
+            # 顶到车后去（A24：0.03 m/s 的爬行根本过不去，交回巡线时口子还在车头
+            # 前面，巡线就会挑到另一条带子 —— 2026-09-18 新场地两次实测：模块一次
+            # 选 left、一次选 right，车最后都走左边那条，选边等于没生效）。
+            forward = (
+                settings.forward_speed
+                if self.state is JunctionState.SETTLE
+                else 0.0
+            )
+            self._turn_last_at = now
+            return MotionCommand(forward=forward, lateral=0.0, yaw=0.0)
+        # A22：有"带子方向"就用它做**伺服** —— 一直转到这条分支的带子在画面里
+        # 接近竖直（车头与带子平行）为止。tilt 是当前帧算出来的，所以车转过去的
+        # 过程中它会自己收敛到 0，转多少度由几何自己决定，不需要估。
+        live_tilt = self.chosen_tilt_deg
+        if live_tilt is not None and self.state in (JunctionState.TURN, JunctionState.SETTLE):
+            yaw = float(live_tilt) * settings.yaw_gain
+            limit = abs(settings.max_turn_yaw)
+            yaw = max(-limit, min(limit, yaw))
+            # 伺服路径同样要把"转过的角度"记下来：检测中途丢了（live tilt 变 None）
+            # 时靠它接着按差值收手，不然会退回一个过小的目标（A22）。
+            if self._turn_last_at is not None:
+                dt = now - self._turn_last_at
+                if 0.0 <= dt <= 0.25:
+                    self._turn_rotated_deg += yaw * dt
+            self._turn_last_at = now
+            if abs(live_tilt) <= settings.branch_align_deg:
+                forward = (
+                    settings.forward_speed
+                    if self.state is JunctionState.SETTLE
+                    else 0.0
+                )
+                return MotionCommand(forward=forward, lateral=0.0, yaw=0.0)
+            yaw = self._with_line_hold(yaw)
+            ratio = 0.0 if limit <= 0.0 else min(1.0, abs(yaw) / limit)
+            return MotionCommand(
+                forward=settings.forward_speed * ratio, lateral=0.0, yaw=yaw
+            )
+        # 转到位之后**不再加转**（A21b，2026-09-17 22:20 实测）：残余角速度会让
+        # 线在画面里越跑越远（settle 期间 y 恒为 -10.3°/s，e 从 +0.41 涨到 +0.76），
+        # 于是"线回中央"永远等不到、白等到 settle_timeout 失败。
+        if not self._turn_still_needed():
+            creep = (
+                settings.forward_speed * _SETTLE_CREEP
+                if self.state is JunctionState.SETTLE
+                else 0.0
+            )
+            self._turn_last_at = now
+            return MotionCommand(forward=creep, lateral=0.0, yaw=0.0)
+        gain_yaw = target * settings.yaw_gain
         limit = abs(settings.max_turn_yaw)
-        yaw = max(-limit, min(limit, yaw))
+        gain_yaw = max(-limit, min(limit, gain_yaw))
+        # 缓出：转过一大半之后按剩余角度缩，最后一段用 floor 倍速蹭过去，
+        # 免得恒定角速度冲过目标（原来的抖动就是这么来的）。
+        remaining = max(0.0, abs(target) - abs(self._turn_rotated_deg))
+        if abs(target) > 0.0:
+            scale = max(_TURN_EASE_FLOOR, min(1.0, remaining / abs(target)))
+        else:
+            scale = 0.0
+        yaw = self._with_line_hold(gain_yaw * scale)
+        # 积分：dt 只在同一段 TURN 里有效，并且夹住异常大的间隔（调试断点/卡帧）。
+        if self._turn_last_at is not None:
+            dt = now - self._turn_last_at
+            if 0.0 <= dt <= 0.25:
+                self._turn_rotated_deg += yaw * dt
+        self._turn_last_at = now
         ratio = 0.0 if limit <= 0.0 else min(1.0, abs(yaw) / limit)
         return MotionCommand(
             forward=settings.forward_speed * ratio,
@@ -1144,30 +1993,68 @@ class GreenJunctionTask:
             yaw=yaw,
         )
 
-    def _read_probe(self, frame: FramePacket, now: float) -> Optional[LightReading]:
-        if self.light_probe is None:
-            return None
-        try:
-            reading = self.light_probe(frame, now)
-        except Exception:
-            # 别人的模块出错不能让车失控；按"没有判据"处理。
-            return None
-        if reading is None:
-            return None
-        if isinstance(reading, LightReading):
-            return reading
-        return None
+    def _rotation_target_deg(self) -> float:
+        """这一段转向的目标角度（A21/A22）。
 
-    def _rule_reading(self, frame: FramePacket, now: float) -> Optional[LightReading]:
-        """本帧的灯读法：优先探针，其次 ``fallback_color``（A6）。"""
+        优先用决策时锁下的分支**带子方向**（tilt）：探针实测它与车辆真实转动量
+        近似 1:1（车转 -10°，左分支 tilt 从 -60.5° 变 -50.5°），而分支**中心**偏角
+        严重低估（同一画面只有 -18.7°）。锁死的量在岔路检测中途丢失时仍然可用 ——
+        这正是 22:28 那次"只转 20° 就交回巡线"的兜底修正。
+        """
+        cap = max(0.0, float(getattr(self.settings, "turn_max_deg", 0.0) or 0.0))
+        if self._chosen_tilt is not None:
+            target = abs(float(self._chosen_tilt))
+        elif self._chosen_bearing is not None:
+            target = abs(float(self._chosen_bearing))
+        else:
+            return 0.0
+        return min(target, cap) if cap > 0.0 else target
+
+    def _turn_still_needed(self) -> bool:
+        """还要不要继续转（A21）：转过目标角度减去 ``branch_align_deg`` 就够了。"""
+        margin = max(0.0, float(self.settings.branch_align_deg))
+        return abs(self._turn_rotated_deg) < max(0.0, self._rotation_target_deg() - margin)
+
+    def _read_probe(self, frame: FramePacket, now: float) -> List[LightReading]:
+        """这一帧的灯读数（0 / 1 / 2 盏都合法，见 A6/A15/A17）。
+
+        来源优先级：注入的 ``light_probe`` → 内置 :class:`LampSpotter` → 空。
+        内置检测器只在**已经检测到岔路**的帧才会被调到（``_step_idle`` /
+        ``_step_decide`` 都在这之后），所以不会给主循环加每帧一次的灯检测。
+        """
+        if self.light_probe is not None:
+            try:
+                value = self.light_probe(frame, now)
+            except Exception:
+                # 别人的模块出错不能让车失控；按"没有判据"处理。
+                return []
+            # infer_branch=True：探针直接甩一个 VisualDetection 过来时，
+            # 这里也能按它在画面里的位置翻成左右（A13）。
+            return _as_readings(value, frame, True, 0.0)
+        if not self.settings.builtin_lamp_detection:
+            return []
+        return self.spotter.readings(_frame_image(frame))
+
+    def _rule_reading(self, frame: FramePacket, now: float) -> List[LightReading]:
+        """本帧的灯读法列表（A6/A17）。
+
+        优先级：注入的探针 → 内置认灯器 → ``fallback_color``。
+        内置认灯器这一帧什么都没认出来时，才轮到 ``fallback_color``
+        （它默认 ``"none"`` = 没有判据；显式设成 ``"green"`` 是"强制按绿灯走"的
+        调试/兜底开关，见 A6）。
+        """
         if self.light_probe is not None:
             return self._read_probe(frame, now)
+        if self.settings.builtin_lamp_detection:
+            readings = self._read_probe(frame, now)
+            if readings:
+                return readings
         fallback = (self.settings.fallback_color or "none").strip().lower()
         if fallback == "green":
-            return LightReading(color=LightColor.GREEN)
+            return [LightReading(color=LightColor.GREEN)]
         if fallback == "red":
-            return LightReading(color=LightColor.RED)
-        return None
+            return [LightReading(color=LightColor.RED)]
+        return []
 
     def _rule_source_available(self, frame: FramePacket, now: float) -> bool:
         """这一帧到底有没有**能用的**判据（A14）。
@@ -1175,16 +2062,37 @@ class GreenJunctionTask:
         2026-09-16 的实车报告指出：老写法把"接了探针"当成"有判据"，于是只要
         岔路出现它就会接管；如果那个岔路口没有灯，它就白等 ``decision_timeout``
         再失败，把岔路从后面注册的 ``free_junction`` 手里抢走。
-        现在改成：**真的拿到读数**（红灯或绿灯）才算有来源；
-        ``None`` / ``UNKNOWN`` / 探针抛异常都不算。
+
+        2026-09-16 晚些时候团队又删掉了 ``traffic_light``（``6dc2c1f``），理由是
+        "它会为了红灯原地锁停、浪费跑圈时间"。所以这里再收紧一档：
+        **必须真的有灯的证据才算有判据**：
+
+        * 有绿灯 → 算（要去绿灯那边）；
+        * 只有红灯、但知道在哪一边，且 ``red_blocks_branch`` → 也算
+          （"红的那边不能走"，官方规则允许岔道口只放红灯，A18）；
+        * 只有红灯、又**没有岔路**（路中间那种）→ 不接管：本模块不做"红灯停"，
+          那是**别人负责的另一个记分任务**（A19）；本模块绝不为红灯在路中间停车。
         """
         if not self.settings.require_rule_source:
             return True
-        reading = self._rule_reading(frame, now)
-        self.last_reading = reading
-        if reading is None:
-            return False
-        return reading.color is not LightColor.UNKNOWN
+        readings = self._rule_reading(frame, now)
+        self._remember_readings(readings)
+        for item in readings:
+            if item.color is LightColor.GREEN:
+                return True
+            if (
+                item.color is LightColor.RED
+                and item.branch is not None
+                and self.settings.red_blocks_branch
+            ):
+                return True
+        return False
+
+    def _remember_readings(self, readings: List[LightReading]) -> None:
+        """存下这一帧看到的灯，给日志/evidence 用（A15：可能是左右两盏）。"""
+        self.last_readings = list(readings)
+        self._last_all_readings = list(readings)
+        self.last_reading = readings[0] if readings else None
 
     def _line_centered(self, frame: FramePacket, now: float) -> Tuple[bool, str]:
         """线回到画面中央了没有（见 A11）。
@@ -1212,6 +2120,153 @@ class GreenJunctionTask:
         return near_line_is_centered(frame.image, settings)
 
     # -- 主入口 -----------------------------------------------------------
+
+    def pending_evidence_request(self):
+        """看一眼排队中的请求，**不取走**。"""
+        return self._queued_evidence
+
+    def take_evidence_request(self):
+        """把一张请求交给整合侧的证据层（画圈、写字、写盘都在那边）。
+
+        这是"原子取出"：取走之后 ``pending_evidence_request`` 就是 ``None``，
+        直到有下一个事件排队。调用方必须拿回执来认领结果（见
+        :meth:`acknowledge_evidence`）。
+        """
+        request = self._queued_evidence
+        self._queued_evidence = None
+        return request
+
+    def acknowledge_evidence(self, request_id: str, saved: bool) -> bool:
+        """回传**真实写盘结果**；失败时有界重试。
+
+        和 ``traffic_light`` 同一套协议：``request_id`` 是请求上的派生属性
+        （不是 dataclass 字段），重试只改 ``attempt``（``request_id`` 会跟着变）。
+        状态机**从不等待**这个回执：照片存不存得下来都必须照常转向、照常交回
+        巡线 —— 分数按存下来的张数算，但"真的开进正确那条路"才是任务本身。
+        """
+        if (
+            self._active_evidence is None
+            or self._active_evidence.request_id != request_id
+        ):
+            return False
+        if saved:
+            self._evidence_outcome = True
+            self._active_evidence = None
+            return True
+        if self._active_evidence.attempt >= self.settings.max_evidence_attempts:
+            self._evidence_outcome = False
+            self._active_evidence = None
+            return True
+        retry = replace(
+            self._active_evidence,
+            attempt=self._active_evidence.attempt + 1,
+        )
+        self._active_evidence = retry
+        self._queued_evidence = retry
+        self._evidence_outcome = None
+        return True
+
+    def _evidence_for_choice(
+        self, chosen: Branch, readings: Sequence[LightReading]
+    ) -> Tuple[str, Branch, Optional[LightReading]]:
+        """按本模块**自己的判据语义**决定这张照片写成"绿灯"还是"红灯"（A18）。
+
+        :return: ``(kind, side, reading)``；``side`` = 灯在哪条分支，
+            ``reading`` = 要在照片上圈出来的那一盏（圈不出来时是 ``None``）。
+
+        判断依据就是 :func:`evaluate_branches` 那几条判据本身：
+
+        1. 选中的这一边**就是绿灯所在的那一边** → ``green_junction:green``，
+           圈那盏绿灯（文案 "detects a green light » <灯在哪条路> way and
+           <我们走哪条路>"）。A15 的主判据，两边各一盏灯时也走这一条。
+        2. 否则是**某一边的红灯**把那条路排除掉的（A16 的降级判据：绿灯只知道
+           存在、某一边是红灯 → 走另一边）→ ``green_junction:red``，圈那盏红灯，
+           ``side`` 是**红灯**在哪条路（文案 "detects a red light » left way and
+           right" 正是老师给的第二种样例）。
+        3. 剩下的降级路径（绿灯没定位 / 两边都报绿灯 / ``fallback_color="green"``）
+           仍然记成绿灯：判据本身就是"按绿灯走"，只是照片上圈不出具体哪一盏，
+           ``side`` 就写我们实际走的那条路。
+        """
+        greens = [item for item in readings if item.color is LightColor.GREEN]
+        reds = [item for item in readings if item.color is LightColor.RED]
+        green_on_chosen = next((item for item in greens if item.branch is chosen), None)
+        if green_on_chosen is not None:
+            return "green_junction:green", chosen, green_on_chosen
+        veto = next(
+            (
+                item
+                for item in reds
+                if item.branch is not None and item.branch is not chosen
+            ),
+            None,
+        )
+        if veto is not None:
+            return "green_junction:red", veto.branch, veto
+        return "green_junction:green", chosen, (greens[0] if greens else None)
+
+    def _queue_evidence_for_choice(
+        self, frame: FramePacket, chosen: Branch, readings: Sequence[LightReading]
+    ) -> None:
+        """选路那一刻的得分照片（A15/A16/A18）。"""
+        kind, side, reading = self._evidence_for_choice(chosen, readings)
+        self._queue_evidence(frame, kind, side, chosen, reading)
+
+    def _queue_evidence(
+        self,
+        frame: FramePacket,
+        kind: str,
+        side: Branch,
+        chosen: Branch,
+        reading: Optional[LightReading],
+    ) -> None:
+        """排队一张照片；**同一事件只排一张**，而且**尽力而为**。
+
+        老师按"存下来的张数"算分，同一件事存两张不会多得分；而写盘失败绝不允许
+        改变转向/接管行为（照片只是得分副作用），所以这里只入队，有异常也咽掉。
+        """
+        if kind in self._evidence_queued_kinds:
+            return
+        if self._evidence_outcome is False:
+            return
+        if self._queued_evidence is not None or self._active_evidence is not None:
+            return
+        try:
+            request = self._make_evidence_request(frame, kind, side, chosen, reading)
+        except Exception:
+            # 证据照片出问题绝不能影响开车：不排这张就是了。
+            return
+        if request is None:
+            return
+        self._evidence_queued_kinds.add(kind)
+        self._active_evidence = request
+        self._queued_evidence = request
+
+    def _make_evidence_request(
+        self,
+        frame: FramePacket,
+        kind: str,
+        side: Branch,
+        chosen: Branch,
+        reading: Optional[LightReading],
+    ):
+        """构造请求：**用圆圈标出那盏灯** + 一行说明文字（文案模板在证据层）。
+
+        坐标只用检测器**真的量到**的灯心/半径（``LightReading.center`` /
+        ``radius``）；量不到就是 ``detection=None``、不带圆圈
+        ——"圆圈被降级"，绝不编一个坐标出来。
+        """
+        detection, circle = _lamp_visual(reading)
+        return make_evidence_photo(
+            kind,
+            frame,
+            detection=detection,
+            shape="circle",
+            circle=circle,
+            side=side.value,
+            chosen=chosen.value,
+            team=self.settings.team_number,
+            label=kind.replace(":", "_"),
+        )
 
     def step(
         self,
@@ -1246,6 +2301,10 @@ class GreenJunctionTask:
         mask = blue_branch_mask(frame.image, settings) if settings.require_blue_branches else None
         detection = self.detector.detect(frame.image, mask)
         self.last_detection = detection if detection.valid else None
+        # A24：当前帧检测不到岔路（车已经开过去了）时，_visual() 仍要能报出
+        # 选中的那条分支，否则日志/存证里会变成"没有目标"，看不出选了哪边。
+        if detection.valid:
+            self._last_valid_detection = detection
         self.mask = detection.mask
 
         if self.state is JunctionState.IDLE:
@@ -1281,9 +2340,10 @@ class GreenJunctionTask:
         # 放在"检测到岔路"之后是为了省掉每帧一次的灯检测：只有真有岔路的帧才去问灯。
         if not self._rule_source_available(frame, now):
             self._confirm_count = 0
+            has_source = self.light_probe is not None or self.settings.builtin_lamp_detection
             message = (
                 "no usable light reading; not applicable"
-                if self.light_probe is not None
+                if has_source
                 else "no light rule source; not applicable"
             )
             return self._not_triggered(message)
@@ -1352,15 +2412,45 @@ class GreenJunctionTask:
                 return self._failed("junction lost before a rule could be applied")
             return self._running(now, "waiting for junction re-detection")
 
-        reading = self._read_probe(frame, now)
-        self.last_reading = reading
-        chosen, reason = evaluate_branches(detection.branches, reading, settings)
+        readings = self._read_probe(frame, now)
+        self._remember_readings(readings)
+        # A18 只对"这个岔路口从头到尾没见过绿灯"成立（官方允许只放红灯）。
+        # 如果先看到过绿灯、后来绿灯没了只剩红灯，那不许顺手"猜另一边" —— 停车更安全。
+        if self._saw_green:
+            readings = [item for item in readings if item.color is not LightColor.RED]
+        elif any(item.color is LightColor.GREEN for item in self._last_all_readings):
+            self._saw_green = True
+        chosen, reason = evaluate_branches(detection.branches, readings, settings)
         if chosen is None:
+            self._rule_side = None
+            self._rule_side_count = 0
             if self._elapsed(now) > settings.decision_timeout:
                 return self._failed("no usable rule: %s" % reason)
             return self._running(now, "waiting for rule: %s" % reason)
 
+        # 同一个"哪边是绿灯"要连续几帧都成立才转身：单帧闪烁不算（见 A15）。
+        need = max(1, int(settings.light_confirm_frames))
+        if chosen.side is self._rule_side:
+            self._rule_side_count += 1
+        else:
+            self._rule_side = chosen.side
+            self._rule_side_count = 1
+        if self._rule_side_count < need:
+            return self._running(
+                now,
+                "confirming light side %s (%d/%d, %s)"
+                % (chosen.side.value, self._rule_side_count, need, reason),
+            )
+
         self.chosen_branch = chosen.side
+        # 把选中分支的偏角锁在这里：每帧重算的话，岔路几何一跳 yaw 就跟着跳
+        # （2026-09-16 实测：yaw 在 -14 与 +36 之间来回，车会抖着转）。
+        self._chosen_bearing = float(chosen.bearing_deg)
+        # A22：真正决定"要转多少"的是分支**带子的方向**（tilt），不是它的中心偏角。
+        self._chosen_tilt = chosen.tilt_deg
+        # 老师要求的"岔路选择"证据照片（统一层）：选边那一刻排队一张。
+        # 照片只是得分副作用：排队不阻塞、写盘失败也不改变转向（A15/A16/A18）。
+        self._queue_evidence_for_choice(frame, chosen.side, self.last_readings)
         self._enter(JunctionState.TURN, now)
         return self._running(
             now,
@@ -1379,17 +2469,53 @@ class GreenJunctionTask:
 
         if detection.valid:
             self._last_seen_at = now
-        else:
-            gap = 0.0 if self._last_seen_at is None else max(0.0, now - self._last_seen_at)
-            if gap > settings.junction_gap_grace:
-                return self._failed("lost the junction while turning")
+        # 岔路检测在转向中途丢掉是**预期**的：车一转进分支，Y 形在画面里就散了。
+        # 所以这里不判失败（A22），改由"转过锁死目标角度"这条兜底收尾 ——
+        # 检测丢了时 chosen_tilt_deg 变成 None，rotated 才允许生效，转向仍然有界。
+        # （2026-09-17 22:38 实车就是转到一半报 "lost the junction while turning"，
+        #  而那时车其实已经对准左边的分支了。）
 
         centered, line_source = self._line_centered(frame, now)
-        settled = self._turn_elapsed(now) >= settings.turn_min_duration and centered
+        self._line_is_centered = bool(centered)
+        self._fork_visible = bool(detection.valid)
+        self._near_error = near_field_line(_frame_image(frame), settings)[0]
+        # A23 自标定收尾（场地无关）：不认"转了多少度"，只认"选中的那条带子
+        # 是不是已经在车正前方"：
+        #   1) aligned  —— 岔路形态还看得见：那条分支的带子已经在画面里竖直
+        #      （与相机光轴平行的地面直线，其消失点在画面中线、成像是竖直的 ——
+        #        不需要知道相机俯仰，也不需要任何手调的角度）；
+        #   2) past_fork —— 岔路形态已经看不见了，而近处那条带子居中：口子已在车后，
+        #      车压上了新的带子（这时岔路检测散掉是**预期**的，不算失败）；
+        #   3) rotated  —— 转向量已经到达安全上限（默认 90°，正常场地碰不到）：
+        #      进 SETTLE 去判，绝不在 TURN 里干等（2026-09-17 23:17 实车就是在这里
+        #      卡住的：yaw 早被上限按成 0，状态机却还在等"带子竖直"）。
+        # 单独"近处带子居中"**不算数** —— 还没转的时候，那条居中带子就是车自己上来的
+        # 主带（22:28 那次就是这么误判成"进了分支"、结果拐上另一条路的）。
+        aligned, aligned_why = self._aligned_now()
+        # 口子已在车后：要么岔路形态彻底消失，要么它的下沿已经压到 ROI 底部
+        # （`drove_past_fork_row_ratio`，模块本来就用这条判"车头顶到口子上"）。
+        # 只要求"岔路消失"太严：这个场地的岔路（一条主带弯出去 + 一条贴的短段）
+        # 在画面里会一直存在，2026-09-18 11:41 实测就卡死在这一步。
+        past_fork = bool(centered) and (
+            not detection.valid
+            or detection.band_bottom_ratio >= settings.drove_past_fork_row_ratio
+        )
+        rotated = not self._turn_still_needed()
+        settled = (
+            self._turn_elapsed(now) >= settings.turn_min_duration
+            and (aligned or past_fork or rotated)
+        )
         if settled:
             self._enter(JunctionState.SETTLE, now)
+            if aligned:
+                whose = aligned_why
+            elif past_fork:
+                whose = "fork passed, line centred (%s)" % line_source
+            else:
+                whose = "rotation ceiling %.1f deg" % self._turn_rotated_deg
             return self._running(
-                now, "branch entered, checking line stability (%s)" % line_source
+                now,
+                "branch entered, checking line stability (%s)" % whose,
             )
 
         return self._running(
@@ -1406,13 +2532,50 @@ class GreenJunctionTask:
             return self._failed("task total timeout while settling")
 
         centered, line_source = self._line_centered(frame, now)
-        stable = centered and self._turn_elapsed(now) >= settings.turn_min_duration
+        self._line_is_centered = bool(centered)
+        self._fork_visible = bool(detection.valid)
+        self._near_error = near_field_line(_frame_image(frame), settings)[0]
+        # A21b：岔路口上"线回中央"这个判据**根本不可能成立** —— 路口处整条 Y 形
+        # 是**一个**连通块（离线对照：`junction_frame` 的 conf=1.00 就是整块 Y），
+        # 近处窄带里也常是劈开的两条，所以 2026-09-17 22:20 那次 settle 整整
+        # 1.5 秒都等不到、最后 `line did not return after the turn` 失败。
+        # 因此这里补一条等价判据：**选中分支已经在车头正前方**（当前帧算出来的
+        # 偏角收敛到 branch_align_deg 以内）就算进了分支，交回巡线去跟。
+        # A23：完成判据与 TURN 同一套 —— "选中的带子已经在车正前方"：
+        #   aligned（岔路还看得见、带子已竖直）或 past_fork（岔路散了、近处带子居中）。
+        # A24：完成条件只有一条 —— **口子已经在车后**（岔路形态消失 + 近处那条带子
+        # 居中）。"带子已经在画面里竖直"(aligned) 只用来停止转向，不能当完成：
+        # 在"直道 + 侧支"的场地上，绿灯那侧往往就是直着走的那条带子，它本来就竖直，
+        # 于是模块会在口子还在车头前面时就交回巡线，巡线转头挑了另一条带子
+        # （2026-09-18 实测：选 left 的车走左边、选 right 的车**也**走左边）。
+        aligned, aligned_why = self._aligned_now()
+        # 口子已在车后：要么岔路形态彻底消失，要么它的下沿已经压到 ROI 底部
+        # （`drove_past_fork_row_ratio`，模块本来就用这条判"车头顶到口子上"）。
+        # 只要求"岔路消失"太严：这个场地的岔路（一条主带弯出去 + 一条贴的短段）
+        # 在画面里会一直存在，2026-09-18 11:41 实测就卡死在这一步。
+        past_fork = bool(centered) and (
+            not detection.valid
+            or detection.band_bottom_ratio >= settings.drove_past_fork_row_ratio
+        )
+        stable = (
+            past_fork
+            and self._turn_elapsed(now) >= settings.turn_min_duration
+        )
         if stable:
             self._rearm_ready_at = now + settings.rearm_cooldown
-            return self._completed("junction passed; line reacquired (%s)" % line_source)
+            return self._completed(
+                "junction passed; fork behind, line centred (%s)" % line_source
+            )
 
         if self._elapsed(now) > settings.settle_timeout:
-            return self._failed("line did not return after the turn (%s)" % line_source)
+            # 转到上限还没对准：**宁可失败停车，也不交回巡线去"猜"一条边** ——
+            # 猜错就是走上非绿灯的那条路（22:28 的教训）。
+            return self._failed(
+                "could not confirm entering the %s branch "
+                "(rotated %.1f deg, %s; fork still ahead)"
+                % ("?" if self.chosen_branch is None else self.chosen_branch.value,
+                   self._turn_rotated_deg, aligned_why)
+            )
 
         return self._running(now, "settling on the new branch")
 

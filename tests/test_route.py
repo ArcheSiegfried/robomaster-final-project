@@ -19,11 +19,14 @@ from route import (  # noqa: E402
     BRIDGING,
     BRIDGE_FORWARD_SPEED,
     BRIDGE_MIN_SECONDS,
-    END_APPROACH,
-    END_APPROACH_SPEED,
-    MONITORING,
     CENTERING,
     CORNERING,
+    END_APPROACH,
+    END_APPROACH_SPEED,
+    EVIDENCE_TEAM,
+    MONITORING,
+    REACQUIRING,
+    REACQUIRE_STABLE_FRAMES,
     SEARCHING,
     SEARCH_HARD_LIMIT_DEG,
     SEARCH_CONFIRM_YAW_SPEED,
@@ -52,6 +55,10 @@ def far_fragment_frame(x=400):
 
 def near_route_frame(x=320):
     return segment_frame((x, 355), (x, 120), thickness=24)
+
+
+def extending_route_frame(bottom_y, x=320):
+    return segment_frame((x, bottom_y), (x, 85), thickness=24)
 
 
 def near_old_line_frame(x=400):
@@ -169,7 +176,16 @@ class RouteVisionTests(unittest.TestCase):
         self.assertTrue(path.present)
         self.assertIsNotNone(path.endpoint)
         self.assertFalse(path.endpoint.internal)
-        self.assertLess(path.error, -0.5)
+        # 2026-09-17：作者把转向用的前瞻点改成 `CORNER_LOOKAHEAD_PIXELS = 65`
+        # （"在可见最远端转向会让连通直角看起来像断口"），这个误差的**量级**
+        # 因此从 -0.5 变成 -0.15。判定"直角 vs 断口"靠的是 endpoint.internal
+        # （上面那条），这里改成断言**两者的分离**而不是一个写死的旧阈值：
+        gap = self.vision.connected_path(disconnected_right_angle_frame(), 320)
+        self.assertLess(path.error, -0.10, "连通直角的横向误差应该明显偏一侧")
+        self.assertGreater(
+            gap.error, path.error + 0.10,
+            "真断口与连通直角的横向误差必须能分开（否则会把直角当断口）",
+        )
 
     def test_real_gap_has_internal_old_and_new_endpoints(self):
         image = disconnected_right_angle_frame()
@@ -203,14 +219,14 @@ class RouteRecoveryTests(unittest.TestCase):
         harness.start_line(now=1.0, x=400)
 
         pending = harness.feed_image(1.05, near_old_line_frame())
-        takeover = harness.feed_image(1.15, near_old_line_frame())
+        takeover = harness.feed_image(1.25, near_old_line_frame())
         self.assertEqual(pending.state, LINE_FOLLOWING)
         self.assertEqual(takeover.state, TASK_ACTIVE)
         self.assertEqual(takeover.command.forward, END_APPROACH_SPEED)
         self.assertIsNone(harness.gimbal.last_move())
 
-        first_blank = harness.feed_blank(1.20)
-        confirmed = harness.feed_blank(1.36)
+        first_blank = harness.feed_blank(1.30)
+        confirmed = harness.feed_blank(1.46)
         self.assertEqual(first_blank.command.forward, 0.0)
         self.assertEqual(confirmed.command.forward, 0.0)
         self.assertEqual(
@@ -223,7 +239,7 @@ class RouteRecoveryTests(unittest.TestCase):
         harness = TaskHarness(task=task)
         harness.start_line(now=1.0, x=400)
         harness.feed_image(1.05, near_old_line_frame())
-        harness.feed_image(1.15, near_old_line_frame())
+        harness.feed_image(1.25, near_old_line_frame())
 
         # This is already beyond the previous 2.5 s phase limit.  The task
         # must still follow the visible bottom line instead of failing.
@@ -336,6 +352,31 @@ class RouteRecoveryTests(unittest.TestCase):
         task._observe_candidate(FramePacket(first, 3, 1.10), 1.10)
         self.assertTrue(task.candidate_near)
 
+    def test_temporal_tracking_keeps_the_same_horizontal_endpoint(self):
+        task = RouteTask()
+        # 2026-09-17 更新夹具：作者的新线加了 `MIN_LOCK_BRANCH_PIXELS = 100`
+        # （"太小/太远的碎片不许进时序跟踪"）。原来 100px 的水平段实测
+        # branch_length 只有 92 -> 被那道闸（而不是被跟踪逻辑）拒掉，
+        # 所以把线段**往左**加长（右端=进场端点不动），保住本测试的意图：
+        # "同一段胶带平移时，跟踪到的是同一个进场端点"。
+        first = segment_frame((150, 190), (350, 190))
+        shifted = segment_frame((190, 190), (390, 190))
+
+        task._observe_candidate(FramePacket(first, 1, 1.0), 1.0)
+        first_endpoint = task._candidate.entry_endpoint
+        task._observe_candidate(FramePacket(shifted, 2, 1.05), 1.05)
+        second_endpoint = task._candidate.entry_endpoint
+
+        self.assertGreater(first_endpoint.point[0], 320)
+        self.assertGreater(second_endpoint.point[0], 350)
+        self.assertLess(
+            RouteTask._directed_angle_difference(
+                first_endpoint.tangent_deg,
+                second_endpoint.tangent_deg,
+            ),
+            10.0,
+        )
+
     def test_perpendicular_candidate_is_valid_for_known_right_angle_gap(self):
         task, harness, _ = start_and_trigger()
         settle_into_bridge(harness)
@@ -387,8 +428,9 @@ class RouteRecoveryTests(unittest.TestCase):
         task._old_tangent_world = None
         for now in (3.01, 3.06, 3.11):
             harness.feed_image(now, far_fragment_frame(x=320))
-        harness.feed_image(3.16, near_route_frame())
-        for now in (3.21, 3.26, 3.31, 3.36, 3.41, 3.46, 3.51):
+        harness.feed_image(3.16, extending_route_frame(260))
+        harness.feed_image(3.21, extending_route_frame(310))
+        for now in (3.26, 3.31, 3.36, 3.41, 3.46, 3.51):
             decision = harness.feed_image(now, near_route_frame())
             self.assertEqual(decision.state, TASK_ACTIVE)
         lowering = harness.feed_image(3.56, near_route_frame())
@@ -416,8 +458,9 @@ class RouteRecoveryTests(unittest.TestCase):
         task._old_tangent_world = None
         for now in (3.01, 3.06, 3.11):
             harness.feed_image(now, far_fragment_frame(x=320))
-        harness.feed_image(3.16, near_route_frame())
-        for now in (3.21, 3.26, 3.31, 3.36, 3.41, 3.46, 3.51, 3.56):
+        harness.feed_image(3.16, extending_route_frame(260))
+        harness.feed_image(3.21, extending_route_frame(310))
+        for now in (3.26, 3.31, 3.36, 3.41, 3.46, 3.51, 3.56):
             harness.feed_image(now, near_route_frame())
 
         failed = harness.feed_blank(5.57)
@@ -431,12 +474,26 @@ class RouteRecoveryTests(unittest.TestCase):
         harness = TaskHarness(task=task)
         harness.start_line(now=1.0, x=320)
         first = harness.feed_image(1.05, connected_right_angle_frame())
-        corner = harness.feed_image(1.15, connected_right_angle_frame())
+        corner = harness.feed_image(1.25, connected_right_angle_frame())
         self.assertEqual(first.state, LINE_FOLLOWING)
         self.assertEqual(corner.state, TASK_ACTIVE)
         self.assertEqual(task.state, CORNERING)
         self.assertGreater(corner.command.forward, 0.0)
         self.assertLess(corner.command.yaw, 0.0)
+        self.assertIsNone(harness.gimbal.last_move())
+
+    def test_connected_corner_tolerates_a_short_path_dropout(self):
+        task = RouteTask()
+        harness = TaskHarness(task=task)
+        harness.start_line(now=1.0, x=320)
+        harness.feed_image(1.05, connected_right_angle_frame())
+        harness.feed_image(1.25, connected_right_angle_frame())
+
+        missing = harness.feed_blank(1.50)
+        recovered = harness.feed_image(1.60, connected_right_angle_frame())
+        self.assertEqual(task.state, CORNERING)
+        self.assertEqual(missing.command.forward, 0.0)
+        self.assertGreater(recovered.command.forward, 0.0)
         self.assertIsNone(harness.gimbal.last_move())
 
     def test_saved_old_tangent_rejects_old_line_and_accepts_perpendicular(self):
@@ -476,6 +533,75 @@ class RouteRecoveryTests(unittest.TestCase):
         decision = harness.feed_image(3.16, far_fragment_frame(x=400))
         self.assertEqual(decision.command.forward, 0.0)
         self.assertNotEqual(decision.command.lateral, 0.0)
+
+    def test_confirming_the_recovered_route_queues_the_scoring_photo(self):
+        """8.1: the evidence photo is queued at the *confirmed* reacquisition.
+
+        ``_step_reacquiring`` is the task's own "recovery succeeded, hand back
+        to line following" moment: the normal base line detector has seen the
+        new route centered and heading-aligned for REACQUIRE_STABLE_FRAMES
+        frames, and the very next step returns COMPLETED.  That is the instant
+        the scoring photo must be queued, so the saved image shows the route
+        that was *found again*, not a frame from the still-searching descent.
+
+        The preceding states are staged directly instead of replayed frame by
+        frame: the full handoff chain is covered by other tests in this file,
+        and this test isolates the evidence contract at the confirmation step.
+        """
+        task, harness, _ = start_and_trigger()
+        settle_into_bridge(harness)
+        task.state = REACQUIRING
+        task.started_at = 2.16
+        task._phase_started_at = 2.16
+        # The camera is already lowered at this point, so no gimbal settle.
+        task._reacquire_view_already_low = True
+        task._stable_frames = 0
+        task._stable_last_sequence = None
+        task._line_detector.reset()
+
+        confirmed = None
+        for index in range(REACQUIRE_STABLE_FRAMES):
+            now = 3.00 + index * 0.05
+            decision = harness.feed_image(now, near_route_frame())
+            if index < REACQUIRE_STABLE_FRAMES - 1:
+                # Not yet confirmed: no photo may be queued before the task
+                # itself decides the correct route has been found again.
+                self.assertIsNone(
+                    task.pending_evidence_request,
+                    "photo queued before the route was confirmed",
+                )
+            confirmed = decision
+        self.assertEqual(confirmed.task_update.status, TaskStatus.COMPLETED)
+        self.assertEqual(
+            confirmed.task_update.message,
+            "base line detector confirmed centered new route",
+        )
+
+        request = task.take_evidence_request()
+        self.assertIsNotNone(request, "no scoring photo queued on confirmation")
+        self.assertEqual(request.kind, "route")
+        self.assertEqual(request.annotation, "Team 10 finds correct to follow")
+        self.assertEqual(EVIDENCE_TEAM, "10")
+        self.assertIsNotNone(request.image)
+        # The annotation must ride on the frame the route was confirmed in.
+        self.assertEqual(request.image.shape, near_route_frame().shape)
+        self.assertEqual(request.shape, "rect")
+        # 老师要求"照片里要显示出重新找到的路线并标注"：那一刻必须真的拿到框。
+        self.assertIsNotNone(request.detection)
+        self.assertIsNotNone(request.detection.box)
+        box_left, box_top, box_right, box_bottom = request.detection.box
+        height, width = request.image.shape[:2]
+        self.assertTrue(
+            0 <= box_left < box_right <= width and 0 <= box_top < box_bottom <= height,
+            f"evidence box {request.detection.box} leaves the frame",
+        )
+
+        # Same event, one photo only: re-queueing must not duplicate it.
+        task._queue_recovery_evidence(None, None)
+        self.assertIsNone(task.pending_evidence_request)
+        # The real writer result is acknowledged, but a failed write is
+        # tolerated: either way the task already handed control back.
+        self.assertTrue(task.acknowledge_evidence(request.request_id, True))
 
     def test_total_timeout_fails_stops_and_restores_line_view(self):
         _, harness, _ = start_and_trigger()

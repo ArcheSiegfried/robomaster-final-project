@@ -4,7 +4,7 @@
 
 模块：`number_marker.py`
 
-基线：`integration` @ `de781590a9fdbd1b4d41eb3fa11f92f65a334272`
+本次 handoff closure 基线：`integration` @ `66e526edb1e4c365a5cc1031bcfeb6d91e8c45fc`
 
 ## Requirement mapping
 
@@ -19,7 +19,7 @@
 | face / center | `compute_aim_intent()`、`_integrate_pitch()`、`is_marker_centered()` | 水平误差继续输出底盘 yaw；垂直误差经受限时间积分后输出既有 `GimbalCommand` 绝对 pitch；居中帧不发送多余云台指令 |
 | 连续稳定后锁定 | `aim_stable_frames`、frame sequence 去重 | 同一帧重复调用不增加计数 |
 | marker 丢失/观测过期 | `LOST`、freshness 校验 | 立即零运动；超过模块超时后 `FAILED` |
-| scoring snapshot | `EvidenceRequest`、`render_evidence_image()`、保存回执 | 请求含真实全帧、框、ID、队号文字和中心文字锚点；主循环 evidence service 已接收请求并回传真实写盘结果 |
+| scoring snapshot | `EvidenceRequest`、保存回执 | 本模块只构造请求：真实全帧副本、全帧坐标框、ID、默认 Team 10 文字与中心文字锚点；正式图片只由 `evidence.py` 渲染并写盘 |
 | 个人函数由主流程调用 | `NumberMarkerTask.step()` | 已在 `task_registry.py` 注册，`main.build_coordinator()` 逐帧调用；marker source 与 evidence service 均已接入主循环 |
 
 ## Current integration interface
@@ -81,11 +81,17 @@ Final 文件未定义 nearest 的距离来源，也未定义“最近但太小�
 - `Team <number> detects a marker with ID of <id>`；
 - 画面中心文字锚点。
 
-主循环的 evidence service 调用 `take_evidence_request()` 取走请求，保存
-`render_evidence_image()` 的结果，再用
+`NumberMarkerConfig.team_number` 的正式默认值为 `"10"`，仍可显式覆盖。annotation 由
+`self.settings.team_number` 与当前 marker ID 动态组成；没有把整句写成固定字符串。首次请求 ID 是
+`marker:<id>:frame:<sequence>:attempt:1`，有界重试在旧 ID 后追加 `:retryN`，每次不同；旧 ID
+回执无效。
+
+主循环的 evidence service 调用 `take_evidence_request()` 取走请求，由 `evidence.py` 的
+`render_task_evidence()` 在全帧副本上画框文字并保存，再用
 `acknowledge_evidence(request_id, saved)` 回传实际写盘结果。只有 `saved=True` 才加入
-`saved_ids` 并完成；失败不会伪装成功。重试次数可配置，重试不重复执行瞄准。未配置真实队号
-会在锁定后失败，避免生成伪造队号证据。
+`saved_ids` 并完成；失败不会伪装成功。重试次数可配置且有限，重试不重复执行瞄准。
+`EVIDENCE_PENDING` 未回执时保持 `RUNNING` 与零运动，不继续 yaw/pitch 漂移；终态立即清除本模块
+的排队请求和 pitch 瞬态。若调用方显式把队号设为空，锁定后仍安全失败，避免伪造队号证据。
 
 ## Offline verification
 
@@ -96,10 +102,13 @@ C:\Users\15836\anaconda3\envs\robomaster38\python.exe -m unittest tests.test_num
 C:\Users\15836\anaconda3\envs\robomaster38\python.exe scripts\check_module.py number_marker
 ```
 
-模块测试共 56 项：原有 40 项全部保留，并新增 16 项，覆盖居中无多余 pitch、上下方向、符号
+本次模块测试共 64 项：原有 56 项中仅把旧模块 renderer 测试改为正式 evidence renderer 测试，
+另新增 8 项 handoff/失败清理测试。此前测试覆盖居中无多余 pitch、上下方向、符号
 单点翻转、0.20 秒积分上限、重复时间戳、上下角度限幅、水平和垂直同时输出、校正后稳定锁定、
 目标短时丢失、陈旧帧、evidence pending 无漂移、完成/失败后新目标从 entry pitch 重新开始，
-以及 `TaskUpdate.gimbal` 经真实 coordinator 到既有 `GimbalOutput` 的离线贯通。
+以及 `TaskUpdate.gimbal` 经真实 coordinator 到既有 `GimbalOutput` 的离线贯通。本次额外验证默认
+Team 10、动态 ID、完整请求字段/全帧副本、有界唯一重试、旧回执拒绝、pending 零运动、重复 ID
+不再计分和失败即时清理。
 结果只可标为 **OFFLINE VERIFIED**。
 
 ## Unresolved requirement ambiguities
@@ -109,7 +118,7 @@ C:\Users\15836\anaconda3\envs\robomaster38\python.exe scripts\check_module.py nu
 - “face” 要求底盘朝向、云台朝向或两者都要。
 - 中心区域的精确几何定义。
 - 已瞄准但截图写盘失败时，允许几次补存，以及如何计分。
-- 正式 team number、marker 样式、真实尺寸、颜色、视距与光照范围。
+- marker 样式、真实尺寸、颜色、视距与光照范围。
 
 ## Hardware tuning checklist
 

@@ -28,6 +28,15 @@ MIN_FRAGMENT_MAJOR_PIXELS = 28.0
 # a physical endpoint.
 ENDPOINT_BORDER_PIXELS = 28
 MIN_ENDPOINT_BRANCH_PIXELS = 24.0
+ENDPOINT_FIT_INNER_PIXELS = 10.0
+ENDPOINT_FIT_OUTER_PIXELS = 140.0
+MIN_ENDPOINT_FIT_POINTS = 24
+MAX_ENDPOINT_FIT_MEDIAN_ERROR = 6.0
+# Steering at the farthest visible endpoint makes a connected corner look
+# sharper and earlier than it really is.  Follow a point this far along the
+# skeleton from the robot-side end instead; the far endpoint remains available
+# only for deciding whether the tape physically ends.
+CORNER_LOOKAHEAD_PIXELS = 65.0
 
 
 @dataclass(frozen=True)
@@ -38,6 +47,7 @@ class RouteEndpoint:
     tangent_deg: float
     internal: bool
     branch_length: float
+    line_point: Optional[Tuple[float, float]] = None
 
 
 @dataclass(frozen=True)
@@ -71,6 +81,7 @@ class RouteCandidate:
     score: float
     endpoints: Tuple[RouteEndpoint, ...] = ()
     entry_endpoint: Optional[RouteEndpoint] = None
+    line_point: Optional[Tuple[float, float]] = None
 
 
 class RouteVision:
@@ -122,10 +133,11 @@ class RouteVision:
         points = contour.reshape(-1, 2).astype(np.float32)
         if len(points) < 2:
             return None
-        vx, vy, _, _ = cv2.fitLine(
-            points, cv2.DIST_L2, 0, 0.01, 0.01
+        vx, vy, x0, y0 = cv2.fitLine(
+            points, cv2.DIST_HUBER, 0, 0.01, 0.01
         ).reshape(-1)
         vx, vy = float(vx), float(vy)
+        x0, y0 = float(x0), float(y0)
         # The route tangent is undirected.  Prefer the direction that points
         # towards the top of the image, i.e. away from the robot.
         if vy > 0.0 or (abs(vy) < 1e-6 and vx < 0.0):
@@ -141,6 +153,7 @@ class RouteVision:
             angle,
             (int(round(upper[0])), int(round(upper[1]))),
             (int(round(lower[0])), int(round(lower[1]))),
+            (x0, y0),
         )
 
     @staticmethod
@@ -222,27 +235,46 @@ class RouteVision:
         left, top = offset
         frame_height, frame_width = frame_shape
         features = []
-        # A local Euclidean neighbourhood is more stable than the first two
-        # skeleton pixels and remains cheap for the small route components.
-        tangent_radius = 30.0
         for y, x in endpoint_pixels:
             distances = np.hypot(points[:, 1] - x, points[:, 0] - y)
-            band = points[
-                (distances >= MIN_ENDPOINT_BRANCH_PIXELS)
-                & (distances <= tangent_radius)
-            ]
-            if len(band) == 0:
-                far_index = int(np.argmax(distances))
-                target_y, target_x = points[far_index]
-            else:
-                # Median suppresses one-pixel skeleton spurs around a bend.
-                target_y, target_x = np.median(band, axis=0)
-            dx = float(target_x - x)
-            dy = float(target_y - y)
             branch_length = float(np.max(distances))
             if branch_length < MIN_ENDPOINT_BRANCH_PIXELS:
                 continue
-            angle = degrees(atan2(dx, max(-dy, 1e-6)))
+
+            # The course guarantees a substantial straight segment after a
+            # physical gap.  Estimate its direction from that segment instead
+            # of the first 20-30 skeleton pixels at the endpoint: the latter
+            # was dominated by jagged tape ends and produced unstable ALIGN
+            # commands.  Huber fitting suppresses the remaining skeleton spurs.
+            fit_band = points[
+                (distances >= ENDPOINT_FIT_INNER_PIXELS)
+                & (distances <= ENDPOINT_FIT_OUTER_PIXELS)
+            ]
+            if len(fit_band) < MIN_ENDPOINT_FIT_POINTS:
+                continue
+            fit_xy = np.column_stack(
+                (fit_band[:, 1], fit_band[:, 0])
+            ).astype(np.float32)
+            vx, vy, x0, y0 = cv2.fitLine(
+                fit_xy, cv2.DIST_HUBER, 0, 0.01, 0.01
+            ).reshape(-1)
+            vx, vy = float(vx), float(vy)
+            x0, y0 = float(x0), float(y0)
+            residuals = np.abs(
+                (fit_xy[:, 0] - x0) * vy
+                - (fit_xy[:, 1] - y0) * vx
+            )
+            if float(np.median(residuals)) > MAX_ENDPOINT_FIT_MEDIAN_ERROR:
+                continue
+
+            # Direct the fitted axis from the physical endpoint into the new
+            # route.  This keeps left/right 90-degree approaches distinct and
+            # lets ALIGN rotate the chassis along the route before centering.
+            mean_dx = float(np.mean(fit_xy[:, 0]) - x)
+            mean_dy = float(np.mean(fit_xy[:, 1]) - y)
+            if vx * mean_dx + vy * mean_dy < 0.0:
+                vx, vy = -vx, -vy
+            angle = degrees(atan2(vx, -vy))
             while angle > 180.0:
                 angle -= 360.0
             while angle <= -180.0:
@@ -259,6 +291,7 @@ class RouteVision:
                     tangent_deg=float(angle),
                     internal=internal,
                     branch_length=branch_length,
+                    line_point=(x0 + left, y0 + top),
                 )
             )
         return tuple(features)
@@ -327,6 +360,24 @@ class RouteVision:
                 item.point[1] - robot_end.point[1],
             ),
         )
+        skeleton = self._thin(component)
+        skeleton_y, skeleton_x = np.nonzero(skeleton)
+        if skeleton_x.size:
+            full_x = skeleton_x + left + local_x
+            full_y = skeleton_y + top + local_y
+            distances = np.hypot(
+                full_x - robot_end.point[0],
+                full_y - robot_end.point[1],
+            )
+            lookahead_index = int(
+                np.argmin(np.abs(distances - CORNER_LOOKAHEAD_PIXELS))
+            )
+            lookahead = (
+                int(full_x[lookahead_index]),
+                int(full_y[lookahead_index]),
+            )
+        else:
+            lookahead = far_end.point
         x, y, box_width, box_height = (
             local_x + left,
             local_y + top,
@@ -340,11 +391,11 @@ class RouteVision:
             confidence=1.0,
             box=(x, y, x + box_width, y + box_height),
         )
-        error = (far_end.point[0] - width / 2.0) / max(width / 2.0, 1.0)
+        error = (lookahead[0] - width / 2.0) / max(width / 2.0, 1.0)
         return RoutePathObservation(
             True,
             endpoint=far_end,
-            lookahead_point=far_end.point,
+            lookahead_point=lookahead,
             error=float(error),
             detection=detection,
         )
@@ -428,7 +479,7 @@ class RouteVision:
             geometry = self._line_geometry(contour)
             if geometry is None:
                 continue
-            angle, upper_local, lower_local = geometry
+            angle, upper_local, lower_local, line_point_local = geometry
             contour_x, contour_y, contour_width, contour_height = cv2.boundingRect(contour)
             component = np.zeros((contour_height, contour_width), dtype=np.uint8)
             shifted = contour.copy()
@@ -494,6 +545,10 @@ class RouteVision:
                     score=float(score),
                     endpoints=endpoints,
                     entry_endpoint=entry_endpoint,
+                    line_point=(
+                        float(line_point_local[0] + left),
+                        float(line_point_local[1] + top),
+                    ),
                 )
             )
 

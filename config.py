@@ -11,7 +11,10 @@ class VisionConfig:
     hsv_lower: HSV = (95, 80, 60)
     hsv_upper: HSV = (135, 255, 255)
     roi_left: float = 0.06
-    roi_top: float = 0.54
+    # Real-car right-angle logs showed the upper far band seeing the outgoing
+    # arm too early and commanding about 90 deg/s before the chassis reached
+    # the corner.  Move the top edge down so steering is based on nearer tape.
+    roi_top: float = 0.62
     roi_right: float = 0.94
     roi_bottom: float = 0.96
     open_kernel: int = 3
@@ -78,6 +81,10 @@ class TaskConfig:
 
     # A single continuous takeover longer than this is aborted and released.
     max_task_seconds: float = 20.0
+    # 终端"竞争探测"间隔（秒）：每到这个时间点，协调器在那**一帧**把所有模块都问一遍，
+    # 记录各自想不想接管（胜负规则不变，仍是顺序里第一个 RUNNING），好让操作员看到
+    # "谁在竞争、最后判给了谁"。设 0 = 关闭（不额外调用任何模块）。
+    claim_probe_seconds: float = 3.0
     # After a task releases, wait this long for a fresh valid line before
     # giving up and requiring a human SPACE press.
     release_resume_timeout: float = 2.0
@@ -129,11 +136,12 @@ class RuntimeConfig:
     marker_coordinate_mode: str = "auto"
     # 终端状态反馈（丢线、任务接管、异常、心跳）。False = 完全不打印。
     console_status: bool = True
-    #: 心跳行间隔（秒）。只影响"还活着"那行的频率，不影响状态变化行。
-    console_heartbeat_seconds: float = 2.0
-    #: 有模块接管时的心跳间隔（秒）。比上面快得多，好让操作员在 VS Code 终端里
-    #: 实时看到"此刻是哪个模块在开车、已经跑了多久、它在发什么命令"——调优先级用。
-    console_task_heartbeat_seconds: float = 0.5
+    #: 心跳行间隔（秒）：**每 3 秒**打一行"现在是谁在开车、它在干什么"。
+    #: 只影响心跳，不影响状态变化行（接管/结束/丢线/异常都是立刻打）。
+    console_heartbeat_seconds: float = 3.0
+    #: 有模块接管时的心跳间隔（秒）。默认与上面相同（统一 3 秒一行）；
+    #: 想让接管期间更密就把它调小（例如 0.5）。
+    console_task_heartbeat_seconds: float = 3.0
     display: bool = True
     vision: VisionConfig = field(default_factory=VisionConfig)
     control: ControlConfig = field(default_factory=ControlConfig)

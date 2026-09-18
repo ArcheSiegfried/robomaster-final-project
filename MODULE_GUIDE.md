@@ -1,6 +1,9 @@
 # 模块接口与协作说明
 
-公共接口版本：**v0.2（Issue #15 批准）**。v0.2 只增加可选云台请求，v0.1 的既有字段、单位和调用顺序保持兼容。
+公共接口版本：**v0.3（2026-09-17 批准）**。v0.3 **只扩展 `GimbalOutput` 的行为**（见第 2 节"云台请求"），
+`GimbalCommand` / `TaskUpdate` 的字段、单位和调用顺序**一律不变**，v0.1/v0.2 写成的模块零改动。
+
+版本历史：v0.2（Issue #15 批准）只增加可选云台请求，v0.1 的既有字段、单位和调用顺序保持兼容。
 
 骨架版本：**v0.2-task-skeleton**（第 6 节）。骨架只做了**附加**：新增协调层 `coordinator.py`、
 注册表 `task_registry.py`、任务安全参数 `config.TaskConfig` 和模块协议。第 2 节中
@@ -140,7 +143,7 @@ def step(self, frame: FramePacket, now: float) -> TaskUpdate:
 
 `NOT_TRIGGERED` 表示当前帧不接管；`RUNNING` 表示继续处理；`COMPLETED` 和 `FAILED` 都应停止该任务的运动请求并交回主流程处理。`step()` 必须快速返回。
 
-### 云台请求（v0.2）
+### 云台请求（v0.2 类型 / v0.3 出口行为）
 
 ```python
 GimbalCommand(
@@ -149,7 +152,78 @@ GimbalCommand(
 )
 ```
 
-角度单位为度，表示相对机器人上电基准的绝对目标角。任务只把请求放入 `TaskUpdate.gimbal`；`GimbalOutput` 是唯一动态云台出口，并负责限幅、非有限值回退和相同请求去重。正式运行保持 `CHASSIS_LEAD`，因此底盘搜索时云台 yaw 跟随底盘，任务主要请求 pitch。任务完成、失败、超时、异常、人工停止或视频失效后，协调器恢复 `CONFIG.gimbal_pitch/gimbal_yaw`，等待 `gimbal_settle_seconds` 后才尝试恢复巡线。
+角度单位为度，表示相对机器人上电基准的绝对目标角。任务只把请求放入 `TaskUpdate.gimbal`；`GimbalOutput` 是唯一动态云台出口。正式运行保持 `CHASSIS_LEAD`，因此底盘搜索时云台 yaw 跟随底盘，任务主要请求 pitch。
+
+**v0.3（2026-09-17）——为什么改**：SDK 在已有动作执行中再发 `gimbal.moveto()` 会直接抛
+`Robot is already performing N action(s)`（`robomaster/action.py`）。旧出口只对"目标完全相同"去重，
+换一个目标就撞上这个异常，协调器把它当成任务故障并重置任务；实车表现为
+**number_marker 的 ID 4 接管后立刻掉链子**。v0.3 把出口改成"串行化 + 保留最新目标"：
+
+1. **同一时刻只有一个绝对动作在飞**；忙时**不再调用 `moveto`**，只把目标放进 `pending`（**最新覆盖旧的**）；
+2. **动作完成后由 `poll()` 收割并补发** `pending`；`poll()` 幂等、**非阻塞**（只读 action 的
+   `state / is_completed / has_failed / failure_reason`，绝不 `wait_for_completed` 等待）；
+3. **`restore_line_view()` 可重试**：忙时同样只是排队，动作完成后自动补发（它天然是最新目标）；
+4. **不再向调用方抛异常**：`already performing` 只记进 `last_error` / `stats()`（`rejected_by_inflight`）；
+   动作失败最多重试 2 次，之后放弃该目标并记录（`last_error`），不会无限重试；
+5. 出口新增只读面：`busy`、`pending`、`last_error`、`at_line_view`、`stats()`。
+
+**谁负责每帧推进（v0.3 的接口约定）**：`coordinator.py` 在 `step()` 里**每帧恰好一次**调用
+`gimbal_output.poll()`（在任何状态分支之前）。这是闭环的一部分：
+`coordinator.py` 的释放路径只在任务结束那一帧请求一次恢复，**没有周期性的 poll，
+排队的"回巡线视角"就永远发不出去**（车会一直停在 `waiting for gimbal to return to line view`）。
+释放期间协调器还会**等 `at_line_view` 为真**才开始 `gimbal_settle_seconds` 计时，并且**有界**：
+超过 `release_resume_timeout` 仍未回正就转进"需要人工复位"的既有路径，不无限停车。
+（老出口没有 `poll`/`at_line_view` 时，协调器按改造前行为处理，逐字节兼容。）
+
+任务完成、失败、超时、异常、人工停止或视频失效后，协调器恢复 `CONFIG.gimbal_pitch/gimbal_yaw`，
+等云台真的到位并 settle 之后才尝试恢复巡线。
+
+#### 实验入口专用的第二个云台出口（2026-09-17 豁免说明）
+
+`route_only_main.py`（直角长断口"云台侧视"实验入口）会注入
+`route_gimbal_output.RouteGimbalOutput` —— 它**继承** `GimbalOutput`，增加了"相对车头 yaw +
+云台角度遥测"模式。这是**唯一被批准的第二个云台出口**，边界如下：
+
+* **只允许实验入口使用**：默认 `main.py` 仍然只用 `GimbalOutput`（`gimbal_output_factory=None`）；
+* 它**不得**直接 import SDK，也不得绕过集中出口的限幅；
+* 实验任务 `route_gimbal.py`（`GimbalAlignedRouteTask`）**不登记进 `task_registry.py`**
+  （默认接管顺序与实车行为不受影响），只从该入口启用；契约测试用
+  `tests/test_task_contract.py::EXPERIMENT_ONLY_MODULES` 显式豁免，并**反向断言它不在注册表里**。
+
+### 得分照片（任务证据，统一层）
+
+**照片张数就是 Final 的分数**，而"画框/画圈/写字/去重/落盘/写进 report.md"全部由证据层
+（`evidence.py`，整合负责人维护）负责 —— 模块**只负责在得分那一刻把请求交出来**，
+并且**文案由证据层统一生成**（5 个模块各写一套必然口径不一）：
+
+```python
+from evidence import make_evidence_photo
+
+photo = make_evidence_photo(
+    "obstacle",                       # 见 evidence.ANNOTATION_TEMPLATES
+    frame,                            # FramePacket
+    detection=detection,              # 带 .box 的 VisualDetection（矩形/圆都用它）
+    shape="rect",                     # "rect"=框（障碍/堵车/路线/标识），"circle"=圈（灯）
+    side="left", chosen="right",      # 按模板需要填（漏填会当场 KeyError）
+)
+```
+
+交出去的链路与 `number_marker` / `traffic_light` 一样（`main.service_task_evidence()`
+每帧对所有任务轮询，**必须回执**）：
+
+```python
+request = task.take_evidence_request()                 # 任务交出
+saved = recorder.save_task_evidence(request)           # 证据层画 + 存，返回真实结果
+task.acknowledge_evidence(request.request_id, saved)   # 回传真实结果
+```
+
+两条硬规矩：
+
+* **尽力而为**：写盘失败绝不允许改变任务行为（不许因此 FAILED、停车或重试到超时）；
+* **同一事件只存一张**：`event_key` 默认 = 照片标签，证据层对同一个事件键只写一次
+  （红灯与绿灯是两个不同事件，必须分别保存）。
+
+完整对照表（老师后来明确的 5 组要求）见 [`EVIDENCE_PHOTOS.md`](EVIDENCE_PHOTOS.md)。
 
 ### 巡线暂停和恢复
 
@@ -230,7 +304,7 @@ python -m unittest discover -s tests -v
 每个文件已在 `task_registry.py` 里登记好，组员**只替换文件内容**即可：
 
 ```python
-MOTION_TASK_CLASSES = (TrafficLightTask, NumberMarkerTask, ...)  # 可接管运动，顺序即优先级
+MOTION_TASK_CLASSES = (GreenJunctionTask, ObstacleTask, ...)  # 可接管运动，顺序即优先级
 OBSERVER_CLASSES = (EvidenceRecorder,)                            # 每帧可见，永不接管
 ```
 

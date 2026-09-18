@@ -12,57 +12,29 @@
 
 from evidence import EvidenceRecorder
 from free_junction import FreeJunctionTask
-from green_junction import GreenJunctionTask, make_light_probe
+from green_junction import GreenJunctionTask
 from number_marker import NumberMarkerTask
 from obstacle import ObstacleTask
 from route import RouteTask
-from traffic_light import TrafficLightDetector, TrafficLightTask
-
-#: 绿岔路模块要的"现在是什么灯"。它自己不认灯（契约禁止它直接读别人的判定），
-#: 只接受一个注入缝 `light_probe(frame, now) -> LightReading`；而本注册表是
-#: **唯一无参构造任务的装配点**，所以这根线必须在这里接（见 PR#45 的 A14）。
-#:
-#: 两个必须注意的点（依据 PR#45 审查）：
-#: 1. 只包**无状态**的 `TrafficLightDetector`。不要包 `TrafficLightTask()`——
-#:    那会养出第二台灯机、自己往证据队列塞红灯截图（实测 state=holding_red）。
-#: 2. `min_confidence` 不取它默认的 0.0（等于来者不拒）；实车真绿灯实测
-#:    conf≈0.62，所以这里要求 0.40。
-LIGHT_PROBE_MIN_CONFIDENCE = 0.40
-
-
-def build_light_probe(detector=None, min_confidence=LIGHT_PROBE_MIN_CONFIDENCE):
-    """把交通灯模块的识别结果转成绿岔路模块要的灯色探针。
-
-    探针只做翻译，不重复判定：红绿灯识别仍由 `traffic_light` 负责。
-    看不见灯或认不出颜色时如实返回 UNKNOWN —— 绿岔路会因此**不接管**
-    （他的 A14：真的拿到红/绿读数才算有判据来源），于是不会再把握不住的
-    岔路从后面的模块手里抢走。构造失败就返回 None（等于没接探针）。
-    """
-    try:
-        detector = TrafficLightDetector() if detector is None else detector
-        return make_light_probe(detector, min_confidence=min_confidence)
-    except Exception:
-        return None
-
-
-def _build_task(cls, light_probe):
-    """按类装配任务；需要外部观测的模块在这里注入。"""
-    if cls is GreenJunctionTask:
-        return cls(light_probe=light_probe)
-    return cls()
+from traffic_light import TrafficLightTask
 
 # 功能模块：一个文件 = 一个名额 = 一个人。顺序即接管优先级。
 #
-# 2026-09-16 按实车反馈调整（第二版，集成负责人确认）：
-#   红绿灯 → 红绿灯岔路 → 障碍物绕行 → 短线巡回 → 障碍物岔路 → 数字识别
-# 变化：`obstacle` 从第 6 位升到第 3 位（车前方的障碍必须先处理）；
-#       `free_junction` 从第 3 位降到第 5 位；
-#       `number_marker` 挪到最后（它目前在实车上"看到标识却不接管"，
-#       先让真正会动作的模块先接管；它的诊断见 marker_source.stats() 的宽度字段）。
-# 注意顺序的代价：`obstacle` 现在会优先于岔路/巡回/标识接管，
-# 而它的误触发率还不低（29 次运行里 26 帧被判成障碍），修判据之前要留意。
+# 2026-09-17 变更（集成负责人确认）：**`traffic_light.py` 回来了**（3 号 ASmoon540 重新提交）。
+# 它 09-16 被删的理由是"实车上反复把红色物体判成红灯并原地锁停"，这版把那条治了：
+#   * 红灯 2 帧就停、绿灯 5 帧 + 0.30s 丢帧宽限才放行（停得快、放得慢，偏向安全）；
+#   * **"总停车时钟"（`max_hold_seconds=15`）不被绿灯闪断重置** → 卡死最终一定 FAILED，
+#     不会像老版本那样无限锁停；
+#   * **绿灯从 IDLE 状态永不接管**（绿灯只用来"放行"，不抢正在开车的车）；
+#   * 顺带把红灯的得分截图接上了 evidence 通道（`Team 10 detects a red light and stops the robot`）。
+# 位置放回第 1 位（红绿灯是安全项）。两个副作用都要知道：
+#   1. `coordinator.py` 的"红灯否决权"**重新生效**：任何任务在开车时遇到红灯都会被暂停
+#      （暂停时间不计入任务预算），红灯消失后原任务继续；
+#   2. 灯色判据现在**两个模块都有**（本模块 + `green_junction` 的内置认灯器）；岔路口的
+#      绿灯仍归 `green_junction`（本模块绿灯不接管）。
+# 老提醒仍然成立：`obstacle` 优先于岔路/巡回/标识接管。
 MOTION_TASK_CLASSES = (
-    TrafficLightTask,  # 1 红绿灯（红灯是停车条件，最先判断）
+    TrafficLightTask,  # 1 红绿灯（红灯停、绿灯确认后放行）
     GreenJunctionTask,  # 2 红绿灯岔路
     ObstacleTask,  # 3 障碍物绕行
     RouteTask,  # 4 短线巡回
@@ -84,13 +56,9 @@ def build_motion_tasks(enabled_names=None):
     task.  A tuple such as ``("route",)`` is intended for an isolated real-car
     test entry: the registry remains complete, while unrelated unfinished
     detectors cannot take over during that test.
-
-    **装配在这里接线**：绿岔路模块自己不认红绿灯，必须由这里注入灯色探针
-    （见 `build_light_probe`），否则它在生产环境下永远不会接管。
     """
-    light_probe = build_light_probe()
     if enabled_names is None:
-        return tuple(_build_task(cls, light_probe) for cls in MOTION_TASK_CLASSES)
+        return tuple(cls() for cls in MOTION_TASK_CLASSES)
 
     requested = tuple(enabled_names)
     if not requested:
@@ -102,7 +70,7 @@ def build_motion_tasks(enabled_names=None):
     unknown = tuple(name for name in requested if name not in by_name)
     if unknown:
         raise ValueError("unknown motion task(s): %s" % ", ".join(unknown))
-    return tuple(_build_task(by_name[name], light_probe) for name in requested)
+    return tuple(by_name[name]() for name in requested)
 
 
 def build_observers(capture_directory=None):

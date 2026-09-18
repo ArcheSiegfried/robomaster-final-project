@@ -84,12 +84,16 @@
     python obstacle.py 样图.png [输出掩膜.png]
 """
 
+from dataclasses import replace
 from typing import Optional
+
+import time
 
 import cv2
 import numpy as np
 
 from config import CONFIG
+from evidence import TEAM_NUMBER, make_evidence_photo
 from models import (
     FramePacket,
     MotionCommand,
@@ -105,12 +109,42 @@ KIND = "obstacle"
 # 1. 可调参数（假设全在这里；改这一节就够了）
 # =====================================================================
 
+# 【v10】触发条件：**视野里有车 且 蓝线消失**（用户要求）。
+#
+# 为什么要这样：原来"一看到车就开始横移"，车会在离障碍还很远的地方就早早开始绕，
+# 结果每次都**正好停在障碍机器人前面**，然后才手忙脚乱地躲。
+#
+# 现在等到**蓝线被障碍挡住**才动手 —— 蓝线在近处消失 = 车已经开到障碍跟前了，
+# 这本身就是最可靠的"距离检测"（比任何像素估距都稳），
+# 而且必须**同时**看到车（SDK 机器人识别），避免把"线断了"误当成"有障碍"。
+TRIGGER_NEEDS_LINE_LOST = True
+
+# 触发之后的动作是**开环**的：OUT -> PASS -> BACK -> 回到线上，
+# 过程中**不再看蓝线、也不再看障碍框**（用户要求），只管绕过去。
+# 只有最后 SEEK 段才重新看线，用来确认"线回来了"。
+
 # --- 绕行方向 ---
-DODGE_SIDE = "left"          # "left" 往左绕；"right" 往右绕
+DODGE_SIDE = "left"          # 默认往左绕（障碍基本在正中间时用这个）
+# 【v8】PDF item 3 要求 "observe carefully to choose go around it from left or right"，
+# 快照里还要写清是从哪边绕的 —— 所以不能永远往左。
+# 规则：障碍明显偏左就从右边绕、明显偏右就从左边绕（离它远一点更安全）；
+# 偏离不到 SIDE_DEADBAND 就按 DODGE_SIDE 的默认值。
+SIDE_DEADBAND = 0.25         # 障碍横向偏移小于这个比例就算"在正中间"
+
+# --- 尺寸（米）—— 全部来自 DJI 官方技术参数，不是估的 ---
+#   https://www.dji.com/cn/robomaster-ep/specs   「机器人 - 尺寸」：
+#       步兵机器人：320×240×270 mm（长 × 宽 × 高）
+#       工程机器人：410×240×330 mm
+#   障碍是**同一型号**的小车，所以两车长宽相同。
+OUR_LENGTH_M = 0.32          # 我们车长（步兵）
+OUR_WIDTH_M = 0.24           # 我们车宽
+OBSTACLE_LENGTH_M = 0.32     # 障碍车长（同型号）
+OBSTACLE_WIDTH_M = 0.24      # 障碍车宽
+CLEARANCE_M = 0.10           # 每个方向留的余量
 
 # --- 速度（m/s）。骨架还会再裁一次（横移<=0.25、前进<=0.30），这里留一点余量 ---
-SIDE_SPEED = 0.24            # 横移让开的速度（0.24 × 1.70s ≈ 41 cm）
-FWD_SPEED = 0.20             # 越过障碍时的前进速度
+SIDE_SPEED = 0.24            # 横移让开的速度
+FWD_SPEED = 0.25             # 越过障碍时的前进速度（要跑 0.74 m，太慢会拖长时间）
 BACK_SPEED = 0.20            # 绕完往回收的速度
 SEEK_SPEED = 0.16            # 找线时往回挪的速度
 
@@ -118,34 +152,57 @@ SEEK_SPEED = 0.16            # 找线时往回挪的速度
 # HOLD_BEFORE_GO = 0 是 P0-2 的修法：确认完立刻侧移，不再先停车看清。
 # 实测过：那 0.20 秒的零速会让车多前冲约 6 cm，正是"看起来像停住了"的来源。
 HOLD_BEFORE_GO = 0.00
-T_OUT_TIME = 1.70            # 第 1 段：往侧面让开（0.24 × 1.70 ≈ 41 cm）
-T_PASS_TIME = 2.20           # 第 2 段：往前越过（0.20 × 2.20 ≈ 44 cm，见下面的换算）
-T_BACK_TIME = 1.20           # 第 3 段：往回收（0.20 × 1.20 ≈ 24 cm）
-SEEK_TIME = 1.50             # 第 4 段：主动找线，最多找这么久
+#
+# 【v11 关键修正】前进距离必须按"**我们车尾也过去**"算，不能只算车头。
+#   车头刚过障碍时车尾还在它旁边，一收回来就蹭上 —— 用户实测就是这么蹭的。
+#
+#     需要前进的距离 = 障碍车长 + 我们车长 + 余量
+#                    = 0.32 + 0.32 + 0.10 = 0.74 m
+#       -> T_PASS_TIME = 0.74 / 0.25 = 2.96 s，取 3.00 s（≈0.75 m）
+#     （v10 及以前用的是 (32+32)/2 + 余量 ≈ 0.44 m —— **短了 30 cm**，车尾过不去）
+#
+#   横移同理，要完全错开两车的**宽度**：
+#     需要横移的距离 = (我们车宽 + 障碍车宽) / 2 + 余量
+#                    = (0.24 + 0.24) / 2 + 0.10 = 0.34 m
+#       -> OUT 段 0.24 × 1.70 ≈ 0.41 m  ✓（留了额外余量，更稳）
+#
+#   回程不用一次收完：BACK 收回 0.20 × 1.20 ≈ 24 cm，剩下的交给 SEEK 边挪边找线。
+T_OUT_TIME = 1.70            # 第 1 段：往侧面让开（0.24 × 1.70 ≈ 0.41 m ≥ 0.34）
+T_PASS_TIME = 3.00           # 第 2 段：往前越过（0.25 × 3.00 ≈ 0.75 m ≥ 0.64）
+T_BACK_TIME = 1.20           # 第 3 段：往回收（0.20 × 1.20 ≈ 0.24 m）
+SEEK_TIME = 2.50             # 第 4 段：主动找线，最多找这么久
+# 【v8】原来 1.5s —— 实车记录里"绕完 1.5s 内没找回线"是现在最贵的失败模式
+# （2026-09-16 16:59 那次 5 次绕行里有 1 次要人按 SPACE 救）。
+# 放宽到 2.5s：0.16 m/s × 2.5s ≈ 40 cm 的搜索范围。
+#
+# 四段合计 1.70 + 3.00 + 1.20 + 2.50 = 8.40 s，所以总上限要放在它之上。
 
 # 【官方信息】障碍是**一辆静止的小车**（另一台 RoboMaster 同型车）。
-# 下面三个距离都是照这个尺寸算出来的，不是拍脑袋：
-#
-#   两车长度都按约 30~32 cm 算：
-#     要完全越过它，前进至少 = (30 + 32) / 2 + 余量 10 ≈ 41 cm
-#       -> PASS 段 0.20 × 2.20 ≈ 44 cm  ✓（原来 1.60s 只有 32 cm，会"只开一半"）
-#   两车宽度都按约 24 cm 算：
-#     要完全错开，横移至少 = (24 + 24) / 2 + 余量 10 ≈ 34 cm
-#       -> OUT 段 0.24 × 1.70 ≈ 41 cm  ✓
-#   横移让开多少，回程就要收多少：
-#       -> BACK 段 0.20 × 1.20 ≈ 24 cm，剩下的交给 SEEK 段边挪边找线（最多再 24 cm）
+# 尺寸全部来自 DJI 官方技术参数页（步兵机器人 320×240×270 mm），
+# 上面 OUR_/OBSTACLE_ 那六个常量就是它；三个动作距离都由它们算出来，不是拍脑袋。
 #
 # 障碍是**静止的**，所以它不会自己让开，也不会追上来；
 # 但也意味着"绕完还看到同一个障碍"就说明**没绕过去**，
 # 这时候连绕上限（MAX_CONSECUTIVE_DODGES）会把它停下来交给人看。
 
 # --- 硬性保护 ---
-MAX_TOTAL_TIME = 9.00        # 整段（含找线）最长 9 秒，超了立刻停车报 FAILED
+# 四段合计 8.40 s（1.70+3.00+1.20+2.50），总上限放在它之上，留出帧率波动的余量。
+MAX_TOTAL_TIME = 11.00       # 整段（含找线）最长 11 秒，超了立刻停车报 FAILED
 CONFIRM_FRAMES = 2           # 连续 2 帧确认（原来 3 帧，见 P0-2）
 LINE_CONFIRM_FRAMES = 2      # 找线时连续 2 帧看到蓝线，才算找回来了
 REARM_SECONDS = 5.00         # 一次绕行结束后，这段时间内不再重新接管
 MAX_CONSECUTIVE_DODGES = 2   # 同一段路最多连绕 2 次，第 3 次直接停车要人来看
 CLEAR_SECONDS = 3.00         # 画面里连续这么久没有障碍，就认为换了段路，连绕计数归零
+
+# --- 得分照片（7.1 障碍绕行）---
+# 老师的要求：确认绕行那一刻要存一张照片，图上能看清障碍、还有一行字写清
+# "测到障碍 + 选了哪边绕"（文案模板在证据层 `evidence.ANNOTATION_TEMPLATES`，
+# 模块**不拼字符串**）。画框/写字/去重/落盘全在 `evidence.py`，模块只交请求。
+#
+# 照片是**加分项，不是绕行的前提**：写盘失败只放弃照片 —— 不 FAILED、不停车、
+# 也绝不在 step() 里等回执（否则一张截图就能把绕行拖成超时）。
+# 写盘失败最多重试这么多次就放弃，之后不再重复排队。
+MAX_EVIDENCE_ATTEMPTS = 2
 
 # 【v4 · 最重要的一条】两次 step() 之间隔这么久，就认为"我们被从外面踢掉了"。
 #
@@ -164,6 +221,11 @@ CLEAR_SECONDS = 3.00         # 画面里连续这么久没有障碍，就认为�
 # 实测那一次断档是 2.6 秒；而正常绕行时每帧都会调用一次 step()（约 0.03 秒一次）。
 STALE_STEP_GAP = 1.00
 
+# 断档之后"先停一脚"的时长：这段时间内保持控制权、原地不动，然后再重新判断。
+# 为什么不一帧就接着绕：被从外面拿走控制权的瞬间，车可能已经不在原来的位置/姿态，
+# 先停稳、看清画面再动更安全（审阅人 2026-09-16 的建议）。
+RECONFIRM_HOLD = 0.10
+
 # --- 检测 ROI（画面比例 x1, y1, x2, y2）---
 # 【P0-1 / P1-3 的核心修改】原来是 (0.20, 0.45, 0.80, 0.95)：
 #   * 下沿 0.95 会把镜头正下方、机器人自己的橙色件收进来（实测每帧 900~1700 px）；
@@ -177,10 +239,10 @@ MIN_OBSTACLE_AREA = 0.03     # 外接框至少占 ROI 面积的 3%，更小的�
 MIN_OBSTACLE_WIDTH = 0.10    # 宽度至少占 ROI 宽度的 10%
 MIN_OBSTACLE_HEIGHT = 0.22   # 高度至少占 ROI 高度的 22%：立着挡路的东西才有这个高度
 MIN_DENSITY = 0.05           # 框内"有东西"的像素占比 >= 5%：排除稀疏散点
-# 上限只当兜底：真正的"太近了"由 ROI 下沿负责，不靠面积上限去拒
-# （原来 MAX_OBSTACLE_AREA=0.90 会出现"越该动作越被拒掉"的矛盾）
-MAX_OBSTACLE_AREA = 0.60
-MAX_OBSTACLE_WIDTH = 0.60
+# 上限只当兜底。【v10 放宽到 0.95】：贴到车头的障碍会占满大半个 ROI，
+# 原来 0.60 的上限会把最该绕的那一台车拒掉。
+MAX_OBSTACLE_AREA = 0.95
+MAX_OBSTACLE_WIDTH = 0.95
 
 # ---------------------------------------------------------------------
 # 【v5】实车误触发（2026-09-15 16:15 那次运行）之后加的三道闸
@@ -188,19 +250,21 @@ MAX_OBSTACLE_WIDTH = 0.60
 # 实测：26 张现场截图里有 11 张被判成"有障碍"（42%），车就在正常巡线中反复
 # 左移-回正。报告给了三条关键线索，下面三道闸一一对应。
 #
-# 闸一：**贴边淘汰**。11 个误判框里有 9 个压在 ROI 的下沿/左沿/右沿上。
-#   几何理由：真障碍是"挡在路中间"的东西，应该完整待在 ROI 里面；
-#   被 ROI 边界切开的，多半是背景、场地边界或者车体自身的边缘。
+# 闸一：**贴边淘汰**（只判左沿 / 右沿）。
+#   11 个误判框里有 9 个压在 ROI 的侧沿或下沿上。几何理由：真障碍是"挡在路中间"的，
+#   被 ROI 侧边切开的，多半是背景、场地边界或者车体自身的边缘。
+#
+#   【v10 改动】**下沿不再淘汰**：触发条件已经变成"蓝线消失"，
+#   而蓝线消失恰恰意味着障碍已经贴到车头 —— 那时候障碍**必然**压住 ROI 下沿。
+#   原来那条"下沿也淘汰"会把最该绕的那一台车拒掉。
 REJECT_EDGE_TOUCHING = True
 EDGE_TOUCH_MARGIN = 0.02     # 距边界 2% 以内就算"贴着"
 
-# 闸四（v6 新增）：**上沿不再豁免**。
-#   v5 时我故意不判上沿，理由是"远处的东西会从上面露出来"。结果实车反馈
-#   （2026-09-16，7 次运行里 3 次"一启动就避障"）打脸：三个误判框里有两个
-#   y=108 正好等于 ROI 顶边，框内是"中灰 70%+亮白 22%"和"暗区 85%"——全是背景
-#   （墙 / 白板 / 暗处），几乎没有一个蓝线像素。
-#   真障碍立在赛道上、在可绕的距离上，不该从 ROI 最顶上开始。
-TOP_INSET_RATIO = 0.06       # 框的上沿必须比 ROI 顶边低 6% 以上
+# 闸四：上沿留白。【v10 默认关掉（=0）】。
+#   v6 加它是因为当时"一启动就避障"，那些误判框全贴在 ROI 顶边（背景）。
+#   现在触发条件多了"蓝线必须消失"这一条，背景结构再也过不来；
+#   而**贴到车头的障碍顶边本来就会冲出 ROI 上沿**，留着它反而拒掉真障碍。
+TOP_INSET_RATIO = 0.00       # 0 = 不判上沿
 
 # 闸五（v6 新增）：**位置判据**。真障碍挡在线上、就在车正前方，所以
 #   纵向应该出现在走廊下半部（近处），横向不该偏出 ROI 中间一半。
@@ -265,29 +329,53 @@ SCORE_TOTAL_W = SCORE_AREA_W + SCORE_LOWER_W + SCORE_CENTER_W + SCORE_WIDTH_W
 #       而影子、反光是渐变的，边缘很"软"。所以找硬边缘 -> 连成块 -> 套形状判据。
 #       什么颜色都能抓，不依赖"猜道具颜色"。
 #
-# 两个踩过的坑（都会让另一台车漏检，别再改回去）：
+# 三个踩过的坑（都会让另一台车漏检或让地板误触发，别再改回去）：
 #   * Canny 出来是 1 像素宽的曲线，闭运算不会把它变粗，必须先 dilate 加粗；
 #   * 蓝线是竖着穿过障碍的，如果把蓝线像素从边缘图里"挖掉"，会把障碍的轮廓
-#     切成两半、连不成块。正确做法是**先把蓝线在灰度图上抹平成地面色再找边缘**。
+#     切成两半、连不成块。正确做法是**先把蓝线在灰度图上抹平成地面色再找边缘**；
+#   * 【v8】这个场地的地面是**带斑点的地胶**，斑纹在 blur=5/low=40 下 ROI 里
+#     边缘密度有 4.94%/3.38%/4.28%/4.49%（四处取样），而真车才 14.28%
+#     —— **只差 1.8 倍，分不开**，于是"没障碍的时候车会莫名开始避障"。
+#
+# 【v8】参数是扫出来的（真实画面 + 合成道具一起端到端测）：
+#     blur=5 /40/110  -> 真实地板两处都**误判**，合成道具都能认
+#     blur=9 /60/160  -> 真实地板两处**都干净**，车形障碍仍能认（conf 0.84）★选它
+#     blur=11/80/200  -> 地板干净，但合成车形障碍被滤掉（太狠）
+# 依据：审阅人留的两张真实框图 + `tests/samples/` 里那两个真实裁片
+# （`real_floor_roi.png` 负样本、`real_obstacle_car.png` 正样本）。
+#
+# ⚠️ 代价（必须知道）：模糊变大之后，**对比度不足的扁平浅色道具抓不到**
+# （纯色亮橙块 vs 浅色地面只差 37 灰阶，模糊后边缘消失）。
+# 所以**这一路只当兜底**：主路径是下面第 0 节 —— 直接用 DJI SDK 的机器人识别。
 USE_STRUCTURE = True
-EDGE_LOW = 40                # Canny 低阈值：越低越敏感，噪声也越多
-EDGE_HIGH = 110              # Canny 高阈值
+EDGE_BLUR = 9                # Canny 之前的模糊核（奇数）
+EDGE_LOW = 60                # Canny 低阈值（原来 40）
+EDGE_HIGH = 160              # Canny 高阈值（原来 110）
 EDGE_DILATE = 3              # 把 1 像素宽的边缘加粗，后面才连得成块
 STRUCTURE_CLOSE = 17         # 把边缘连成整块的核大小
 
 # ---------------------------------------------------------------------
-# 检测模式二：颜色判据（**默认关闭**）
+# 【v9】检测模式零（**主路径**）：DJI SDK 的机器人识别
 # ---------------------------------------------------------------------
-# 关掉的原因见 P0-1：皮肤 H 5~25 和橙色完全重叠，426 帧里被判成障碍的 4 帧
-# 全是人的手。颜色判据在这个场景里**没有分离度**，不如不用。
-# 真道具是纯色、且现场确认不误触发时，可以打开它当补充。
+# 用户点破了要害：**颜色判据根本答不了"车在哪里"** ——
+# 车身在画面里颜色千变万化（光照、角度、遮挡），靠颜色既框不准位置、也框不全车身。
 #
-# 绝对不要再加 ((0,0,0),(180,255,70)) 这种"任何够暗的像素"：
-# v1 加过，实测亮度 <=70 的灰块 100% 被判成障碍，车自己的影子全会中招。
-USE_COLOR_RANGES = False
-OBSTACLE_HSV_RANGES = (
-    ((5, 90, 80), (25, 255, 255)),      # 橙色系（备用，默认不启用）
-)
+# 而 DJI 官方 SDK 本来就有"机器人识别"（已对 `robomaster/vision.py` 核实）：
+#
+#     ep_robot.vision.sub_detect_info(name="robot", callback=cb)
+#     回调 rect_info = [(x, y, w, h), ...]   x/y 是**中心点**，w/h 是宽高
+#
+# 也就是 SDK 直接给出"画面里那个位置有一台同型机器人，框是这么大" ——
+# 这才是真正能框住车、还能顺便估算远近的东西，而且**完全不看颜色**。
+#
+# 架构上：任务模块**不得自己订阅 SDK**（契约），所以订阅由集成层做
+# （照 `marker_source.py` 的样子），每帧调 `task.update_robot_observations(...)`
+# 把观测推进来。模块这边只用、不订。
+#
+# 下面这两个门槛是"这一帧要不要因为这台车开始绕"的判据：
+ROBOT_MIN_WIDTH_RATIO = 0.06   # SDK 框宽度 < 画面宽 6% 就当太远，先不绕
+ROBOT_OBSERVATION_MAX_AGE = 0.35  # 观测超过这么久没更新就当没有（SDK 回调会掉）
+ROBOT_CONFIDENCE = 0.95        # SDK 给的框，置信度给高（它是官方识别，不是猜的）
 
 # ---------------------------------------------------------------------
 # 皮肤色剔除（**默认开启**）
@@ -369,6 +457,82 @@ class ObstacleDetector:
         self.last_position_rejected = 0
         self.last_flat_rejected = 0
         self.last_mask = None
+        self.last_roi = None      # 最近一次用的 ROI 像素框，选边时要用
+        self.last_source = "none"  # "sdk_robot" / "structure" / "none"，给运行记录看
+        # SDK 机器人识别的观测（由集成层每帧推进来；模块自己不订阅 SDK）
+        self._robot_rows = ()
+        self._robot_seen_at = None
+
+    def update_robot_observations(self, rows, observed_at=None) -> None:
+        """集成层每帧调：把 SDK 机器人识别的结果推进来。
+
+        `rows` 里每一项是 `(x, y, w, h)`：x/y 是**中心点**、w/h 是宽高（整幅画面像素）。
+        契约上模块不得自己订阅 SDK，所以这条通道必须由主循环统一喂
+        （和 `number_marker` 的 `update_candidates` 一个道理）。
+        空列表表示"这一帧没有识别到机器人"，会把旧观测清掉，免得拿旧框当新鲜。
+        """
+        try:
+            converted = tuple(tuple(float(v) for v in row[:4]) for row in (rows or ()))
+        except (TypeError, ValueError):
+            converted = ()
+        # 丢掉 nan / inf，它们会让后面的比较静默出错
+        converted = tuple(
+            row for row in converted if all(value == value and abs(value) != float("inf")
+                                            for value in row)
+        )
+        self._robot_rows = converted
+        self._robot_seen_at = (
+            (time.monotonic() if observed_at is None else float(observed_at))
+            if converted else None
+        )
+
+    def _robot_box(self, image, now):
+        """SDK 机器人识别给出的框（新鲜的话）。**完全不看颜色。**
+
+        这是主路径：官方识别直接告诉我们"画面里那个位置有一台同型机器人，框这么大"，
+        比任何颜色/边缘判据都可靠，也顺带能估算远近。
+        """
+        rows = self._robot_rows
+        seen_at = self._robot_seen_at
+        if not rows or seen_at is None or now is None:
+            return None
+        if now - seen_at > ROBOT_OBSERVATION_MAX_AGE:
+            return None
+
+        height, width = image.shape[:2]
+        if height <= 0 or width <= 0:
+            return None
+        roi_left, roi_top, roi_right, roi_bottom = _pixel_box(image.shape, OBSTACLE_ROI)
+
+        best = None
+        for x, y, w, h in rows:
+            if w <= 0 or h <= 0:
+                continue
+            if w / float(width) < ROBOT_MIN_WIDTH_RATIO:
+                # 太远：还没到要绕的距离（这一条替代了原来那套位置判据）
+                continue
+            if not (roi_left <= x <= roi_right):
+                # 不在正前方（偏到旁边去了），不是挡路的那台
+                continue
+            if best is None or w > best[0]:
+                best = (w, x, y, w, h)
+
+        if best is None:
+            return None
+
+        _w, x, y, w, h = best
+        return VisualDetection(
+            valid=True,
+            kind=KIND,
+            center=(int(round(x)), int(round(y))),
+            confidence=ROBOT_CONFIDENCE,
+            box=(
+                int(round(x - w / 2.0)),
+                int(round(y - h / 2.0)),
+                int(round(x + w / 2.0)),
+                int(round(y + h / 2.0)),
+            ),
+        )
 
     # ---------------- 两条证据 ----------------
 
@@ -396,23 +560,18 @@ class ObstacleDetector:
                 gray = gray.copy()
                 gray[line > 0] = int(np.median(outside))
 
-        gray = cv2.GaussianBlur(gray, (5, 5), 0)
+        gray = cv2.GaussianBlur(gray, (EDGE_BLUR, EDGE_BLUR), 0)
         edges = cv2.Canny(gray, EDGE_LOW, EDGE_HIGH)
         edges = cv2.dilate(edges, _odd_kernel(EDGE_DILATE))
         blobs = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, _odd_kernel(STRUCTURE_CLOSE))
         return blobs, edges
 
     @staticmethod
-    def _looks_like_an_object(patch, edges, box):
-        """闸六：框里是"有结构的立体物"或者"彩色道具"吗。
+    def _looks_like_an_object(edges, box):
+        """闸六：框里除了自己那圈轮廓，**里面还有硬边缘**吗。
 
-        patch 是框内的 HSV；edges 是整块 ROI 的边缘图（可能为 None）。
+        v9 起只看灰度边缘，不再看颜色（用户要求：判据里不要有颜色）。
         """
-        if patch.size == 0:
-            return False
-        if float(patch[:, :, 1].mean()) >= MIN_MEAN_SATURATION:
-            # 彩色道具：平均饱和度够高（地面/墙/影子都是低饱和的）
-            return True
         if edges is None:
             return False
 
@@ -429,16 +588,6 @@ class ObstacleDetector:
         if total <= 0:
             return False
         return (int(cv2.countNonZero(inner)) / total) >= MIN_INTERNAL_EDGE_RATIO
-
-    def _color_mask(self, hsv):
-        mask = np.zeros(hsv.shape[:2], dtype=np.uint8)
-        for lower, upper in OBSTACLE_HSV_RANGES:
-            mask |= cv2.inRange(
-                hsv,
-                np.array(lower, dtype=np.uint8),
-                np.array(upper, dtype=np.uint8),
-            )
-        return mask
 
     @staticmethod
     def _is_skin_like(patch, inside):
@@ -478,14 +627,19 @@ class ObstacleDetector:
 
     # ---------------- 对外 ----------------
 
-    def detect(self, image) -> VisualDetection:
-        """返回整幅图像坐标的 VisualDetection；没有障碍返回 no_result。"""
+    def detect(self, image, now=None) -> VisualDetection:
+        """返回整幅图像坐标的 VisualDetection；没有障碍返回 no_result。
+
+        **主路径是 SDK 的机器人识别**（`_robot_box`）：集成层每帧把官方识别的框
+        推进来，这里直接用，完全不看颜色。没有新鲜观测时才退回灰度结构判据。
+        """
         self.last_candidates = 0
         self.last_skin_rejected = 0
         self.last_edge_rejected = 0
         self.last_position_rejected = 0
         self.last_flat_rejected = 0
         self.last_mask = None
+        self.last_source = "none"
         if image is None:
             return VisualDetection.no_result(KIND)
 
@@ -494,6 +648,14 @@ class ObstacleDetector:
             return VisualDetection.no_result(KIND)
 
         left, top, right, bottom = _pixel_box(image.shape, OBSTACLE_ROI)
+        self.last_roi = (left, top, right, bottom)
+
+        # 主路径：SDK 机器人识别（不看颜色、直接给框）
+        from_robot = self._robot_box(image, now)
+        if from_robot is not None:
+            self.last_source = "sdk_robot"
+            return from_robot
+
         roi = image[top:bottom, left:right]
         roi_height, roi_width = roi.shape[:2]
         roi_area = float(roi_height * roi_width)
@@ -508,11 +670,10 @@ class ObstacleDetector:
         if USE_STRUCTURE:
             structure, edges = self._structure_mask(roi, line)
             mask |= structure
-        if USE_COLOR_RANGES:
-            mask |= self._color_mask(hsv)
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, _odd_kernel(OPEN_KERNEL))
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, _odd_kernel(CLOSE_KERNEL))
         self.last_mask = mask
+        self.last_source = "structure"
 
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         best = None
@@ -534,14 +695,14 @@ class ObstacleDetector:
                 # 立着挡路的东西才有这个高度；贴地的细条、扁平色斑到这里被刷掉
                 continue
 
-            # 闸一：贴边淘汰（下沿 / 左沿 / 右沿；上沿不算，远处的东西会从上面露出来）
+            # 闸一：贴边淘汰（**只判左沿 / 右沿**）
+            # v10：下沿不再淘汰 —— 障碍贴到车头时必然压住 ROI 下沿，
+            # 那正是该绕的那一台。上沿由 TOP_INSET_RATIO 控制（现在 =0，不判）。
             if REJECT_EDGE_TOUCHING:
                 margin_x = roi_width * EDGE_TOUCH_MARGIN
-                margin_y = roi_height * EDGE_TOUCH_MARGIN
                 if (
                     box_left <= margin_x
                     or box_left + box_width >= roi_width - margin_x
-                    or box_top + box_height >= roi_height - margin_y
                 ):
                     self.last_edge_rejected += 1
                     continue
@@ -580,9 +741,9 @@ class ObstacleDetector:
                 self.last_skin_rejected += 1
                 continue
 
-            # 闸六：一块"平的、中性色"的区域不是障碍
+            # 闸六：一块"平的"区域不是障碍（框里除了轮廓，里面还得有硬边缘）
             if not self._looks_like_an_object(
-                patch, edges, (box_left, box_top, box_width, box_height)
+                edges, (box_left, box_top, box_width, box_height)
             ):
                 self.last_flat_rejected += 1
                 continue
@@ -655,32 +816,140 @@ class ObstacleTask:
         self.last_seen_at = None
         # 到达连绕上限后置位：不再接管，免得变成"每几秒停一下"的走走停停。
         self.locked = False
+        # 这一轮往哪边绕（v8：不再固定往左，触发时按障碍偏哪边决定）
+        self._active_side = 1.0 if DODGE_SIDE == "right" else -1.0
+        self.last_side = None     # "left" / "right"，给运行记录和得分快照用
         # 上一次 step() 的时刻：用来发现"我们被从外面踢掉了"（见 STALE_STEP_GAP）
         self._last_step_at = None
         # 第一次被调用的时刻：启动预热用（STARTUP_GRACE_SECONDS，默认 0 即关闭）
         self._first_step_at = None
+        # 得分照片协议（7.1）：排队中的请求 / 已交出去的请求 / 已排过的事件键 /
+        # 真实的写盘结果。**这四个槽位不参与绕行决策**，只影响"有没有一张照片"。
+        self._queued_evidence = None
+        self._active_evidence = None
+        self._evidence_queued_kinds: set = set()
+        self._evidence_outcome = None
 
     # ---------------- 对外 ----------------
 
-    def detect(self, image) -> VisualDetection:
-        """给一帧图像，回答有没有障碍（整幅图像坐标）。"""
-        return self.detector.detect(image)
+    def detect(self, image, now=None) -> VisualDetection:
+        """给一帧图像，回答有没有障碍（整幅图像坐标）。
+
+        先走 SDK 机器人识别（如果集成层喂了新鲜观测），没有再退回灰度结构判据。
+        """
+        return self.detector.detect(image, now)
+
+    def update_robot_observations(self, rows, observed_at=None) -> None:
+        """集成层每帧调：把 SDK 机器人识别的结果推进来（见 ObstacleDetector 的同名方法）。
+
+        这是本模块**唯一**的障碍观测入口，由主循环喂；模块自己不订阅 SDK。
+        """
+        self.detector.update_robot_observations(rows, observed_at)
+
+    # ------------------------------------------------------------------
+    # 得分照片协议（7.1）—— 主线每帧轮询这几个方法（照 traffic_light 的协议抄）
+    # ------------------------------------------------------------------
+
+    @property
+    def pending_evidence_request(self):
+        """看一眼排队的请求，但**不取走**。"""
+        return self._queued_evidence
+
+    def take_evidence_request(self):
+        """把一张请求交给集成侧的证据写入器。没有就返回 None。"""
+        request = self._queued_evidence
+        self._queued_evidence = None
+        return request
+
+    def acknowledge_evidence(self, request_id: str, saved: bool) -> bool:
+        """记录证据层**真实**的写盘结果；失败按上限重试。
+
+        绕行状态机**从不等待**这个回执：照片存没存成，车都照原样绕过去
+        （不 FAILED、不停车、也不占用"总共 11 秒"的绕行预算）。
+
+        `request_id` 是 `EvidencePhoto` 的**派生属性**（label + 帧号 + 次数算出来的），
+        **不是字段** —— 所以重试时只 `replace(attempt=...)`，绝不能把它传进 `replace`。
+        """
+        if (
+            self._active_evidence is None
+            or self._active_evidence.request_id != request_id
+        ):
+            return False
+        if saved:
+            self._evidence_outcome = True
+            self._active_evidence = None
+            return True
+        if self._active_evidence.attempt >= MAX_EVIDENCE_ATTEMPTS:
+            self._evidence_outcome = False
+            self._active_evidence = None
+            return True
+        retry = replace(
+            self._active_evidence,
+            attempt=self._active_evidence.attempt + 1,
+        )
+        self._active_evidence = retry
+        self._queued_evidence = retry
+        self._evidence_outcome = None
+        return True
+
+    def _queue_evidence(
+        self, frame: FramePacket, detection: VisualDetection, kind: str = KIND
+    ) -> None:
+        """排一张得分照片。**尽力而为**：排不上、造不出、写不成都不动绕行。
+
+        按**事件**去重（`_evidence_queued_kinds`）：障碍绕行是**一个**计分事件，
+        所以整段运行只排一张。证据层还会用同一个 `event_key`（默认 = 标签
+        `obstacle`）再兜一层，重复请求不会变成第二个文件、也不会重复算分。
+        """
+        if kind in self._evidence_queued_kinds:
+            return
+        if self._evidence_outcome is False:
+            return
+        if self._queued_evidence is not None or self._active_evidence is not None:
+            return
+        try:
+            request = self._make_evidence_request(frame, detection)
+        except Exception:
+            # 连"造请求"这一步出错也不许影响这一帧的绕行：这只是加分项。
+            self._evidence_outcome = False
+            return
+        self._evidence_queued_kinds.add(kind)
+        self._active_evidence = request
+        self._queued_evidence = request
+
+    def _make_evidence_request(self, frame: FramePacket, detection: VisualDetection):
+        """7.1 的得分照片：**矩形**框住障碍（红绿灯才用圆圈），文字写清往哪边绕。"""
+        return make_evidence_photo(
+            KIND,
+            frame,
+            detection=detection,
+            shape="rect",
+            side=self.last_side,
+            team=TEAM_NUMBER,
+        )
 
     def step(self, frame: FramePacket, now: float) -> TaskUpdate:
         """主循环每帧调用一次，必须立刻返回。"""
         if self._first_step_at is None:
             self._first_step_at = now
         if self.stage != "IDLE" and self._was_cut_short(now):
-            # 协调器在外面把控制权拿走了（视频中断 / 人工按键 / 硬超时），
-            # 而且不会通知模块。发现断档就作废重来，绝不从半路接着走。
-            self._abandon()
+            # 【v8】断档：协调器在外面把控制权拿走又还回来，但**不会通知模块**。
+            #
+            # 这里**绝不能**清成 IDLE 就直接走 _step_idle —— 实车记录里一共 12 次
+            # `obstacle returned NOT_TRIGGERED while owning motion` 就是这么来的：
+            # 协调器认为我们还拿着控制权，我们却说不想要了，于是判违约、强制收回。
+            #
+            # 正确做法：保留控制权、先停一脚（RUNNING + 零速度），下一帧再重新判断。
+            # 见 _step_active 里的 RECONFIRM 分支。
+            self._enter("RECONFIRM", now)
+            self.started_at = now
         self._last_step_at = now
 
         if self.stage == "IDLE":
-            detection = self.detect(frame.image)
+            detection = self.detect(frame.image, now)
             self.last_detection = detection
-            return self._step_idle(detection, now)
-        # 绕行途中不再重复检测（结果只用于上报）；只有 SEEK 段还要看画面找线。
+            return self._step_idle(frame, detection, now)
+        # 绕行途中不再重复检测（结果只用于上报）；只有 SEEK / RECONFIRM 要看画面。
         return self._step_active(frame.image, now)
 
     def _was_cut_short(self, now: float) -> bool:
@@ -690,21 +959,11 @@ class ObstacleTask:
             and (now - self._last_step_at) > STALE_STEP_GAP
         )
 
-    def _abandon(self) -> None:
-        """作废当前这一轮绕行：回到 IDLE，重新判断。
-
-        注意**不设冷却**（`finished_at` 不动）：这一轮本来就没绕成，
-        障碍多半还在，应该马上重新确认、重新绕，而不是干等 5 秒。
-        """
-        self.stage = "IDLE"
-        self.hit_frames = 0
-        self.line_frames = 0
-        self.started_at = None
-        self.segment_started_at = None
-
     # ---------------- 还没接管：判断要不要管 ----------------
 
-    def _step_idle(self, detection: VisualDetection, now: float) -> TaskUpdate:
+    def _step_idle(self, frame: FramePacket, detection: VisualDetection, now: float) -> TaskUpdate:
+        # 用整帧包（FramePacket），不用裸图：得分照片要连帧号/采集时刻一起交给证据层。
+        image = frame.image
         # 启动预热：默认关（STARTUP_GRACE_SECONDS = 0）。
         # 要压制"一启动就避障"，把它设成 3.0 左右即可。
         if (
@@ -734,6 +993,17 @@ class ObstacleTask:
             self.hit_frames = 0
             return TaskUpdate(
                 TaskStatus.NOT_TRIGGERED, detection=detection, message="no obstacle"
+            )
+
+        # 【v10】关键的一条：**车看到了还不够，必须等蓝线被它挡住**。
+        #   蓝线在近处消失 = 车已经开到障碍跟前了 —— 这就是"距离检测"。
+        #   原来一看到车就横移，结果每次都早早开始绕、正好停在障碍前面。
+        if TRIGGER_NEEDS_LINE_LOST and line_is_visible(image):
+            self.hit_frames = 0
+            return TaskUpdate(
+                TaskStatus.NOT_TRIGGERED,
+                detection=detection,
+                message="obstacle seen but the line is still visible; not yet",
             )
 
         if self.locked:
@@ -771,6 +1041,14 @@ class ObstacleTask:
 
         self.started_at = now
         self.segment_started_at = now
+        # 选边：障碍偏哪边就往另一边绕（PDF 要求"看清后自己选左或右"）
+        self._active_side = self._choose_side(detection)
+        self.last_side = self._side_name()
+        # 【7.1 得分照片】就是这一帧：连续帧确认完成、绕行方向刚定下来，
+        # 紧接着就要下发第一脚侧移。图上要有障碍的矩形框 + 一行写清
+        # "Team 10 detects obstacle » the left/right side"（文案由证据层拼）。
+        # 只是**排队**：证据层什么时候写、写不写得成，都不影响下面的动作。
+        self._queue_evidence(frame, detection)
         if HOLD_BEFORE_GO > 0.0:
             self.stage = "HOLD"
             return TaskUpdate(
@@ -798,6 +1076,30 @@ class ObstacleTask:
                 "obstacle still there after %d dodges; stopped for a human check"
                 % self.dodge_count,
                 now,
+            )
+
+        if self.stage == "RECONFIRM":
+            # 断档之后：**保留控制权**（返回 RUNNING），先停一脚，下一帧重新判断。
+            # 关键：这条路径**永远不能返回 NOT_TRIGGERED**（那是违约，见 step()）。
+            if now - self.segment_started_at < RECONFIRM_HOLD:
+                return self._running(
+                    MotionCommand(), "control was cut short; stopping to re-check"
+                )
+            detection = self.detect(image, now)
+            self.last_detection = detection
+            if detection.valid:
+                # 障碍还在：重新开始一轮完整的绕行（重新选边）
+                self._enter("OUT", now)
+                self.started_at = now
+                self._active_side = self._choose_side(detection)
+                self.last_side = self._side_name()
+                return self._running(
+                    MotionCommand(lateral=self._side() * SIDE_SPEED),
+                    "re-confirmed after a gap; stepping aside",
+                )
+            # 障碍没了：正常交回（COMPLETED 会走协调器的归还流程，不算违约）
+            return self._finish(
+                TaskStatus.COMPLETED, "takeover was cut short; handing back", now
             )
 
         if now - self.started_at > MAX_TOTAL_TIME:
@@ -905,7 +1207,33 @@ class ObstacleTask:
         )
 
     def _side(self) -> float:
-        return 1.0 if DODGE_SIDE == "right" else -1.0
+        """这一轮往哪边绕（+1 右 / -1 左）。触发时由 _choose_side 定好。"""
+        return self._active_side
+
+    def _choose_side(self, detection) -> float:
+        """决定从左边还是右边绕。
+
+        PDF item 3 要求"看清后自己选左或右"，所以不能永远往左：
+        障碍明显**偏左**就从右边过、明显**偏右**就从左边过（远离它）；
+        基本在正中间（偏移不到 SIDE_DEADBAND）就按 DODGE_SIDE 的默认值。
+        """
+        default = 1.0 if DODGE_SIDE == "right" else -1.0
+        if not detection.valid or detection.center is None:
+            return default
+        roi = self.detector.last_roi
+        if roi is None:
+            return default
+        roi_left, _roi_top, roi_right, _roi_bottom = roi
+        half = max((roi_right - roi_left) / 2.0, 1.0)
+        offset = (detection.center[0] - (roi_left + roi_right) / 2.0) / half
+        if offset > SIDE_DEADBAND:
+            return -1.0        # 障碍偏右 -> 往左绕
+        if offset < -SIDE_DEADBAND:
+            return 1.0         # 障碍偏左 -> 往右绕
+        return default
+
+    def _side_name(self) -> str:
+        return "right" if self._active_side > 0 else "left"
 
 
 # =====================================================================

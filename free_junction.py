@@ -120,13 +120,14 @@ A12           所有阈值都是在合成画面上定的，**必须在正式场�
 import math
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 from typing import Iterable, List, Optional, Tuple
 
 import cv2
 import numpy as np
 
+from evidence import make_evidence_photo
 from models import (
     FramePacket,
     MotionCommand,
@@ -141,6 +142,10 @@ KIND = "free_junction"
 #: 两条分支的取值，同时也是 `VisualDetection.target_id` 的取值。
 BRANCH_LEFT = "left"
 BRANCH_RIGHT = "right"
+
+#: 得分截图的模板名（`evidence.ANNOTATION_TEMPLATES["free_junction"]` =
+#: `Team {team} detects traffic jam » {side} way and {chosen}`，6.2 拥堵岔路 15 分）。
+EVIDENCE_KIND = KIND
 
 #: 零速度。未触发、等待判据、完成、失败都返回它。
 STOP = MotionCommand()
@@ -672,6 +677,15 @@ class FreeJunctionConfig:
     max_forward: float = 0.30
     max_lateral: float = 0.25
     max_yaw: float = 90.0
+
+    # ---- 得分截图（6.2 拥堵岔路，老师后来明确要一张证据照片）----
+    #: 图上那句话的队号。样例文字是 `Team 10 ...`（那是样例队号），我们按队号写 03；
+    #: 与 `evidence.TEAM_NUMBER` 一致。文案模板在 `evidence.ANNOTATION_TEMPLATES`
+    #: （`free_junction` → `Team {team} detects traffic jam » {side} way and {chosen}`），
+    #: **不由本模块拼字符串**：五个模块各写一套必然口径不一，分数就丢在这上面。
+    team_number: str = "10"
+    #: 写盘失败后的重试上限（沿用 evidence.py 的回执约定，和 traffic_light 同值）。
+    max_evidence_attempts: int = 2
 
     # ---- 安全与时效（A9 / A10 / A11）----
     max_task_seconds: float = 12.0    # 骨架 20 秒硬上限，这里留足余量
@@ -1706,6 +1720,20 @@ class FreeJunctionTask:
         self.last_outcome: Optional[TaskStatus] = None
         #: 被迫结束（协调器调 reset()）的次数。实车记录里用它看"是不是在被反复打断"。
         self.interruptions = 0
+        #: 得分截图请求的槽位（协议与 `traffic_light.py` 完全一致：
+        #: `main.service_task_evidence()` 每帧 poll `take_evidence_request()`，
+        #: 写盘结果再经 `acknowledge_evidence()` 回传）。
+        self._queued_evidence = None
+        self._active_evidence = None
+        #: 这次运行里已经排过照片的事件（"free_junction"）。老师按**保存的张数**算分，
+        #: 同一次拥堵事件排两张不会多得分，只会让报告变脏。
+        self._evidence_queued_kinds: set = set()
+        self._evidence_outcome: Optional[bool] = None
+        #: 这一帧的拥堵读数是不是上一帧留下的（APPROACH/TURN/EXIT 不再重算判据）。
+        #: 用它防止把**过期**的框当成"堵路车"画进得分截图。
+        self._blockage_stale = False
+        #: 最近一次"排得分截图"的下场（一行短句），给 message 和实车排查用。
+        self.last_evidence_note = "no evidence photo (not triggered yet)"
 
         self._confirm_count = 0
         self._blockage_key = BLOCKAGE_NONE
@@ -1775,7 +1803,198 @@ class FreeJunctionTask:
             self._sdk_rows = ()
             self._sdk_pushed_at = None
         self.last_sdk_mode = ""
+        self._blockage_stale = False
+        # 被迫结束时把截图槽位也清掉：上一次接管留下的请求绑的是上一次的帧，
+        # 而且那条接管已经被判为无效，不该再靠它留下一张得分截图。
+        self._forget_evidence()
         self._arm_rearm()
+
+    # ------------------------------------------------------------------
+    # 得分截图协议（main.service_task_evidence 每帧 poll 这几个方法）
+    # ------------------------------------------------------------------
+
+    @property
+    def pending_evidence_request(self):
+        """看一眼排队中的请求，**不消耗**它（协议与 `traffic_light.py` 一致）。"""
+        return self._queued_evidence
+
+    def take_evidence_request(self):
+        """把一条请求交给集成层的证据写入器。"""
+        request = self._queued_evidence
+        self._queued_evidence = None
+        return request
+
+    def acknowledge_evidence(self, request_id: str, saved: bool) -> bool:
+        """记录真实写盘结果，失败时有界重试（协议照抄 `traffic_light.py`）。
+
+        **选路绝不等待回执**：截图是得分副作用，不是"往哪边拐"的门。
+        注意 `request_id` 是 `EvidencePhoto` 的**派生属性、不是字段**，
+        所以重试用 `replace(..., attempt=...)`，绝不把它塞进 `replace`。
+        """
+        if (
+            self._active_evidence is None
+            or self._active_evidence.request_id != request_id
+        ):
+            return False
+        if saved:
+            self._evidence_outcome = True
+            self._active_evidence = None
+            return True
+        if self._active_evidence.attempt >= self.settings.max_evidence_attempts:
+            self._evidence_outcome = False
+            self._active_evidence = None
+            return True
+        retry = replace(
+            self._active_evidence,
+            attempt=self._active_evidence.attempt + 1,
+        )
+        self._active_evidence = retry
+        self._queued_evidence = retry
+        self._evidence_outcome = None
+        return True
+
+    def _forget_evidence(self) -> None:
+        """把截图协议的状态清干净（`reset()` 调用）。"""
+        self._queued_evidence = None
+        self._active_evidence = None
+        self._evidence_outcome = None
+        self._evidence_queued_kinds = set()
+
+    def _queue_evidence(
+        self, frame: FramePacket, detection: Optional[VisualDetection],
+        side: Optional[str], chosen: Optional[str],
+    ) -> bool:
+        """在"判出拥堵侧 + 选定分支"那一刻排**一张**得分截图。
+
+        **尽力而为**：这里任何一步失败都只让这一张图没有，绝不改变选路
+        （写盘、标框都是副作用；`main.service_task_evidence()` 的回执只进
+        `_evidence_outcome`，状态机不看它）。返回是否真的排上了。
+
+        同一个事件只排一张（`_evidence_queued_kinds`）；上一张还没被证据层取走
+        时不排第二张（与 `traffic_light._queue_evidence` 同一套规则）。
+        """
+        if EVIDENCE_KIND in self._evidence_queued_kinds:
+            return False
+        if self._evidence_outcome is False:
+            return False
+        if self._queued_evidence is not None or self._active_evidence is not None:
+            return False
+        try:
+            request = self._make_evidence_request(frame, detection, side, chosen)
+        except Exception:
+            # 证据层的模板缺失 / 画面拷贝失败都不许影响开车：记下来，继续走。
+            self._evidence_queued_kinds.add(EVIDENCE_KIND)
+            self._evidence_outcome = False
+            return False
+        self._evidence_queued_kinds.add(EVIDENCE_KIND)
+        self._active_evidence = request
+        self._queued_evidence = request
+        return True
+
+    def _make_evidence_request(
+        self, frame: FramePacket, detection: Optional[VisualDetection],
+        side: Optional[str], chosen: Optional[str],
+    ):
+        """6.2 拥堵岔路的证据照片：**矩形框出堵路的那台车** + 写明堵在哪条路、我们选了哪条。
+
+        文案与画框都在统一层（`evidence.py`），本模块只说"哪一帧、框哪个目标、
+        谁是 side、谁是 chosen"，不自己拼字符串、也不自己画。
+
+        `detection=None` 表示**这一帧确实没拿到堵路车的框坐标**（画面判据没回来 /
+        读数过期 / 官方读数没带框）：那时交出去的是一张**无框图**，并且接管那一刻的
+        `message` 会写明"矩形框缺失、降级为无框图"。**不为了画框去编坐标**：
+        Final 这些图就是分数本身，编一个框比没有框更糟。
+        """
+        return make_evidence_photo(
+            EVIDENCE_KIND,
+            frame,
+            detection=detection,
+            shape="rect",
+            side=side,
+            chosen=chosen,
+            team=self.settings.team_number,
+        )
+
+    @staticmethod
+    def _blockage_detection(
+        reading: BlockageReading, side: Optional[str]
+    ) -> Optional[VisualDetection]:
+        """把"堵路那台车"的候选框包成一个 `VisualDetection`（给证据层画矩形）。
+
+        框来自**模块已有的读数**：`last_blockage` 上左/右观测各自的候选框
+        （`BlockageReading.left_box` / `right_box`，已换算成整帧像素）。
+        **读数里没有框、或者框退化成一个点/无效时返回 None** —— 由
+        `_make_evidence_request` 交出一张无框图，绝不自造坐标。
+        """
+        if reading is None or side not in (BRANCH_LEFT, BRANCH_RIGHT):
+            return None
+        box = reading.left_box if side == BRANCH_LEFT else reading.right_box
+        if box is None:
+            return None
+        try:
+            x0, y0, x1, y1 = (int(value) for value in box)
+        except (TypeError, ValueError):
+            return None
+        if x1 <= x0 or y1 <= y0:
+            return None            # 退化框：画出来是一条线，没有意义
+        evidence = (
+            reading.left_evidence if side == BRANCH_LEFT else reading.right_evidence
+        )
+        try:
+            confidence = min(1.0, max(0.0, float(evidence)))
+        except (TypeError, ValueError):
+            confidence = 0.0
+        return VisualDetection(
+            valid=True,
+            kind=KIND,
+            center=((x0 + x1) // 2, (y0 + y1) // 2),
+            target_id=side,
+            color=None,
+            confidence=confidence,
+            box=(x0, y0, x1, y1),
+        )
+
+    def _evidence_from_reading(self, reading: BlockageReading) -> Optional[VisualDetection]:
+        """这次读数里"堵路的那台车"的框（没有可用框就返回 None）。
+
+        `BRANCH_BOTH`：两条都有车时 `side` 取左（见 `_blocked_side`）——
+        老师要的是"框出堵路的那台机器人"，两条都有车时本来就是边缘情形
+        （默认直接报失败、不接管），挑左边那台即可。
+        """
+        return self._blockage_detection(reading, self._blocked_side(reading))
+
+    @staticmethod
+    def _blocked_side(reading: BlockageReading) -> Optional[str]:
+        """`side` = **检出有车的那一侧**（老师要的是"堵在哪条路"）。"""
+        return {
+            BLOCKAGE_LEFT: BRANCH_LEFT,
+            BLOCKAGE_RIGHT: BRANCH_RIGHT,
+            BLOCKAGE_BOTH: BRANCH_LEFT,
+        }.get(getattr(reading, "reading", BLOCKAGE_NONE))
+
+    def _evidence_note(self, queued: bool, boxed: bool) -> str:
+        """清单张图的下场，直接写进接管那一刻的 `message`（实车记录里看得见）。
+
+        "矩形框缺失、降级为无框图"必须**明确写出来** —— 否则看图的人只会以为
+        那一帧没有框，分不清这是降级还是漏画。
+        """
+        if not queued:
+            return "no evidence photo (%s); " % self._evidence_skip_reason()
+        if not boxed:
+            return "evidence photo without a box (no usable blockage frame); "
+        return "evidence photo with the blocking vehicle boxed; "
+
+    def _evidence_skip_reason(self) -> str:
+        if self._evidence_outcome is False:
+            return "the evidence layer cannot save one"
+        if EVIDENCE_KIND in self._evidence_queued_kinds:
+            return "already queued for this event"
+        return "the evidence queue is busy"
+
+    def _evidence_note_suffix(self) -> str:
+        """`last_evidence_note` + 一个空格（直接拼在 message 前面）。"""
+        note = str(getattr(self, "last_evidence_note", "") or "")
+        return ("%s " % note) if note else ""
 
     def detect(self, image: Optional[np.ndarray]) -> VisualDetection:
         """给外面看的检测结果：岔路位置 + 判出的可通行一侧（只读，不改状态）。
@@ -1818,11 +2037,14 @@ class FreeJunctionTask:
         # `free_junction step was slow` 有几次就落在这些阶段）。
         if self._wants_blockage_reading():
             self.last_blockage = self._read_blockage(fork, frame.image, rect, moment)
+            self._blockage_stale = False
+        else:
+            self._blockage_stale = True
         reading = self.last_blockage
         self.last_visual = self._visual(fork, self.chosen_branch)
 
         if self.state is JunctionState.IDLE:
-            return self._step_idle(fork, reading, moment)
+            return self._step_idle(fork, reading, moment, frame)
         return self._step_active(fork, reading, moment)
 
     # -- 官方 SDK 观测（集成层推来的纯数据）--------------------------------
@@ -2214,7 +2436,8 @@ class FreeJunctionTask:
     # -- IDLE -------------------------------------------------------------
 
     def _step_idle(
-        self, fork: ForkDetection, reading: BlockageReading, now: float
+        self, fork: ForkDetection, reading: BlockageReading, now: float,
+        frame: Optional[FramePacket] = None,
     ) -> TaskUpdate:
         settings = self.settings
 
@@ -2265,10 +2488,38 @@ class FreeJunctionTask:
         self._decide_count = 0
         self._decide_reading = None
         self._decide_reading_at = None
+        # 判据不成立（两条都有车且没配兜底边）时不排照片：这一帧没有"我们选了哪条路"
+        # 可以写，而且车马上就会 FAILED 停下（见 _step_active）。
+        if self.chosen_branch is not None:
+            self._queue_junction_evidence(frame, reading)
         return self._running(
             now, "%sjunction confirmed, deciding (%s; %s)"
             % (self._official_note(), reason, reading.describe())
         )
+
+    def _queue_junction_evidence(
+        self, frame: FramePacket, reading: BlockageReading
+    ) -> None:
+        """6.2 的得分照片就在这一刻排：**拥堵侧已经判出来了、分支也已经选定**。
+
+        `side` = 检出有车的那一侧（读数的读数，不随兜底边改变；
+        `"both"` 这种边缘情形按 `_blocked_side` 取左）；
+        `chosen` = **我们实际选的那条分支**（`self.chosen_branch`，它自己）。
+
+        照片里框的是 `reading` 上那条"堵路车"的候选框（和判据同源，不另找一遍）；
+        读数里没有可用框时，交出去的是**无框图**，并在 message 里写明降级。
+        """
+        detection = self._evidence_from_reading(reading)
+        # 只在"这一帧刚算出的读数"上用它的框：APPROACH / TURN / EXIT 不再重算判据，
+        # 那时的 `last_blockage` 是好几帧以前的东西，框位置已经对不上这一帧的画面。
+        boxed = detection is not None and not self._blockage_stale
+        queued = self._queue_evidence(
+            frame,
+            detection if boxed else None,
+            self._blocked_side(reading),
+            self._branch_name(),
+        )
+        self.last_evidence_note = self._evidence_note(queued, boxed)
 
     # -- 接管中的状态机 ---------------------------------------------------
 
@@ -2321,9 +2572,12 @@ class FreeJunctionTask:
                     and self._decide_count >= max(1, int(settings.decide_confirm_frames))):
                 self.chosen_branch = branch
                 self._enter(JunctionState.APPROACH, now)
+                # "选定分支"这一刻已经排好照片（见 _step_idle / _queue_junction_evidence）；
+                # 把它的下场写进 message，实车记录里就能看出"框到底有没有拿到"。
                 return self._running(
-                    now, "%staking the %s branch (%s; %s)"
-                    % (self._official_note(), branch.value, reason, reading.describe())
+                    now, "%s%staking the %s branch (%s; %s)"
+                    % (self._official_note(), self._evidence_note_suffix(),
+                       branch.value, reason, reading.describe())
                 )
             if self._elapsed(now) >= settings.decide_timeout:
                 # **软失败**：判据一时读不到，不是"任务做错了"。用短冷却重新拉闸，
