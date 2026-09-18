@@ -1061,11 +1061,14 @@ class OfficialSdkCriterionTests(unittest.TestCase):
         records = self._replay(task, fork_frame(), stale, start=now, frames=200)
         self.assertIs(records[-1][1].status, TaskStatus.COMPLETED)
 
-    def test_reading_outside_the_corridor_band_is_ignored(self):
-        """带外（画面最下方的自家车头 / 最上方的背景 / ROI 之外）的读数不算数。"""
+    def test_readings_below_the_band_or_outside_the_roi_are_ignored(self):
+        """**比判据带更近**（画面最下方的自家车头）与**横向在岔路 ROI 之外**的读数不算数。
+
+        （2026-09-18 用户要求"官方 SDK 判据优先级高一点"之后，**比判据带更远**
+        的上方读数改成"够宽就采信"——那条在下面单独的用例里。）
+        """
         outside = [
             (0.20, 0.95, 0.18, 0.10),     # 太靠下：自家车头那一带
-            (0.20, 0.02, 0.18, 0.06),     # 太靠上：背景
             (0.01, 0.40, 0.02, 0.10),     # 落在岔路 ROI 横向范围之外
         ]
         for sighting in outside:
@@ -1073,8 +1076,41 @@ class OfficialSdkCriterionTests(unittest.TestCase):
             records = self._replay(task, fork_frame(), [sighting], frames=40)
             self.assertIs(
                 records[-1][1].status, TaskStatus.NOT_TRIGGERED,
-                "带外的读数不该成为判据: %s" % (sighting,),
+                "带外/带下的读数不该成为判据: %s" % (sighting,),
             )
+
+    def test_a_far_sighting_above_the_band_counts_when_it_is_wide_enough(self):
+        """**比判据带更远**（画面上方）的官方读数：够宽就采信，太窄（场外远景机器人）不算。
+
+        车停到 1 米之外时，官方识别报出的框可能落在判据带上沿以上；以前一律丢掉，
+        等于白白放弃最可靠的官方判据。
+        """
+        wide = (0.20, 0.02, 0.18, 0.06)       # 上方，宽 18% —— 1~2 米外的车
+        narrow = (0.20, 0.02, 0.02, 0.03)     # 上方，宽 2% —— 远景里的小东西
+        task = self._task()
+        records = self._replay(task, fork_frame(floor=235), [wide])
+        self.assertIs(records[-1][1].status, TaskStatus.COMPLETED,
+                      "够宽的上方读数应该被采信")
+        self.assertIs(task.chosen_branch, Branch.RIGHT)
+        task = self._task()
+        records = self._replay(task, fork_frame(), [narrow], frames=40)
+        self.assertIs(records[-1][1].status, TaskStatus.NOT_TRIGGERED,
+                      "太窄的上方读数不该采信")
+
+    def test_the_official_reading_overrides_a_conflicting_picture(self):
+        """官方与画面**冲突**时以官方为准（这是"官方优先"的硬要求）。
+
+        画面在这一帧会把车认在右边（合成帧右侧放一辆无彩色车），而官方说左边有车
+        → 必须走右支（左支被堵），且读数来源标 `sdk`。
+        """
+        task = self._task()
+        image = fork_frame()
+        draw_dark_car(image, DARK_CAR_RIGHT_BOX)
+        records = self._replay(task, image, [(0.22, 0.45, 0.18, 0.10)])
+        self.assertIs(records[-1][1].status, TaskStatus.COMPLETED)
+        self.assertIs(task.chosen_branch, Branch.RIGHT,
+                      "官方说左边有车 → 必须走右支，不能被画面判据带偏")
+        self.assertEqual(task.last_blockage.source, "sdk")
 
     def test_readings_on_both_sides_fail_instead_of_guessing(self):
         task = self._task()

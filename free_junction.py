@@ -375,6 +375,18 @@ class FreeJunctionConfig:
     #: 并在 message 里写明 `official robot detection unavailable`，一眼能看出用的是哪套。
     #: ``"sdk"`` = 只用官方读数（没订阅就永远不接管 —— 只用于确认订阅是否通了）；
     #: ``"vision"`` = 只用画面判据（旧行为）。
+    #: ---- 官方 SDK"机器人识别"（判据里**优先级最高**的那条）----
+    #: 2026-09-18 用户明确：障碍物还是完整 EP 小车的可能性很大，**官方判据优先级要高**。
+    #: 官方的优点是与场地/距离/光照/车是否开机无关（只要它认得出），所以：
+    #:   * 判据带内的官方读数 → 直接用（不看尺寸、颜色、形状）；
+    #:   * **比判据带更远**（画面上方）的官方读数 → 只要框够宽（`sdk_min_width_ratio`）
+    #:     也采信（车在 1 米外时框常落在带上沿以上）；
+    #:   * **比判据带更近**（画面最下沿的是我们自己的车身）→ 绝不采信；
+    #:   * 官方与画面判据**冲突**时以官方为准（`_read_blockage` 里先返回官方结果）。
+    #: 官方一条读数都没有时，才退回画面判据兜底（关机/只剩底盘的车就属于这种）。
+    sdk_min_width_ratio: float = 0.05
+    #: "比判据带更远"允许多远：判据带上沿往上占整帧高度的比例。
+    sdk_far_margin_ratio: float = 0.20
     blockage_source: str = "sdk_or_vision"
     #: 官方读数的保鲜窗口（秒）：回调比这还旧就当作"这一帧没看到"。
     #: 宁可退回"没有判据"（不接管），也不拿一条过期读数决定往哪边拐。
@@ -1682,6 +1694,10 @@ class FreeJunctionTask:
         #: 官方确实看到了车，只是位置不在带内 —— 这种读数现在也采信（见
         #: `_read_sdk_blockage`），所以这句话主要是给实车排查用的。
         self.sdk_outside_band = 0
+        #: 官方读数被丢掉的条数（比判据带更近 = 我们自己的车身 / 太窄 = 场外远景）。
+        #: message 里会写出来，实车上一眼能看出"官方看到了但被过滤掉了"。
+        self.sdk_rejected_near = 0
+        self.sdk_rejected_narrow = 0
         self.last_blockage = BlockageReading(BLOCKAGE_NONE)
         self.last_visual = VisualDetection.no_result(KIND)
         self.chosen_branch: Optional[Branch] = None
@@ -2050,8 +2066,11 @@ class FreeJunctionTask:
             return ""
         if self.official_sightings > 0:
             if self.sdk_outside_band:
-                return ("official robot detected outside the junction band (%d); "
+                return ("official robot detected (%d far sighting(s) used); "
                         % self.sdk_outside_band)
+            if self.sdk_rejected_near or self.sdk_rejected_narrow:
+                return ("official robot detection rejected (%d near = own body, %d too narrow); "
+                        % (self.sdk_rejected_near, self.sdk_rejected_narrow))
             return ""
         return "official robot detection unavailable (0 sightings so far; picture criterion); "
 
@@ -2086,17 +2105,24 @@ class FreeJunctionTask:
         far = []
         for sighting in sightings:
             center_x, center_y = sighting.center
-            inside = (top <= center_y <= bottom) and (left_edge <= center_x <= right_edge)
-            if inside:
+            ratio = sighting.width_ratio(width)
+            if left_edge <= center_x <= right_edge and top <= center_y <= bottom:
                 in_band.append(sighting)
-            elif center_y < top:
-                # 比判据带更远（更靠画面上方）的官方读数**只计数、不采信**：
-                # 计数是给实车排查用的（message 会写"official robot detected outside
-                # the junction band"），采信它会让场外无关的机器人抢戏。
-                # 判据带本身已经覆盖画面 0.10~0.86，1 米外的车也在里面。
+            elif (center_y < top
+                  and center_y >= top - settings.sdk_far_margin_ratio * height
+                  and left_edge <= center_x <= right_edge
+                  and ratio >= settings.sdk_min_width_ratio):
+                # **比判据带更远**（画面上方）的官方读数：车停到 1 米之外时框可能落在
+                # 带上沿以上；以前一律丢掉等于白白放弃最可靠的官方判据。
+                # 但要**够宽**（`sdk_min_width_ratio`）——场外远景里的机器人不该抢戏。
                 far.append(sighting)
+            elif center_y >= top:
+                # 比判据带更近（画面最下沿）= 我们自己的车身，绝不采信。
+                self.sdk_rejected_near += 1
+            else:
+                self.sdk_rejected_narrow += 1
         self.sdk_outside_band = len(far)
-        for sighting in in_band:
+        for sighting in (in_band or far):
             center_x, _center_y = sighting.center
             ratio = sighting.width_ratio(width)
             if center_x < split:
