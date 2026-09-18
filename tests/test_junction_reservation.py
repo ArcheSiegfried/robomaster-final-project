@@ -75,6 +75,52 @@ class ObstacleAtForkTests(unittest.TestCase):
         self.assertIsInstance(
             task.wants_control(FramePacket(blank, 1, 1.0), 1.0), bool)
 
+    # -- 用户定的规则：岔路口遇到车 → free_junction；直路障碍 → obstacle ----
+    def test_a_straight_road_obstacle_does_not_trigger_the_junction_module(self):
+        """**直路上的障碍**不该惊动 free_junction —— 那是 obstacle 的活。
+
+        用户的原话："就在岔路口发现车就 free_junction，直路避障不就行了吗"。
+        这条钉住前半句的反面：**没有岔路几何时，free_junction 必须让开**，
+        否则它会去跟 obstacle 抢直路上的活。
+        """
+        task = FreeJunctionTask(FreeJunctionConfig())
+        # 直路 + 正前方一块"障碍"（不构成 Y 形分叉）
+        straight = line_frame(320)
+        straight[120:200, 280:360] = 60        # 路中间一个暗色方块
+        self.assertFalse(
+            task.wants_control(FramePacket(straight, 1, 1.0), 1.0),
+            "直路上的障碍不该让 free_junction 出手（那是 obstacle 的场景）",
+        )
+
+    def test_a_real_lane_obstacle_still_belongs_to_obstacle(self):
+        """协调器层：直路上 obstacle 照常接管，free_junction 不抢。"""
+
+        class LaneObstacle:
+            name = "obstacle"
+
+            def step(self, frame, now):
+                return TaskUpdate(
+                    TaskStatus.RUNNING,
+                    motion=MotionCommand(forward=0.08, lateral=-0.08),
+                    message="obstacle; stepping aside",
+                )
+
+        obstacle = LaneObstacle()
+        junction = FreeJunctionTask(FreeJunctionConfig())
+        coordinator = self._build((obstacle, junction))
+        self.now += 0.05
+        self.sequence += 1
+        # 全程喂普通直路帧（没有岔路）
+        for _ in range(120):
+            self.now += 0.05
+            self.sequence += 1
+            coordinator.step(
+                FramePacket(line_frame(320), self.sequence, self.now), self.now)
+        self.assertEqual(
+            coordinator.active_task_name, "obstacle",
+            "直路上必须让 obstacle 干活，free_junction 不许抢",
+        )
+
     # -- 协调器层：预约真的能把控制权从 obstacle 手里接过来 --------------
     def _build(self, tasks):
         self.chassis = FakeChassis()
