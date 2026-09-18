@@ -7,6 +7,7 @@ import sys
 import unittest
 from contextlib import redirect_stderr
 from dataclasses import replace
+from unittest.mock import patch
 
 import numpy as np
 
@@ -35,6 +36,7 @@ from tests.task_harness import (  # noqa: E402
     assert_inert_through_harness,
     assert_module_source_is_clean,
 )
+import number_marker  # noqa: E402
 
 WIDTH = 640
 HEIGHT = 360
@@ -597,9 +599,14 @@ class TrackingHysteresisTests(unittest.TestCase):
             task.step(packet(5, 1.34), 1.34)
         lines = [json.loads(line.split(" ", 1)[1]) for line in output.getvalue().splitlines()]
         events = [line["event"] for line in lines]
-        self.assertEqual(events, ["TARGET_LOCKED", "TRACKING_BELOW_TRIGGER",
-                                  "TRACKING_RECOVERED", "TARGET_LOST_GRACE",
-                                  "TARGET_LOST_TIMEOUT"])
+        self.assertEqual(
+            [event for event in events if event in {
+                "TARGET_LOCKED", "TRACKING_BELOW_TRIGGER", "TRACKING_RECOVERED",
+                "TARGET_LOST_GRACE", "TARGET_LOST_TIMEOUT",
+            }],
+            ["TARGET_LOCKED", "TRACKING_BELOW_TRIGGER", "TRACKING_RECOVERED",
+             "TARGET_LOST_GRACE", "TARGET_LOST_TIMEOUT"],
+        )
         self.assertEqual(lines[0]["locked_target_id"], "1")
         self.assertEqual(lines[0]["locked_target_width_ratio"], 0.25)
         self.assertEqual(lines[-1]["frame_sequence"], 5)
@@ -812,6 +819,138 @@ class EvidenceTests(unittest.TestCase):
         self.assertIs(update.status, TaskStatus.FAILED)
         self.assertIsNone(task.pending_evidence_request)
         self.assertEqual(task.saved_ids, set())
+
+
+class DiagnosticsOnlyTests(unittest.TestCase):
+    def feed(self, task, sequence, now, ratio=0.25, x=WIDTH / 2, y=HEIGHT / 2):
+        set_current(task, sequence, now, candidate(x=x, y=y, width=WIDTH * ratio))
+        return task.step(packet(sequence, now), now)
+
+    def events(self, task, name):
+        return [item for item in task.diagnostic_events if item["event"] == name]
+
+    def test_trigger_boundary_and_locked_tracking_are_unchanged(self):
+        task = NumberMarkerTask(BASE_CONFIG)
+        with redirect_stderr(io.StringIO()):
+            self.assertIs(self.feed(task, 1, 1.0, 0.20).status, TaskStatus.NOT_TRIGGERED)
+            self.assertEqual(self.feed(task, 2, 1.01, 0.2001).message,
+                             "STOPPING:TARGET_FOUND")
+            held = self.feed(task, 3, 1.02, 0.19, x=460)
+        self.assertEqual(held.message, "AIMING:TRACKING_BELOW_TRIGGER")
+        self.assertEqual(task.target_id, "1")
+        self.assertIsNone(task.pending_evidence_request)
+        trace = list(task._recent_observations)
+        self.assertEqual([row["frame_sequence"] for row in trace], [2, 3])
+        self.assertAlmostEqual(trace[-1]["current_target_width_ratio"], 0.19)
+        self.assertEqual(trace[-1]["phase"], "AIMING:TRACKING_BELOW_TRIGGER")
+        self.assertEqual(trace[-1]["yaw_command"], held.motion.yaw)
+        self.assertEqual(trace[-1]["target_id"], "1")
+        self.assertEqual(trace[-1]["target_center_x"], 460)
+        self.assertEqual(trace[-1]["frame_center_x"], WIDTH / 2)
+        self.assertEqual(trace[-1]["x_error_px"], 140)
+        self.assertEqual(trace[-1]["task_phase"], "AIMING:TRACKING_BELOW_TRIGGER")
+        self.assertEqual(trace[-1]["candidate_source_sequence"], 3)
+
+    def test_center_transitions_and_stability_increments_are_precise(self):
+        task = NumberMarkerTask(BASE_CONFIG)
+        with redirect_stderr(io.StringIO()):
+            self.feed(task, 1, 1.0, x=460)
+            self.feed(task, 2, 1.01, x=460)
+            self.feed(task, 3, 1.02)
+            self.feed(task, 4, 1.03)
+            self.feed(task, 5, 1.04, x=460)
+            self.feed(task, 6, 1.05)
+            self.feed(task, 7, 1.06)
+            final = self.feed(task, 8, 1.07)
+        self.assertEqual([e["event"] for e in task.diagnostic_events
+                          if e["event"].startswith("CENTER_")],
+                         ["CENTER_ENTER", "CENTER_EXIT", "CENTER_ENTER"])
+        self.assertEqual([e["stable_frames"] for e in self.events(task, "STABLE_FRAME_INCREMENT")],
+                         [1, 2, 1, 2, 3])
+        resets = self.events(task, "STABLE_FRAMES_RESET")
+        self.assertEqual([(e["stable_frames"], e["reset_reason"]) for e in resets],
+                         [(0, "CENTER_LOST")])
+        self.assertEqual(final.message, "AIM_LOCKED:EVIDENCE_PENDING")
+
+    def test_width_reset_and_evidence_gate_event_order(self):
+        task = NumberMarkerTask(BASE_CONFIG)
+        with redirect_stderr(io.StringIO()):
+            self.feed(task, 1, 1.0)
+            self.feed(task, 2, 1.01)
+            self.feed(task, 3, 1.02, 0.19)
+            self.feed(task, 4, 1.03, 0.23)
+            self.feed(task, 5, 1.04, 0.23)
+            self.assertIsNone(task.pending_evidence_request)
+            final = self.feed(task, 6, 1.05, 0.23)
+        self.assertEqual(self.events(task, "STABLE_FRAMES_RESET")[0]["reset_reason"],
+                         "WIDTH_BELOW_EVIDENCE_GATE")
+        self.assertEqual(final.message, "AIM_LOCKED:EVIDENCE_PENDING")
+        names = [event["event"] for event in task.diagnostic_events]
+        self.assertLess(names.index("EVIDENCE_READY"), names.index("EVIDENCE_REQUESTED"))
+        self.assertEqual(self.events(task, "EVIDENCE_READY")[0]["stable_frames"], 3)
+        self.assertGreater(self.events(task, "EVIDENCE_REQUESTED")[0]
+                           ["current_target_width_ratio"], 0.20)
+        self.assertIsNotNone(task.pending_evidence_request)
+
+    def test_timeout_has_bounded_one_second_trace_and_state(self):
+        task = NumberMarkerTask(BASE_CONFIG)
+        output = io.StringIO()
+        with redirect_stderr(output):
+            self.feed(task, 1, 1.0, x=460)
+            for sequence in range(2, 162):
+                self.feed(task, sequence, 1.0 + (sequence - 1) * 0.05, x=460)
+            failed = self.feed(task, 162, 9.05, x=460)
+        self.assertEqual(failed.message, "FAILED:TASK_TIMEOUT")
+        timeout = self.events(task, "TASK_TIMEOUT")[0]
+        trace = timeout["recent_trace"]
+        self.assertLessEqual(len(trace), 40)
+        self.assertGreaterEqual(trace[-1]["timestamp_monotonic_s"] -
+                                trace[0]["timestamp_monotonic_s"], 1.0)
+        self.assertEqual(timeout["locked_target_id"], "1")
+        self.assertEqual(timeout["task_state"], "FAILED")
+        self.assertEqual(timeout["phase"], "FAILED:TASK_TIMEOUT")
+        self.assertLess(timeout["task_timeout_remaining_s"], 0.0)
+        self.assertEqual(timeout["last_observation"]["phase"], "AIMING")
+        self.assertIn('"recent_trace"', output.getvalue())
+
+    def test_diagnostic_serialization_failure_does_not_change_control(self):
+        reference = NumberMarkerTask(BASE_CONFIG)
+        faulty = NumberMarkerTask(BASE_CONFIG)
+        with redirect_stderr(io.StringIO()):
+            expected_lock = self.feed(reference, 1, 1.0, x=460)
+            expected_aim = self.feed(reference, 2, 1.01, x=460)
+        with patch.object(number_marker.json, "dumps", side_effect=RuntimeError("log failed")):
+            actual_lock = self.feed(faulty, 1, 1.0, x=460)
+            actual_aim = self.feed(faulty, 2, 1.01, x=460)
+        self.assertEqual(actual_lock, expected_lock)
+        self.assertEqual(actual_aim, expected_aim)
+        self.assertEqual(faulty.state, reference.state)
+        self.assertEqual(faulty.target_pitch, reference.target_pitch)
+
+    def test_stderr_and_history_failures_do_not_change_control(self):
+        class BrokenStream:
+            def write(self, _text):
+                raise RuntimeError("stderr unavailable")
+
+        class BrokenHistory:
+            def clear(self):
+                raise RuntimeError("history unavailable")
+
+            def __bool__(self):
+                raise RuntimeError("history unavailable")
+
+        reference = NumberMarkerTask(BASE_CONFIG)
+        faulty = NumberMarkerTask(BASE_CONFIG)
+        faulty._recent_observations = BrokenHistory()
+        with redirect_stderr(io.StringIO()):
+            expected_lock = self.feed(reference, 1, 1.0, x=460)
+            expected_aim = self.feed(reference, 2, 1.01, x=460)
+        with patch.object(number_marker.sys, "stderr", BrokenStream()):
+            actual_lock = self.feed(faulty, 1, 1.0, x=460)
+            actual_aim = self.feed(faulty, 2, 1.01, x=460)
+        self.assertEqual(actual_lock, expected_lock)
+        self.assertEqual(actual_aim, expected_aim)
+        self.assertEqual(faulty.state, reference.state)
 
 
 class CoordinatorIntegrationTests(unittest.TestCase):
