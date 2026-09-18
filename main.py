@@ -1,7 +1,9 @@
 """RoboMaster entry point. Importing this module never connects to hardware."""
 
+import socket
 import sys
 import time
+from pathlib import Path
 
 import cv2
 
@@ -797,5 +799,67 @@ def main(
         cv2.destroyAllWindows()
 
 
+def _startup_crash_report(error: BaseException):
+    """启动阶段崩溃时写一份**带环境信息**的记录并返回路径。
+
+    为什么单独做一份（2026-09-18 现场教训）：`initialize()` 在
+    `build_coordinator()` **之前**，所以启动阶段一崩就什么都留不下 ——
+    `captures/` 目录还没建，用户只看到满屏 SDK 栈，问"为什么没有报告"。
+
+    这份记录落在 `captures/crashes/`，内容包含：完整 traceback、本机所有
+    IPv4 地址、以及关键配置。绝不抛异常（它自己崩了就返回 None）。
+    """
+    try:
+        import datetime
+        import traceback
+
+        directory = Path(DEFAULT_CAPTURE_DIRECTORY) / "crashes"
+        directory.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        target = directory / ("crash_%s.txt" % stamp)
+
+        lines = [
+            "RoboMaster 启动/运行崩溃记录",
+            "时间: %s" % datetime.datetime.now().isoformat(timespec="seconds"),
+            "",
+            "== traceback ==",
+            "".join(traceback.format_exception(
+                type(error), error, error.__traceback__
+            )),
+            "== 本机 IPv4 地址 ==",
+        ]
+        try:
+            host = socket.gethostname()
+            for info in socket.getaddrinfo(host, None, socket.AF_INET):
+                lines.append("  %s" % (info[4][0],))
+        except Exception as lookup_error:
+            lines.append("  （取不到: %s）" % lookup_error)
+        lines += [
+            "== 相关配置 ==",
+            "  ROBOT_AP_ADDRESS = 192.168.2.1",
+            "  ROBOT_AP_PORT    = 20020",
+            "  video_gap_stop_seconds = %s" % getattr(
+                CONFIG, "video_gap_stop_seconds", "?"),
+            "  viewer = %s" % sys.executable,
+            "",
+            "提示：SDK 连不上时会抛 `TypeError: exceptions must derive from",
+            "BaseException`（client.py:95 用字符串 raise），它**盖住了真原因**。",
+            "看本机有没有 192.168.2.x：没有就是没连上车的热点。",
+            "也可以跑 scripts/check_robot_link.py 直接问车在不在。",
+        ]
+        target.write_text("\n".join(lines), encoding="utf-8")
+        return target
+    except Exception:
+        return None
+
+
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except BaseException as error:            # noqa: BLE001 - 就是为了兜住一切
+        if not isinstance(error, (KeyboardInterrupt, SystemExit)):
+            path = _startup_crash_report(error)
+            if path is not None:
+                print("\n[main] 崩溃记录已写入：%s" % path, flush=True)
+                print("[main] 把这份文件交给协助者比截屏更有用。", flush=True)
+        raise
