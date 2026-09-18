@@ -343,7 +343,7 @@ class TaskTests(unittest.TestCase):
         task, updates = self.run_sequence(["red", "red"])
         request = task.take_evidence_request()
         self.assertIsNotNone(request)
-        self.assertIn("Team 03 detects a red light", request.annotation)
+        self.assertIn("Team 10 detects a red light", request.annotation)
         self.assertTrue(request.detection.valid)
         self.assertEqual(request.detection.color, "red")
         self.assertIsNotNone(request.detection.box)

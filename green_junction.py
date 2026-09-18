@@ -670,7 +670,7 @@ class JunctionConfig:
     max_branch_center_offset: float = 0.85  # 分支中心相对 ROI 中心的允许偏移
     line_center_deadband: float = 0.18      # 线偏多少还算"在中央"
     # ---- 得分照片（统一层，2026-09-18 集成侧接入）----
-    team_number: str = "03"          # 写进照片说明文字的队号
+    team_number: str = "10"          # 写进照片说明文字的队号
     max_evidence_attempts: int = 2   # 写盘失败最多重试几次，之后放弃照片
     line_valid_confidence: float = 0.20     # 低于此置信度的线检测不算数
     min_junction_confidence: float = 0.25   # 综合置信度门槛

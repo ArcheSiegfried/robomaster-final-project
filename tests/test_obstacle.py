@@ -1094,8 +1094,8 @@ class ObstacleEvidencePhotoTests(unittest.TestCase):
 
     # 文案照老师样例：`Team 10 detects obstacle » the left side`；样例队号 10，
     # 我们是 03。模板在证据层，这里钉死**渲染出来的那句话**。
-    LEFT_TEXT = "Team 03 detects obstacle » the left side"
-    RIGHT_TEXT = "Team 03 detects obstacle » the right side"
+    LEFT_TEXT = "Team 10 detects obstacle » the left side"
+    RIGHT_TEXT = "Team 10 detects obstacle » the right side"
 
     @staticmethod
     def _drive_to_the_dodge(task, image=None, now=1.0, seq=0, limit=200):

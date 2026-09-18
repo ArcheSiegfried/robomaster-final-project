@@ -999,7 +999,7 @@ class JunctionEvidenceTests(unittest.TestCase):
         request = task.take_evidence_request()
         self.assertIsNotNone(request, "判出拥堵侧并选定分支那一刻应该排一张得分截图")
         self.assertEqual(
-            request.annotation, "Team 03 detects traffic jam » left way and right"
+            request.annotation, "Team 10 detects traffic jam » left way and right"
         )
         self.assertEqual(request.shape, "rect", "老师要求用矩形框出堵路的那台车")
         self.assertIsNotNone(request.image)
@@ -1025,16 +1025,16 @@ class JunctionEvidenceTests(unittest.TestCase):
         request = task.take_evidence_request()
         self.assertIsNotNone(request)
         self.assertEqual(
-            request.annotation, "Team 03 detects traffic jam » right way and left"
+            request.annotation, "Team 10 detects traffic jam » right way and left"
         )
         self.assertEqual(request.detection.box, task.last_blockage.right_box)
         self.assertGreater(box_iou(request.detection.box, CAR_RIGHT_BOX), 0.5)
 
     def test_the_team_number_comes_from_the_module_settings(self):
         """队号从配置来（样例是 `Team 10`，我们写 03），不由模块自己拼字符串。"""
-        task = FreeJunctionTask(FreeJunctionConfig(team_number="03"))
+        task = FreeJunctionTask(FreeJunctionConfig(team_number="10"))
         drive_to_branch_choice(task, fork_frame(car_left=True))
-        self.assertTrue(task.take_evidence_request().annotation.startswith("Team 03 "))
+        self.assertTrue(task.take_evidence_request().annotation.startswith("Team 10 "))
 
     def test_a_failed_acknowledgement_does_not_change_the_route(self):
         """**回执 False（写盘失败）之后行为不变**：选的路、走完的结局都一样，
@@ -1111,7 +1111,7 @@ class JunctionEvidenceTests(unittest.TestCase):
         self.assertIsNone(request.detection, "没有可用框就不许编坐标")
         self.assertIsNotNone(request.image)
         self.assertEqual(
-            request.annotation, "Team 03 detects traffic jam » left way and right"
+            request.annotation, "Team 10 detects traffic jam » left way and right"
         )
         self.assertIn("without a box", task.last_evidence_note)
         self.assertIn("no usable blockage frame", task.last_evidence_note)

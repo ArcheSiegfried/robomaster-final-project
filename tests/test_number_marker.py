@@ -40,7 +40,7 @@ import number_marker  # noqa: E402
 
 WIDTH = 640
 HEIGHT = 360
-BASE_CONFIG = NumberMarkerConfig(team_number="03")
+BASE_CONFIG = NumberMarkerConfig(team_number="10")
 
 
 def packet(sequence=1, now=1.0):
@@ -89,9 +89,9 @@ def advance_to_evidence(task, marker_id="1", start=1.0):
 
 
 class NumberMarkerContractTests(unittest.TestCase):
-    def test_default_team_number_is_03(self):
-        self.assertEqual(NumberMarkerConfig().team_number, "03")
-        self.assertEqual(NumberMarkerTask().settings.team_number, "03")
+    def test_default_team_number_is_10(self):
+        self.assertEqual(NumberMarkerConfig().team_number, "10")
+        self.assertEqual(NumberMarkerTask().settings.team_number, "10")
 
     def test_module_source_obeys_the_safety_rules(self):
         assert_module_source_is_clean(self, "number_marker.py")
@@ -639,7 +639,7 @@ class EvidenceTests(unittest.TestCase):
     def test_request_contains_rectangle_id_team_and_center_text_anchor(self):
         task, request = self.task_at_evidence()
         self.assertEqual(request.marker_id, "1")
-        self.assertEqual(request.annotation, "Team 03 detects a marker with ID of 1")
+        self.assertEqual(request.annotation, "Team 10 detects a marker with ID of 1")
         self.assertEqual(request.text_anchor, (WIDTH // 2, HEIGHT // 2))
         self.assertIsNotNone(request.detection.box)
         self.assertEqual(request.image.shape, (HEIGHT, WIDTH, 3))
@@ -651,7 +651,7 @@ class EvidenceTests(unittest.TestCase):
             request = task.take_evidence_request()
             self.assertEqual(
                 request.annotation,
-                "Team 03 detects a marker with ID of {}".format(marker_id),
+                "Team 10 detects a marker with ID of {}".format(marker_id),
             )
         custom = NumberMarkerTask(
             replace(NumberMarkerConfig(), team_number="17", aim_stable_frames=1)
@@ -682,7 +682,7 @@ class EvidenceTests(unittest.TestCase):
         self.assertEqual(request.captured_at, 1.01)
         self.assertEqual(request.detection.center, (320, 180))
         self.assertEqual(request.detection.box, (240, 130, 400, 230))
-        self.assertEqual(request.annotation, "Team 03 detects a marker with ID of 2")
+        self.assertEqual(request.annotation, "Team 10 detects a marker with ID of 2")
         self.assertEqual(request.image.shape, (HEIGHT, WIDTH, 3))
         self.assertTrue(np.array_equal(request.image, original))
         image[:] = 99

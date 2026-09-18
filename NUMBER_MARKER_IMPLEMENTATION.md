@@ -19,7 +19,7 @@
 | face / center | `compute_aim_intent()`、`_integrate_pitch()`、`is_marker_centered()` | 水平误差继续输出底盘 yaw；垂直误差经受限时间积分后输出既有 `GimbalCommand` 绝对 pitch；居中帧不发送多余云台指令 |
 | 连续稳定后锁定 | `aim_stable_frames`、frame sequence 去重 | 同一帧重复调用不增加计数 |
 | marker 丢失/观测过期 | `LOST`、freshness 校验 | 立即零运动；超过模块超时后 `FAILED` |
-| scoring snapshot | `EvidenceRequest`、保存回执 | 本模块只构造请求：真实全帧副本、全帧坐标框、ID、默认 Team 03 文字与中心文字锚点；正式图片只由 `evidence.py` 渲染并写盘 |
+| scoring snapshot | `EvidenceRequest`、保存回执 | 本模块只构造请求：真实全帧副本、全帧坐标框、ID、默认 Team 10 文字与中心文字锚点；正式图片只由 `evidence.py` 渲染并写盘 |
 | 个人函数由主流程调用 | `NumberMarkerTask.step()` | 已在 `task_registry.py` 注册，`main.build_coordinator()` 逐帧调用；marker source 与 evidence service 均已接入主循环 |
 
 ## Current integration interface
@@ -81,7 +81,7 @@ Final 文件未定义 nearest 的距离来源，也未定义“最近但太小�
 - `Team <number> detects a marker with ID of <id>`；
 - 画面中心文字锚点。
 
-`NumberMarkerConfig.team_number` 的正式默认值为 `"03"`，仍可显式覆盖。annotation 由
+`NumberMarkerConfig.team_number` 的正式默认值为 `"10"`，仍可显式覆盖。annotation 由
 `self.settings.team_number` 与当前 marker ID 动态组成；没有把整句写成固定字符串。首次请求 ID 是
 `marker:<id>:frame:<sequence>:attempt:1`，有界重试在旧 ID 后追加 `:retryN`，每次不同；旧 ID
 回执无效。
@@ -107,7 +107,7 @@ C:\Users\15836\anaconda3\envs\robomaster38\python.exe scripts\check_module.py nu
 单点翻转、0.20 秒积分上限、重复时间戳、上下角度限幅、水平和垂直同时输出、校正后稳定锁定、
 目标短时丢失、陈旧帧、evidence pending 无漂移、完成/失败后新目标从 entry pitch 重新开始，
 以及 `TaskUpdate.gimbal` 经真实 coordinator 到既有 `GimbalOutput` 的离线贯通。本次额外验证默认
-Team 03、动态 ID、完整请求字段/全帧副本、有界唯一重试、旧回执拒绝、pending 零运动、重复 ID
+Team 10、动态 ID、完整请求字段/全帧副本、有界唯一重试、旧回执拒绝、pending 零运动、重复 ID
 不再计分和失败即时清理。
 结果只可标为 **OFFLINE VERIFIED**。
 
