@@ -758,8 +758,17 @@ def _branch_tilt(
     span = max(ys) - min(ys)
     if span < 1.0:
         return None
+    # A25：只用**靠近分叉点那一小段**（y 最大的那几行）拟合方向。整条分支一起拟合时，
+    # 弯出去的那条是弧线、贴出去的那段又很短，平均下来方向会偏大 —— 2026-09-18 实测
+    # 就是被这个偏大的角带着转了 63°、然后偏出带子。车最先要跟上的本来就是近段。
+    order = np.argsort(np.asarray(ys, dtype=float))
+    nearest = order[-max(4, int(round(len(order) * 0.4))):]
+    fit_y = np.asarray(ys, dtype=float)[nearest]
+    fit_x = np.asarray(xs, dtype=float)[nearest]
+    if fit_y.max() - fit_y.min() < 1.0:
+        return None
     try:
-        slope = float(np.polyfit(np.asarray(ys, dtype=float), np.asarray(xs, dtype=float), 1)[0])
+        slope = float(np.polyfit(fit_y, fit_x, 1)[0])
     except Exception:
         return None
     tilt = abs(math.degrees(math.atan(slope)))
