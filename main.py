@@ -188,14 +188,29 @@ def feed_robot_observations(coordinator, source, frame, now) -> int:
         rows, observed_at = source.observations(frame)
     except Exception:
         rows, observed_at = (), None
+    # 数据源"在正常跑"吗？订阅成功 = 官方识别真的在工作。
+    # 传给任务用于判据闸门：**订阅成功却一直什么都不报**说明"确实没有机器人"，
+    # 这时不该退回画面判据（实车实测画面判据会把椅子当车）。
+    # 订阅本身没建起来（False/None）才是"这条通路不可用"，才允许画面判据兜底。
+    try:
+        healthy = bool(getattr(source, "subscribe_result", False))
+    except Exception:
+        healthy = False
     fed = 0
     for task in getattr(coordinator, "motion_tasks", ()):
         push = getattr(task, "update_robot_observations", None)
         if not callable(push):
             continue
         try:
-            push(rows, observed_at)
+            push(rows, observed_at, source_healthy=healthy)
             fed += 1
+        except TypeError:
+            # 模块的签名还没有这个关键字（旧模块/假件）：退回旧调用方式。
+            try:
+                push(rows, observed_at)
+                fed += 1
+            except Exception:
+                pass
         except Exception:
             pass
     return fed

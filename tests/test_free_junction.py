@@ -1441,5 +1441,79 @@ class HarnessIntegrationTests(unittest.TestCase):
         self.assertIsNone(harness.task_name)
 
 
+class OfficialHealthGateTests(unittest.TestCase):
+    """官方识别**在正常跑却什么都没报**时，不许拿画面判据接管（2026-09-18 实车）。
+
+    实车证据（`captures/run_20260918_165321` / `165522`）：官方机器人识别以
+    ~25 Hz 在回调、订阅成功，但 `robots_in_snapshot` 恒为 0。于是本模块每次都
+    退回画面判据；画面判据把**背景里的椅子/桌子**当成停着的小车，后果是：
+    抢在 `green_junction` 前面接管、存下一张口径错误的得分截图
+    （`Team 10 detects traffic jam » left way and right`）、0.3 秒后 FAILED 停车。
+
+    闸门用**数据源健康度**而不是时间：实测画面判据在岔路确认那一帧就给出读数、
+    下一帧车就进了 APPROACH，任何正的宽限期都赶不上。
+    """
+
+    def _replay(self, task, image, sightings=(), healthy=None,
+                frames=120, dt=0.05, start=1.0):
+        records = []
+        now = start
+        for index in range(frames):
+            task.update_robot_observations(sightings, now=now,
+                                           source_healthy=healthy)
+            update = task.step(FramePacket(image, index + 1, now), now)
+            records.append((task.state, update, now))
+            now += dt
+            if update.status in (TaskStatus.COMPLETED, TaskStatus.FAILED):
+                break
+        return records
+
+    def test_no_takeover_when_the_source_runs_but_reports_nothing(self):
+        """订阅成功却没有读数 → 画面里明明画着车，也不许接管。"""
+        task = FreeJunctionTask(FreeJunctionConfig())     # 默认 sdk_or_vision
+        records = self._replay(task, fork_frame(car_left=True), healthy=True)
+        statuses = {update.status for _state, update, _now in records}
+        self.assertNotIn(TaskStatus.RUNNING, statuses,
+                         "官方在正常跑却没有车时，画面判据的'拥堵'必然是误判")
+        self.assertIsNone(task.chosen_branch)
+
+    def test_vision_still_falls_back_when_the_source_is_unavailable(self):
+        """订阅没建起来（数据源不可用）→ 画面判据照旧兜底，这是它原本的用途。"""
+        task = FreeJunctionTask(FreeJunctionConfig())
+        records = self._replay(task, fork_frame(car_left=True), healthy=False)
+        statuses = [update.status for _state, update, _now in records]
+        self.assertIn(TaskStatus.RUNNING, statuses,
+                      "这条通路不可用时应当用画面判据兜底")
+
+    def test_uninformed_source_keeps_the_old_behaviour(self):
+        """集成层没告知健康度（None）→ 保持旧行为，画面判据兜底。"""
+        task = FreeJunctionTask(FreeJunctionConfig())
+        records = self._replay(task, fork_frame(car_left=True), healthy=None)
+        self.assertIn(TaskStatus.RUNNING,
+                      [update.status for _state, update, _now in records])
+
+    def test_official_reading_wins_over_the_gate(self):
+        """官方读数出过一次 → 用它，闸门不影响。"""
+        task = FreeJunctionTask(FreeJunctionConfig(blockage_source="sdk"))
+        records = self._replay(
+            task, fork_frame(), sightings=[(320.0, 180.0, 120.0, 90.0)],
+            healthy=True,
+        )
+        self.assertIn(TaskStatus.RUNNING,
+                      [update.status for _state, update, _now in records])
+        self.assertGreater(task.official_sightings, 0)
+
+    def test_the_gate_can_be_switched_off(self):
+        """关掉闸门 = 回到旧行为，用于现场对照与回退。"""
+        task = FreeJunctionTask(FreeJunctionConfig(official_health_gate=False))
+        records = self._replay(task, fork_frame(car_left=True), healthy=True)
+        self.assertIn(TaskStatus.RUNNING,
+                      [update.status for _state, update, _now in records],
+                      "闸门关掉后应当恢复画面判据兜底")
+
+    def test_default_gate_is_on(self):
+        self.assertTrue(FreeJunctionConfig().official_health_gate)
+
+
 if __name__ == "__main__":
     unittest.main()

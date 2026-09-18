@@ -385,6 +385,32 @@ class FreeJunctionConfig:
     #: 宁可退回"没有判据"（不接管），也不拿一条过期读数决定往哪边拐。
     sdk_observation_hold_seconds: float = 0.35
 
+    # ---- "官方识别在跑却什么都没报"时的闸门（2026-09-18 新增）----
+    #:
+    #: 实车证据（`captures/run_20260918_165321` / `165522`）：官方机器人识别以
+    #: ~25 Hz 在回调（`callback_hz` 22.9 / 25.3）、订阅成功，但
+    #: `robots_in_snapshot` **恒为 0**。于是本模块每次都退回画面判据兜底，
+    #: 而画面判据（Canny 硬边缘 + 对比度大块）会把**背景里的椅子/桌子**当成
+    #: 停着的小车，后果实测为：
+    #:   1. 在任务 4 的绿灯岔路口抢在 `green_junction` 前面接管并选边；
+    #:   2. 存下一张口径错误的得分截图
+    #:      （`Team 10 detects traffic jam » left way and right`，而那里根本没有拥堵）
+    #:      —— 老师按这些图算分；
+    #:   3. 接管 0.3 秒后读数消失 → `no vehicle on either branch` → FAILED 停车。
+    #:
+    #: 闸门：**订阅成功（数据源在正常跑）却没有任何官方读数时，不许用画面判据接管。**
+    #: "订阅成功"这个信号由集成层每帧随观测一起推下来
+    #: （`main.feed_robot_observations` 读 `robot_source.subscribe_result`）。
+    #:
+    #: 为什么不用"等 N 秒"这种时间闸门：实测画面判据在**岔路确认那一帧**就给出
+    #: 读数、下一帧车就进了 APPROACH，任何正的宽限期都赶不上，等于没闸门。
+    #:
+    #: 为什么不是无条件禁掉画面判据：**订阅没建起来**（`source_healthy=False`，
+    #: 例如集成层还没接 robot 识别）时，画面判据仍是有用的兜底 —— 那正是它
+    #: 原本的设计目的。
+    #: 想恢复旧行为把这行改成 False。
+    official_health_gate: bool = True
+
     # 旧的"走廊"参数（v2 用来把 ROI 下部切块）。v3 改成整帧高度的检测带之后不再使用，
     # 保留名字只为兼容，值不影响任何行为。
     corridor_height_ratio: float = 1.0
@@ -1374,6 +1400,11 @@ class FreeJunctionTask:
         #: 一直是 0 就说明集成层还没订阅 robot 识别（那时用的是画面判据兜底）——
         #: 主循环的 message 会直接写出来，实车上一眼可见。
         self.official_sightings = 0
+        #: 集成层推下来的"官方数据源在正常跑"信号（订阅成功 = True）。
+        #: 默认 False = "这条通路不可用"，此时画面判据仍可兜底（见 official_health_gate）。
+        self._source_healthy = False
+        #: 本次岔路口是否已判定"官方源在跑却没数据"。保留以便按岔路细化。
+        self._official_dead = False
         self.last_blockage = BlockageReading(BLOCKAGE_NONE)
         self.last_visual = VisualDetection.no_result(KIND)
         self.chosen_branch: Optional[Branch] = None
@@ -1705,12 +1736,22 @@ class FreeJunctionTask:
 
     # -- 官方 SDK 观测（集成层推来的纯数据）--------------------------------
 
-    def update_robot_observations(self, candidates: Iterable, now: Optional[float] = None) -> None:
+    def update_robot_observations(
+        self,
+        candidates: Iterable,
+        now: Optional[float] = None,
+        source_healthy: Optional[bool] = None,
+    ) -> None:
         """主循环推来的**官方 SDK 机器人识别**观测快照（与 5 号 `obstacle.py` 同一套接口）。
 
         接这条通路**不需要改 `main.py` / `task_registry.py`**：`main.py` 的
         `feed_robot_observations()` 每帧对任何实现了本方法的名字调一次
-        （``push(rows, observed_at)``，喂在 `coordinator.step()` 之前）。
+        （``push(rows, observed_at, source_healthy=...)``，喂在 `coordinator.step()` 之前）。
+
+        :param source_healthy: 官方数据源**是否在正常跑**（集成层读
+            `robot_source.subscribe_result`）。用于 `official_health_gate`：
+            订阅成功却一直没读数 → 不退回画面判据。``None`` = 集成层没告知，
+            保持"不可用"语义（画面判据仍可兜底）。
 
         ⚠️ **不要**改成 `update_candidates`：那个名字属于 `number_marker` 的
         **视觉标签(marker)** 通道（`feed_marker_observations()`），标签不是车。
@@ -1737,6 +1778,8 @@ class FreeJunctionTask:
         with self._sdk_lock:
             self._sdk_rows = snapshot
             self._sdk_pushed_at = stamp
+            if source_healthy is not None:
+                self._source_healthy = bool(source_healthy)
 
     def _sdk_sightings(
         self, frame_width: int, frame_height: int, now: float
@@ -1817,6 +1860,10 @@ class FreeJunctionTask:
             # "sdk_or_vision"：官方这一帧没读数 → 退回画面判据兜底。
             if source == "sdk" or official.blocked:
                 return official
+            if self._official_source_is_dead(moment):
+                # 官方识别整场没出过读数 → 画面判据不可信（会把椅子当车），
+                # 宁可不接管也不误停/出错的得分截图。见 official_dead_gate。
+                return BlockageReading(BLOCKAGE_NONE)
 
         left_edge, right_edge = int(rect[0]), int(rect[2])
         top = int(_clamp(settings.blockage_top_ratio, 0.0, 0.9) * height)
@@ -1906,6 +1953,26 @@ class FreeJunctionTask:
         if self.official_sightings > 0:
             return ""
         return "official robot detection unavailable (0 sightings so far; picture criterion); "
+
+    def _official_source_is_dead(self, now: float) -> bool:
+        """官方识别"在正常跑却什么都没报"吗？（见 official_health_gate）
+
+        由集成层每帧随观测推下来的 `source_healthy` 判定：
+
+        * 订阅没建起来（`source_healthy=False`）→ False，画面判据照旧兜底
+          （这正是它原本的设计目的：那条通路不可用时才用它）；
+        * 订阅成功（数据在正常跑）→ True，**不许**用画面判据接管：
+          官方在正常工作、只是没有机器人，画面判据的"拥堵"必然是误判
+          （实测会把椅子/桌子当车）；
+        * 关掉闸门 → 永不为真，行为与改动前完全一致。
+        """
+        if not bool(getattr(self.settings, "official_health_gate", True)):
+            return False
+        return bool(self._source_healthy)
+
+    def _reset_official_dead(self) -> None:
+        """岔路口消失时复位判定（保留接口，便于后续按岔路细化）。"""
+        self._official_dead = False
 
     def _read_sdk_blockage(
         self, fork: ForkDetection, image, rect, now: float
@@ -2048,6 +2115,7 @@ class FreeJunctionTask:
 
         if not fork.valid:
             self._confirm_count = 0
+            self._reset_official_dead()
             return self._not_triggered("no junction")
 
         self._confirm_count += 1
