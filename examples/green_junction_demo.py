@@ -65,11 +65,17 @@ def junction_frame(split_y: int = 220) -> np.ndarray:
     return image
 
 
-def junction_scene(car_yaw: float = 0.0, tilt0: float = 30.0) -> np.ndarray:
+def junction_scene(car_yaw: float = 0.0, tilt0: float = 30.0,
+                   travel: float = 0.0, pass_at: float = 0.18) -> np.ndarray:
     """按"车已经转过 ``car_yaw`` 度"画出岔路口（A23 的自标定收尾要求带子真的转竖直）。
 
     偏斜角与转动量按实车量到的 1:1 关系给（车转 1°，带子偏斜减 1°）。
     """
+    if float(travel) >= float(pass_at):
+        # A24：口子已经在车后 —— 画面里只剩选中的那条带子
+        image = _ground()
+        cv2.line(image, (WIDTH // 2, HEIGHT - 2), (WIDTH // 2, 20), TAPE, 24)
+        return image
     image = _ground()
     fork_y, far_y = 290, 120
     rows = float(fork_y - far_y)
@@ -147,13 +153,16 @@ def run_demo(light_probe=green_right) -> List[str]:
     #    同时巡线模块已经在左/右分支上重新找到线并居中 → 完成
     update = None
     car_yaw = 0.0
-    for _ in range(12):
+    travel = 0.0
+    for _ in range(24):
         now += FRAME_DT
         if update is not None and update.motion is not None:
             car_yaw += float(update.motion.yaw) * FRAME_DT
+            travel += float(update.motion.forward) * FRAME_DT
         decision = follower.process_frame(straight_frame(), now)
         update = task.step(
-            FramePacket(junction_scene(car_yaw), sequence, now), now, decision.detection
+            FramePacket(junction_scene(car_yaw, travel=travel), sequence, now),
+            now, decision.detection,
         )
         sequence += 1
         if update.status is TaskStatus.COMPLETED:

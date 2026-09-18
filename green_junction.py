@@ -118,6 +118,14 @@ A21           锁死的分支偏角是**转动目标**，不是"对齐了没有"
               1.8 秒转过约 80° 把巡线带转出画面，最后以
               ``line did not return after the turn`` 失败；而偏角恰好 ≤6° 的那次
               却能成功 —— 成功与否取决于岔路几何的巧合。
+A24           **完成**（交回巡线）只有一个条件：**口子已经在车后** —— 岔路形态消失
+              ＋ 近处那条带子居中。``aligned``（选中的带子在画面里竖直）只用来**停止
+              转向**，不能当完成：在"直道 + 侧支"的场地上，绿灯那侧常常就是直着走的
+              那条带子，它本来就竖直，于是模块会在口子还在车头前面时就交回巡线，
+              巡线转头挑另一条带子（2026-09-18 新场地实测：一次选 left、一次选 right，
+              车**两次都走左边**，选边等于没生效）。对准之后 SETTLE 阶段以
+              ``forward_speed`` 往前开，把口子顶到车后；``settle_timeout`` 内顶不过去
+              就明确失败停车，绝不交回巡线去猜。
 A23           转向的**收尾判据与场地无关**：不认"转了多少度"，只认"选中的那条带子
               是不是已经在车正前方"——(1) 岔路还看得见时，看那条分支的**带子方向**
               是否已在画面里竖直（``tilt``，与相机光轴平行的地面直线，消失点在画面
@@ -681,7 +689,8 @@ class JunctionConfig:
     max_turn_yaw: float = 75.0       # 转向 yaw 上限（deg/s）
     turn_timeout: float = 3.5        # 转向阶段最长耗时
     turn_min_duration: float = 0.40  # 至少转这么久再判断线是否回来
-    settle_timeout: float = 1.5      # 转完后等线回中央的最长时间
+    settle_timeout: float = 3.0      # 对准之后往前开、把口子顶到车后的最长时间
+    #: （0.10 m/s × 3 秒 ≈ 30 cm，够把一个岔路口开过去；过不去就明确失败）
     #: 转向时车头已经对准选中分支的角度门槛：岔路口上线回中央可能一直不成立
     #: （2026-09-16 实测：yaw 收敛到 0 了却因为看不到单条居中的线而转向超时）。
     branch_align_deg: float = 6.0
@@ -1615,6 +1624,8 @@ class GreenJunctionTask:
         self._line_is_centered = False
         #: 最近一帧岔路形态是否还看得见（A23：看不见了 + 近处居中 = 口子已在车后）。
         self._fork_visible = True
+        #: 最近一次**有效**的岔路检测（车开过去之后仍能报出选中的分支）。
+        self._last_valid_detection: Optional[JunctionDetection] = None
         self._rearm_ready_at: Optional[float] = None
 
     # -- 对外状态 ---------------------------------------------------------
@@ -1691,6 +1702,7 @@ class GreenJunctionTask:
         self._turn_last_at = None
         self._line_is_centered = False
         self._fork_visible = True
+        self._last_valid_detection = None
         self._rearm_ready_at = None
 
     # -- 内部工具 ---------------------------------------------------------
@@ -1722,6 +1734,8 @@ class GreenJunctionTask:
 
     def _visual(self, detection: Optional[JunctionDetection] = None) -> VisualDetection:
         payload = detection if detection is not None else self.last_detection
+        if detection is None and (payload is None or not payload.valid):
+            payload = self._last_valid_detection
         if payload is None or not payload.valid:
             return VisualDetection.no_result("green_junction")
         center = (
@@ -1817,13 +1831,17 @@ class GreenJunctionTask:
         aligned_now, _ = self._aligned_now()
         past_fork = self._line_is_centered and not self._fork_visible
         if not self._turn_still_needed() or aligned_now or past_fork:
-            creep = (
-                settings.forward_speed * _SETTLE_CREEP
+            # 已经对准（或转向量到上限）：不再加转。SETTLE 阶段**往前开**，把口子
+            # 顶到车后去（A24：0.03 m/s 的爬行根本过不去，交回巡线时口子还在车头
+            # 前面，巡线就会挑到另一条带子 —— 2026-09-18 新场地两次实测：模块一次
+            # 选 left、一次选 right，车最后都走左边那条，选边等于没生效）。
+            forward = (
+                settings.forward_speed
                 if self.state is JunctionState.SETTLE
                 else 0.0
             )
             self._turn_last_at = now
-            return MotionCommand(forward=creep, lateral=0.0, yaw=0.0)
+            return MotionCommand(forward=forward, lateral=0.0, yaw=0.0)
         # A22：有"带子方向"就用它做**伺服** —— 一直转到这条分支的带子在画面里
         # 接近竖直（车头与带子平行）为止。tilt 是当前帧算出来的，所以车转过去的
         # 过程中它会自己收敛到 0，转多少度由几何自己决定，不需要估。
@@ -1840,12 +1858,12 @@ class GreenJunctionTask:
                     self._turn_rotated_deg += yaw * dt
             self._turn_last_at = now
             if abs(live_tilt) <= settings.branch_align_deg:
-                creep = (
-                    settings.forward_speed * _SETTLE_CREEP
+                forward = (
+                    settings.forward_speed
                     if self.state is JunctionState.SETTLE
                     else 0.0
                 )
-                return MotionCommand(forward=creep, lateral=0.0, yaw=0.0)
+                return MotionCommand(forward=forward, lateral=0.0, yaw=0.0)
             ratio = 0.0 if limit <= 0.0 else min(1.0, abs(yaw) / limit)
             return MotionCommand(
                 forward=settings.forward_speed * ratio, lateral=0.0, yaw=yaw
@@ -2046,6 +2064,10 @@ class GreenJunctionTask:
         mask = blue_branch_mask(frame.image, settings) if settings.require_blue_branches else None
         detection = self.detector.detect(frame.image, mask)
         self.last_detection = detection if detection.valid else None
+        # A24：当前帧检测不到岔路（车已经开过去了）时，_visual() 仍要能报出
+        # 选中的那条分支，否则日志/存证里会变成"没有目标"，看不出选了哪边。
+        if detection.valid:
+            self._last_valid_detection = detection
         self.mask = detection.mask
 
         if self.state is JunctionState.IDLE:
@@ -2272,27 +2294,31 @@ class GreenJunctionTask:
         # 偏角收敛到 branch_align_deg 以内）就算进了分支，交回巡线去跟。
         # A23：完成判据与 TURN 同一套 —— "选中的带子已经在车正前方"：
         #   aligned（岔路还看得见、带子已竖直）或 past_fork（岔路散了、近处带子居中）。
+        # A24：完成条件只有一条 —— **口子已经在车后**（岔路形态消失 + 近处那条带子
+        # 居中）。"带子已经在画面里竖直"(aligned) 只用来停止转向，不能当完成：
+        # 在"直道 + 侧支"的场地上，绿灯那侧往往就是直着走的那条带子，它本来就竖直，
+        # 于是模块会在口子还在车头前面时就交回巡线，巡线转头挑了另一条带子
+        # （2026-09-18 实测：选 left 的车走左边、选 right 的车**也**走左边）。
         aligned, aligned_why = self._aligned_now()
         past_fork = bool(centered) and not detection.valid
         stable = (
-            (aligned or past_fork)
+            past_fork
             and self._turn_elapsed(now) >= settings.turn_min_duration
         )
         if stable:
             self._rearm_ready_at = now + settings.rearm_cooldown
             return self._completed(
-                "junction passed; %s"
-                % (aligned_why if aligned
-                   else "fork passed, line centred (%s)" % line_source)
+                "junction passed; fork behind, line centred (%s)" % line_source
             )
 
         if self._elapsed(now) > settings.settle_timeout:
             # 转到上限还没对准：**宁可失败停车，也不交回巡线去"猜"一条边** ——
             # 猜错就是走上非绿灯的那条路（22:28 的教训）。
             return self._failed(
-                "could not align with the %s branch (rotated %.1f deg, %s)"
+                "could not confirm entering the %s branch "
+                "(rotated %.1f deg, %s; fork still ahead)"
                 % ("?" if self.chosen_branch is None else self.chosen_branch.value,
-                   self._turn_rotated_deg, line_source)
+                   self._turn_rotated_deg, aligned_why)
             )
 
         return self._running(now, "settling on the new branch")

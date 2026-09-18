@@ -132,7 +132,7 @@ def rotated_fork_frame(fork_x=420, left_x=260, right_x=620, fork_y=290, far_y=12
 
 
 def fork_scene(car_yaw_deg=0.0, chosen=Branch.RIGHT, tilt0=40.0, spread=170.0,
-               lamp=None, lamp_x=None):
+               lamp=None, lamp_x=None, travel=0.0, pass_at=0.18):
     """按"车已经转过 ``car_yaw_deg``"画出岔路口（用**画线**，不是旋转整幅图）。
 
     为什么要这样造画面：A23 的收尾判据是"**选中的那条分支带子在画面里竖直**"，
@@ -146,7 +146,18 @@ def fork_scene(car_yaw_deg=0.0, chosen=Branch.RIGHT, tilt0=40.0, spread=170.0,
     小于 branch_align_deg"与"转过决策时锁下的角度"是同一件事，判据才自洽。
 
     ``lamp``/``lamp_x`` 可选地在画面上加一盏红/绿灯（给灯判据的用例）。
+
+    ``travel``：车已经往前开了多少米（A24：完成必须"口子已在车后"，所以用例必须
+    让车真的开过去）。开过 ``pass_at`` 米之后，画面里就只剩**选中的那条带子**了
+    —— 岔路形态消失、近处带子居中，正是判据要等的那一刻。
     """
+    if float(travel) >= float(pass_at):
+        image = blank_frame()
+        cv2.line(image, (WIDTH // 2, HEIGHT - 2), (WIDTH // 2, 20), TAPE_BGR, TAPE_HALF * 2)
+        if lamp is not None and lamp_x is not None:
+            colour = (0, 0, 255) if lamp == "red" else (0, 255, 0)
+            cv2.circle(image, (int(lamp_x), 100), 22, colour, -1)
+        return image
     image = blank_frame()
     fork_y = 290
     far_y = 120
@@ -581,15 +592,17 @@ class StateMachineTests(unittest.TestCase):
         statuses = []
         now = 100.0
         car_yaw = 0.0
+        travel = 0.0
         update = None
         for index in range(60):
             now += FRAME_DT
             line = fake_line(error=0.0 if index >= 10 else 0.9)
-            frame = fork_scene(car_yaw, chosen=Branch.RIGHT)
+            frame = fork_scene(car_yaw, travel=travel, chosen=Branch.RIGHT)
             update = task.step(packet(frame, index + 1, now), now, line)
             statuses.append(update.status)
             if task.active and update.motion is not None:
                 car_yaw += float(update.motion.yaw) * FRAME_DT
+                travel += float(update.motion.forward) * FRAME_DT
             if task.finished:
                 break
         self.assertEqual(task.state, JunctionState.COMPLETED)
@@ -767,14 +780,16 @@ class StateMachineTests(unittest.TestCase):
         statuses = []
         now = 500.0
         car_yaw = 0.0
+        travel = 0.0
         for index in range(60):
             now += FRAME_DT
             line = fake_line(error=0.0 if index >= 10 else 0.9)
-            frame = fork_scene(car_yaw, chosen=Branch.RIGHT)
+            frame = fork_scene(car_yaw, travel=travel, chosen=Branch.RIGHT)
             update = task.step(packet(frame, index + 1, now), now, line)
             statuses.append(update.status)
             if task.active and update.motion is not None:
                 car_yaw += float(update.motion.yaw) * FRAME_DT
+                travel += float(update.motion.forward) * FRAME_DT
             if task.finished:
                 break
         self.assertEqual(task.state, JunctionState.COMPLETED)
@@ -802,7 +817,7 @@ class StateMachineTests(unittest.TestCase):
         update = task.step(packet(junction_frame(), 9, now), now, fake_line(error=0.9))
         self.assertEqual(update.status, TaskStatus.FAILED)
         self.assertEqual(update.motion, STOP)
-        self.assertIn("could not align", update.message)
+        self.assertIn("could not confirm entering", update.message)
 
     def test_losing_the_junction_before_a_rule_fails_and_stops(self):
         settings = JunctionConfig(decision_timeout=0.5, fallback_rule="none")
@@ -853,14 +868,16 @@ class StateMachineTests(unittest.TestCase):
         statuses = []
         now = 200.0
         car_yaw = 0.0
+        travel = 0.0
         update = None
         for index in range(60):
             now += FRAME_DT
-            frame = fork_scene(car_yaw, chosen=Branch.RIGHT)
+            frame = fork_scene(car_yaw, travel=travel, chosen=Branch.RIGHT)
             update = task.step(packet(frame, index + 1, now), now)
             statuses.append(update.status)
             if task.active and update.motion is not None:
                 car_yaw += float(update.motion.yaw) * FRAME_DT
+                travel += float(update.motion.forward) * FRAME_DT
             if task.finished:
                 break
         self.assertIn(TaskStatus.RUNNING, statuses)
@@ -937,14 +954,16 @@ class StateMachineTests(unittest.TestCase):
         task = GreenJunctionTask(settings=settings)
         now = 700.0
         car_yaw = 0.0
+        travel = 0.0
         update = None
         for index in range(60):
             now += FRAME_DT
             line = fake_line(error=0.0 if index >= 10 else 0.9)
-            frame = fork_scene(car_yaw, chosen=Branch.RIGHT)
+            frame = fork_scene(car_yaw, travel=travel, chosen=Branch.RIGHT)
             update = task.step(packet(frame, index + 1, now), now, line)
             if task.active and update.motion is not None:
                 car_yaw += float(update.motion.yaw) * FRAME_DT
+                travel += float(update.motion.forward) * FRAME_DT
             if task.finished:
                 break
         self.assertEqual(update.status, TaskStatus.COMPLETED)
@@ -971,13 +990,15 @@ class StateMachineTests(unittest.TestCase):
         now = 950.0
         update = None
         car_yaw = 0.0
+        travel = 0.0
         for index in range(60):
             now += FRAME_DT
             line = fake_line(error=0.0 if index >= 10 else 0.9)
-            frame = fork_scene(car_yaw, chosen=Branch.RIGHT)
+            frame = fork_scene(car_yaw, travel=travel, chosen=Branch.RIGHT)
             update = task.step(packet(frame, index + 1, now), now, line)
             if task.active and update.motion is not None:
                 car_yaw += float(update.motion.yaw) * FRAME_DT
+                travel += float(update.motion.forward) * FRAME_DT
             if task.finished:
                 break
         self.assertEqual(update.status, TaskStatus.COMPLETED)
@@ -1120,17 +1141,19 @@ class StateMachineTests(unittest.TestCase):
         )
         now = 1100.0
         car_yaw = 0.0
+        travel = 0.0
         update = None
         for index in range(60):
             now += FRAME_DT
-            frame = fork_scene(car_yaw, chosen=Branch.RIGHT, tilt0=40.0)
+            frame = fork_scene(car_yaw, travel=travel, chosen=Branch.RIGHT, tilt0=40.0)
             update = task.step(packet(frame, index + 1, now), now)
             if task.active and update.motion is not None:
                 car_yaw += float(update.motion.yaw) * FRAME_DT
+                travel += float(update.motion.forward) * FRAME_DT
             if task.finished:
                 break
         self.assertEqual(task.state, JunctionState.COMPLETED)
-        self.assertIn("tilt", task.last_message)
+        self.assertIn("fork behind", task.last_message)
         self.assertLess(
             abs(task._turn_rotated_deg), 50.0,
             "只该转「带子偏斜量」那一档（≈40°），不该靠安全上限",
@@ -1148,11 +1171,13 @@ class StateMachineTests(unittest.TestCase):
         )
         now = 1200.0
         car_yaw = 0.0
+        travel = 0.0
         for index in range(20):
             now += FRAME_DT
-            update = task.step(packet(fork_scene(car_yaw, chosen=Branch.RIGHT), index + 1, now), now)
+            update = task.step(packet(fork_scene(car_yaw, travel=travel, chosen=Branch.RIGHT), index + 1, now), now)
             if task.active and update.motion is not None:
                 car_yaw += float(update.motion.yaw) * FRAME_DT
+                travel += float(update.motion.forward) * FRAME_DT
             if task.state is JunctionState.TURN:
                 break
         # 前提：这条直带子确实"岔路已散 + 近处居中"（否则测不到 A23-2）
@@ -1169,7 +1194,7 @@ class StateMachineTests(unittest.TestCase):
             if task.finished:
                 break
         self.assertEqual(task.state, JunctionState.COMPLETED)
-        self.assertIn("fork passed", task.last_message)
+        self.assertIn("fork behind", task.last_message)
 
     def test_stem_centred_alone_is_not_enough_to_declare_entry(self):
         """A23-3 回归：岔路还在、近处居中的那条是**车自己上来的主带**、带子还横着
@@ -1192,7 +1217,7 @@ class StateMachineTests(unittest.TestCase):
                 break
         self.assertNotEqual(task.state, JunctionState.COMPLETED)
         self.assertEqual(task.state, JunctionState.FAILED)
-        self.assertIn("could not align", task.last_message)
+        self.assertIn("could not confirm entering", task.last_message)
 
 class LightProbeAdapterTests(unittest.TestCase):
     """v3 报告第三节那条断掉的链：3 号没有 ``reading()``，本模块给适配器（A13）。
@@ -1323,13 +1348,15 @@ class LightProbeAdapterTests(unittest.TestCase):
         harness.start_line(now=1.0)
         now = 1.05
         car_yaw = 0.0
+        travel = 0.0
         for _ in range(120):
             now += 0.05
-            frame = fork_scene(car_yaw, chosen=Branch.RIGHT, lamp="green", lamp_x=500)
+            frame = fork_scene(car_yaw, travel=travel, chosen=Branch.RIGHT, lamp="green", lamp_x=500)
             decision = harness.feed_image(now, frame)
             command = getattr(decision, "command", None)
             if harness.owner == "external" and command is not None:
                 car_yaw += float(command.yaw) * 0.05
+                travel += float(command.forward) * 0.05
             if task.finished and decision.owner == "line":
                 break
         self.assertTrue(
@@ -1559,16 +1586,18 @@ class TwoLampTests(unittest.TestCase):
             harness.start_line(now=1.0)
             now = 1.05
             car_yaw = 0.0
+            travel = 0.0
             green_x, red_x = (100, 500) if green_on_left else (500, 100)
             for _ in range(200):
                 now += 0.05
-                frame = fork_scene(car_yaw, chosen=expected)
+                frame = fork_scene(car_yaw, travel=travel, chosen=expected)
                 cv2.circle(frame, (green_x, 100), 22, (0, 255, 0), -1)
                 cv2.circle(frame, (red_x, 100), 22, (0, 0, 255), -1)
                 decision = harness.feed_image(now, frame)
                 command = getattr(decision, "command", None)
                 if harness.owner == "external" and command is not None:
                     car_yaw += float(command.yaw) * 0.05
+                travel += float(command.forward) * 0.05
                 if task.finished and decision.owner == "line":
                     break
             self.assertTrue(
@@ -1750,13 +1779,15 @@ class RedBranchTests(unittest.TestCase):
         now = 100.0
         statuses = []
         car_yaw = 0.0
+        travel = 0.0
         for index in range(60):
             now += FRAME_DT
-            frame = fork_scene(car_yaw, chosen=Branch.RIGHT, lamp="red", lamp_x=100)
+            frame = fork_scene(car_yaw, travel=travel, chosen=Branch.RIGHT, lamp="red", lamp_x=100)
             update = task.step(packet(frame, index + 1, now), now)
             statuses.append(update.status)
             if task.active and update.motion is not None:
                 car_yaw += float(update.motion.yaw) * FRAME_DT
+                travel += float(update.motion.forward) * FRAME_DT
             if task.finished:
                 break
         self.assertIn(TaskStatus.RUNNING, statuses)
@@ -1775,13 +1806,15 @@ class CoordinatorHarnessTests(unittest.TestCase):
         harness.start_line(now=1.0)
         now = 1.05
         car_yaw = 0.0
+        travel = 0.0
         for _ in range(160):
             now += 0.05
-            frame = fork_scene(car_yaw, chosen=Branch.RIGHT)
+            frame = fork_scene(car_yaw, travel=travel, chosen=Branch.RIGHT)
             decision = harness.feed_image(now, frame)
             command = getattr(decision, "command", None)
             if harness.owner == "external" and command is not None:
                 car_yaw += float(command.yaw) * 0.05
+                travel += float(command.forward) * 0.05
             if task.finished and decision.owner == "line":
                 break
         self.assertTrue(
