@@ -115,6 +115,10 @@ class MarkerObservationSource:
 
         self._subscribed = False
         self.subscribe_result: Optional[bool] = None
+        #: 车自报支持的视觉识别功能（SDK 位掩码）与解码后的名字。
+        #: 2026-09-18 新增：用于分辨"车不支持 marker 识别"与"标识没进视野"。
+        self.supported_functions: Optional[int] = None
+        self.supported_names: tuple = ()
         self.callbacks = 0
         self.empty_callbacks = 0
         self.first_callback_at: Optional[float] = None
@@ -143,6 +147,12 @@ class MarkerObservationSource:
         if self._vision is None:
             self.subscribe_result = False
             return False
+        # 先问车"你支持哪些视觉识别功能"（SDK 的 `_get_sdk_function()` 返回一个
+        # 位掩码）。**这条是给现场诊断用的**：2026-09-18 连续四次 run 都是
+        # `callbacks=2 / observed_candidates=0`（SDK 一次都没报出标识），却分不清
+        # 是"车不支持 marker 识别"还是"标识没进视野"。有了这个掩码就能一眼看出：
+        # 掩码里没有 marker 位 → 车/固件根本不支持，SDK 这条路走不通。
+        self.supported_functions = self._probe_supported_functions()
         try:
             if self.color:
                 result = self._vision.sub_detect_info(
@@ -158,6 +168,29 @@ class MarkerObservationSource:
         self.subscribe_result = bool(result)
         self._subscribed = self.subscribe_result
         return self._subscribed
+
+    def _probe_supported_functions(self):
+        """问车支持哪些视觉识别功能。失败返回 None，绝不抛异常。
+
+        返回 SDK 给的位掩码（int）；`None` = 问不出来。
+        记录里同时给出解码后的名字，便于现场直接读。
+        """
+        try:
+            mask = self._vision._get_sdk_function()
+        except Exception:
+            return None
+        if mask is None:
+            return None
+        try:
+            self.supported_names = tuple(
+                name for bit, name in ((1 << 1, "person"), (1 << 2, "gesture"),
+                                       (1 << 3, "line"), (1 << 4, "marker"),
+                                       (1 << 5, "robot"))
+                if mask & bit
+            )
+        except Exception:
+            self.supported_names = ()
+        return mask
 
     def stop(self) -> None:
         """退订。绝不抛异常。"""
@@ -228,6 +261,13 @@ class MarkerObservationSource:
             "subscribed": self._subscribed,
             "subscribe_result": self.subscribe_result,
             "color": self.color or "(未设过滤器)",
+            # 车自报支持的识别功能：没有 marker 位就说明这条路根本走不通，
+            # 不用再纠结阈值/优先级（2026-09-18 新增）。
+            "车支持的识别功能": (
+                "、".join(self.supported_names)
+                if self.supported_names else
+                "（问不出来 mask=%r）" % (self.supported_functions,)
+            ),
             "coordinate_mode": self.coordinate_mode_resolved,
             "callbacks": callbacks,
             "empty_callbacks": empty,
