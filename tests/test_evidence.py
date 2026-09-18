@@ -26,7 +26,7 @@ from tests.task_harness import (  # noqa: E402
 )
 
 import evidence  # noqa: E402
-from evidence import EvidenceRecorder  # noqa: E402
+from evidence import EvidenceRecorder, make_evidence_photo  # noqa: E402
 
 
 class _BrokenWriter:
@@ -210,6 +210,74 @@ class EvidenceWritingTests(unittest.TestCase):
         self.assertGreaterEqual(len(images), 1)
         self.assertTrue(images[0].stat().st_size > 0)
 
+    def test_keyframes_are_capped(self):
+        """关键帧只是调试记录，必须封顶；不然交作业时图多到发不完。"""
+        recorder = EvidenceRecorder(
+            directory=self.tmp, snapshot_interval=0.0, max_keyframes=3
+        )
+        self._recorders.append(recorder)
+        self._feed(recorder, 20)
+        recorder.close()
+        images = sorted(recorder.run_directory.glob("frame_*.jpg"))
+        self.assertEqual(len(images), 3, "关键帧必须停在 max_keyframes 张：%s" % images)
+        self.assertEqual(recorder.snapshots, 3)
+
+    def test_the_cap_does_not_touch_scoring_screenshots(self):
+        """得分截图不能受关键帧上限影响 —— 老师按它们的张数算分。"""
+        recorder = EvidenceRecorder(
+            directory=self.tmp, snapshot_interval=0.0, max_keyframes=1
+        )
+        self._recorders.append(recorder)
+        self._feed(recorder, 5)
+        # 两个**不同事件**的得分截图（真实请求对象，带各自的 event_key）。
+        first = make_evidence_photo(
+            "obstacle", FramePacket(line_frame(320), 7, 3.5),
+            detection=VisualDetection(
+                valid=True, kind="obstacle", box=(10, 10, 90, 90)), side="left")
+        second = make_evidence_photo(
+            "traffic_light:red", FramePacket(line_frame(320), 9, 4.5), shape="circle",
+            detection=VisualDetection(
+                valid=True, kind="traffic_light", color="red",
+                box=(20, 20, 99, 99)))
+        self.assertTrue(recorder.save_task_evidence(first))
+        self.assertTrue(recorder.save_task_evidence(second))
+        recorder.close()
+        self.assertEqual(recorder.snapshots, 1, "关键帧封顶在 1 张")
+        self.assertEqual(recorder.task_snapshots, 2,
+                         "得分截图不受关键帧上限影响")
+        self.assertEqual(len(list(recorder.scoring_directory.glob("task_*.jpg"))), 2)
+
+    def test_console_log_captures_terminal_lines(self):
+        """终端状态行要留一份在磁盘上，关掉窗口/崩了之后还能查。"""
+        recorder = EvidenceRecorder(directory=self.tmp)
+        self._recorders.append(recorder)
+        self.assertIsNotNone(recorder.console_log_path, "应该建好 console.log")
+        recorder.write_console_log("[   1.2s] 巡线 TRACKING\n")
+        recorder.write_console_log("[   2.4s] >> green_junction took over\n")
+        recorder.close_console_log()          # 模拟 main 收尾时的显式关闭
+        text = recorder.console_log_path.read_text(encoding="utf-8")
+        self.assertIn("巡线 TRACKING", text)
+        self.assertIn("green_junction took over", text)
+
+    def test_console_log_write_failure_never_raises(self):
+        """写日志失败绝不能把车搞崩：关掉句柄后再写只计数。"""
+        recorder = EvidenceRecorder(directory=self.tmp)
+        self._recorders.append(recorder)
+        recorder.close_console_log()
+        recorder.write_console_log("这行应该被安静地丢掉\n")   # 不该抛异常
+        self.assertIsNone(recorder._console_log)
+
+    def test_summary_names_the_new_artifacts(self):
+        recorder = EvidenceRecorder(directory=self.tmp)
+        self._recorders.append(recorder)
+        recorder.close()
+        summary = json.loads(
+            (recorder.run_directory / "summary.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(summary["console_log"], "console.log")
+        self.assertEqual(summary["scoring_directory"], "scoring")
+        self.assertEqual(summary["max_keyframes"], 20)
+
     def test_snapshot_survives_a_non_ascii_directory(self):
         """目录名里有中文时截图也必须成功。
 
@@ -381,9 +449,14 @@ class TaskEvidenceTests(unittest.TestCase):
         self.assertTrue(recorder.save_task_evidence(self._request()))
         self.assertEqual(recorder.task_snapshots, 1)
 
-        pictures = [path.name for path in recorder.run_directory.glob("task_*.jpg")]
+        # 得分截图现在住在 scoring/ 子目录里（交作业只交那个目录）。
+        pictures = [path.name for path in recorder.run_directory.rglob("task_*.jpg")]
         self.assertEqual(len(pictures), 1, f"应该正好存一张，实际 {pictures}")
         self.assertIn("2", pictures[0], "文件名里要能看出是哪个标识")
+        self.assertEqual(
+            len(list(recorder.scoring_directory.glob("task_*.jpg"))), 1,
+            "得分截图必须落在 scoring/ 里",
+        )
 
         recorder.close()
         with recorder.log_path.open(encoding="utf-8-sig") as handle:
@@ -486,6 +559,40 @@ class RunReportTests(unittest.TestCase):
             "step was slow",
         ):
             self.assertIn(expected, text, f"运行记录里缺少 {expected!r}")
+
+    def test_scoring_screenshots_live_in_their_own_folder(self):
+        """得分截图必须在 scoring/ 子目录里 —— 交作业只交那个目录。
+
+        这条同时钉住三件事：文件真在 scoring/ 下、报告里写的是带子目录的路径、
+        关键帧不会被误放进 scoring/（放进去就等于把调试图当成分数图交上去）。
+        """
+        recorder = EvidenceRecorder(directory=self.directory, snapshot_interval=0.0)
+        self.addCleanup(recorder.close)
+        recorder.observe(FramePacket(line_frame(320), 1, 1.0), 1.0)
+        self.assertTrue(recorder.save_task_evidence(self._request()))
+        recorder.close()
+
+        run = recorder.run_directory
+        scoring = sorted(p.name for p in (run / "scoring").glob("task_*.jpg"))
+        self.assertEqual(len(scoring), 1, f"scoring/ 里应该有且只有一张：{scoring}")
+        self.assertEqual(
+            [], sorted(p.name for p in (run / "scoring").glob("frame_*.jpg")),
+            "关键帧不许进 scoring/",
+        )
+        report = (run / "report.md").read_text(encoding="utf-8")
+        self.assertIn("scoring/task_2_000007", report,
+                      "报告里要写带子目录的真实相对路径")
+
+    def test_documented_capture_layout_matches_reality(self):
+        """模块头写的目录结构必须和真实落盘一致（文档不能骗下一个人）。"""
+        recorder = EvidenceRecorder(directory=self.directory)
+        self.addCleanup(recorder.close)
+        doc = evidence.__doc__ or ""
+        for expected in ("log.csv", "console.log", "scoring/", "report.md"):
+            self.assertIn(expected, doc, f"模块头没写 {expected}")
+        self.assertTrue((recorder.run_directory / "log.csv").exists())
+        self.assertTrue(recorder.console_log_path.exists())
+        self.assertTrue(recorder.scoring_directory.is_dir())
 
     def test_run_record_keeps_the_module_own_failure_reason(self):
         """协调器只说"task failed"，模块自己给的原因也必须进记录。

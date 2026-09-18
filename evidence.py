@@ -26,8 +26,13 @@
 
     captures/run_20260911_153045/
         log.csv        每帧一行：帧号、采集时刻、循环时刻、已运行秒数、画面尺寸、亮度
-        frame_000123_0006.15s.jpg   每隔一段时间存一张关键帧（运行记录用）
-        task_2_000123_0006.15s.jpg  任务得分截图（带检测框 + 居中说明文字）
+        console.log    终端上打过的那些状态行（`[  12.3s] …`）的副本，带时间戳。
+                       由 `main.py` 把 ConsoleStatus 的输出同时引到这里（见
+                       `main._TeeStream`）。关掉窗口或程序崩了之后还能查发生了什么。
+        frame_000123_0006.15s.jpg   每隔一段时间存一张关键帧（运行记录/调试用）
+        scoring/        **得分截图专用目录**：老师按这个目录里的张数算分，
+                       交作业只交它，调试关键帧不会混进去。
+        scoring/task_2_000123_0006.15s.jpg  得分截图（带检测框 + 居中说明文字）
         log.csv / summary.json / report.md
         report.md      运行结束时自动生成的人类可读记录：
                        起止时间、时长、帧数、得分截图清单（含图上那句话）、
@@ -101,6 +106,18 @@ DEFAULT_FLUSH_INTERVAL = 0.50
 
 #: 最多每隔这么多秒存一张关键帧（秒）。不是每帧都存图。
 DEFAULT_SNAPSHOT_INTERVAL = 2.0
+
+#: 关键帧总数上限。关键帧只是**调试/运行记录**，不是算分的图，所以封顶；
+#: 得分截图（`scoring/`）**不封顶** —— 老师按那个目录里的张数算分，封顶就是丢分。
+#: 一次运行 20 张够复盘了，而且交付时"一次限发 20 张"也放得下。
+DEFAULT_MAX_KEYFRAMES = 20
+
+#: 得分截图专用子目录名。把算分的图和一个调试用的关键帧分开：
+#: 交作业只交这个目录，不会把调试帧混进去。
+SCORING_DIRECTORY = "scoring"
+
+#: 终端状态行副本的文件名（`main.py` 把 ConsoleStatus 的输出 tee 到这里）。
+CONSOLE_LOG_FILENAME = "console.log"
 
 #: 待写队列超过这个长度就立刻 flush，防内存涨。
 DEFAULT_QUEUE_LIMIT = 200
@@ -348,11 +365,14 @@ class EvidenceRecorder:
         flush_interval: float = DEFAULT_FLUSH_INTERVAL,
         snapshot_interval: float = DEFAULT_SNAPSHOT_INTERVAL,
         queue_limit: int = DEFAULT_QUEUE_LIMIT,
+        max_keyframes: int = DEFAULT_MAX_KEYFRAMES,
     ) -> None:
         self.directory = directory
         self.flush_interval = float(flush_interval)
         self.snapshot_interval = float(snapshot_interval)
         self.queue_limit = max(1, int(queue_limit))
+        #: 关键帧上限；<=0 表示不限制。得分截图不受它影响。
+        self.max_keyframes = int(max_keyframes)
 
         self.pending: List[dict] = []
         self.last_flush: Optional[float] = None
@@ -379,6 +399,11 @@ class EvidenceRecorder:
 
         self.run_directory: Optional[Path] = None
         self.log_path: Optional[Path] = None
+        #: 终端状态行副本（见 `write_console_log` / `main._TeeStream`）。
+        self.console_log_path: Optional[Path] = None
+        self._console_log = None
+        #: 得分截图目录（`run_directory/scoring`）。
+        self.scoring_directory: Optional[Path] = None
         self._csv_file = None
         self._writer = None
         self._seen_sequences = set()
@@ -448,7 +473,7 @@ class EvidenceRecorder:
             self.last_snapshot is None
             or now - self.last_snapshot >= self.snapshot_interval
         )
-        if due_snapshot and image is not None:
+        if due_snapshot and image is not None and self._keyframes_remaining():
             if self._write_snapshot(image, sequence, elapsed):
                 self.last_snapshot = now
 
@@ -507,7 +532,17 @@ class EvidenceRecorder:
                 getattr(request, "marker_id", None) or request_id or "task"
             )
             name = "task_%s_%06d_%07.2fs.jpg" % (label, sequence, elapsed)
-            target = self.run_directory / name
+            # 得分截图单独进 scoring/：交作业只交这个目录。
+            # 目录建不出来时退回运行目录根，绝不让"存不上分"这种事发生。
+            parent = self.scoring_directory
+            if parent is None:
+                parent = self.run_directory
+            try:
+                parent.mkdir(parents=True, exist_ok=True)
+            except Exception:
+                parent = self.run_directory
+            target = parent / name
+            relative = "%s/%s" % (parent.name, name)
             # 和关键帧一样：先编码到内存再用 Python 落盘。故意不用
             # cv2.imwrite —— 它在 Windows 上走窄字符路径，目录名带中文
             # （例如 E:\...\机器人期末\）时会**静默失败**，只返回 False。
@@ -531,7 +566,7 @@ class EvidenceRecorder:
                 "elapsed_s": round(elapsed, 2),
                 "label": label,
                 "annotation": annotation,
-                "file": name,
+                "file": relative,
             }
         )
         self.pending.append(
@@ -733,6 +768,8 @@ class EvidenceRecorder:
         if self._closed:
             return
         self._closed = True
+        # 终端日志先关：report.md 之前不需要它，但别留着句柄。
+        self.close_console_log()
         if self._writer is not None:
             self._flush(None)
         try:
@@ -755,12 +792,50 @@ class EvidenceRecorder:
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         self.run_directory = base / ("run_%s" % stamp)
         self.run_directory.mkdir(parents=True, exist_ok=True)
+        #: 得分截图单独一个目录：交作业只交它，调试关键帧不会混进去。
+        self.scoring_directory = self.run_directory / SCORING_DIRECTORY
+        self.scoring_directory.mkdir(parents=True, exist_ok=True)
         self.log_path = self.run_directory / "log.csv"
+        # 终端状态行的副本。只建**文件**，内容由 main 的 tee 写进来。
+        self.console_log_path = self.run_directory / CONSOLE_LOG_FILENAME
+        try:
+            self._console_log = self.console_log_path.open(
+                "w", encoding="utf-8", newline=""
+            )
+        except Exception:
+            self._console_log = None
+            self.console_log_path = None
+            self.write_failures += 1
         # utf-8-sig 让 Excel 直接打开不乱码；newline="" 是 csv 模块的要求。
         self._csv_file = self.log_path.open("w", encoding="utf-8-sig", newline="")
         self._writer = csv.DictWriter(self._csv_file, fieldnames=FIELDNAMES)
         self._writer.writeheader()
         self._started_wall_clock = datetime.now().isoformat(timespec="seconds")
+
+    def write_console_log(self, text: str) -> None:
+        """把一行终端输出追加到 `console.log`。
+
+        由 `main._TeeStream` 调用：终端上打过的状态行，磁盘上留一份。
+        绝不抛异常、绝不阻塞 —— 一个日志不能影响车的控制循环。
+        """
+        if self._console_log is None:
+            return
+        try:
+            self._console_log.write(text)
+            self._console_log.flush()
+        except Exception:
+            # 写日志失败只计数，不打断任何东西。
+            self.write_failures += 1
+
+    def close_console_log(self) -> None:
+        """关闭终端日志。先于 close() 调用，让最后几行也落盘。"""
+        handle, self._console_log = self._console_log, None
+        if handle is None:
+            return
+        try:
+            handle.close()
+        except Exception:
+            pass
 
     def _flush(self, now: Optional[float]) -> None:
         if self._writer is None or not self.pending:
@@ -778,6 +853,16 @@ class EvidenceRecorder:
             self.write_failures += 1
         if now is not None:
             self.last_flush = now
+
+    def _keyframes_remaining(self) -> bool:
+        """关键帧还有配额吗？`max_keyframes <= 0` 表示不限制。
+
+        关键帧是**调试/运行记录**用的，不是算分的图，所以封顶；
+        得分截图（`scoring/`）走 `save_task_evidence`，不经过这里、不受上限影响。
+        """
+        if self.max_keyframes <= 0:
+            return True
+        return self.snapshots < self.max_keyframes
 
     def _write_snapshot(self, image, sequence: int, elapsed: float) -> bool:
         if self.run_directory is None:
@@ -816,7 +901,13 @@ class EvidenceRecorder:
             "write_failures": self.write_failures,
             "flush_interval_s": self.flush_interval,
             "snapshot_interval_s": self.snapshot_interval,
+            "max_keyframes": self.max_keyframes,
             "log": os.path.basename(str(self.log_path)) if self.log_path else "",
+            "console_log": (
+                os.path.basename(str(self.console_log_path))
+                if self.console_log_path else ""
+            ),
+            "scoring_directory": SCORING_DIRECTORY,
         }
         target = self.run_directory / "summary.json"
         temporary = target.with_suffix(".json.tmp")

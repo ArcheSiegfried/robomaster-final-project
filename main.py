@@ -1,5 +1,6 @@
 """RoboMaster entry point. Importing this module never connects to hardware."""
 
+import sys
 import time
 
 import cv2
@@ -224,6 +225,38 @@ LINE_STATE_TEXT = {
     "LINE_LOST": "巡线 LINE_LOST —— 丢线，底座开始找回",
     "VIDEO_LOST": "巡线 VIDEO_LOST —— 视频失效，已锁停",
 }
+
+
+class _TeeStream:
+    """把一个流同时写到终端和运行记录的 `console.log`。
+
+    `ConsoleStatus` 本来就是往一个 `stream` 打印的；这里给那个 stream 包一层，
+    终端照旧看得见，磁盘上同时留一份带时间戳的状态行。关掉窗口、程序崩了、
+    或者事后要给别人看"当时到底发生了什么"，都还能查。
+
+    任何一步失败都吞掉：把状态打出来这件事，绝不能影响控制循环。
+    """
+
+    def __init__(self, primary, sink=None) -> None:
+        self.primary = primary
+        self.sink = sink
+
+    def write(self, text) -> int:
+        if self.sink is not None:
+            try:
+                self.sink(text)
+            except Exception:
+                pass
+        try:
+            return self.primary.write(text)
+        except Exception:
+            return len(text) if isinstance(text, str) else 0
+
+    def flush(self) -> None:
+        try:
+            self.primary.flush()
+        except Exception:
+            pass
 
 
 class ConsoleStatus:
@@ -615,17 +648,29 @@ def main(
             "SPACE resume/pause, R reset, Q/ESC quit. "
             f"{len(coordinator.motion_tasks)} task module(s) registered."
         )
+        sink = _find_evidence_sink(coordinator)
+        run_directory = getattr(sink, "run_directory", None)
+        # 终端状态行同时落盘到 run_directory/console.log（记录器负责开/关文件）。
+        if run_directory is not None and callable(
+            getattr(sink, "write_console_log", None)
+        ):
+            console_stream = _TeeStream(sys.stdout, sink.write_console_log)
+        else:
+            console_stream = sys.stdout
         console = ConsoleStatus(
+            stream=console_stream,
             heartbeat_interval=CONFIG.console_heartbeat_seconds,
             enabled=CONFIG.console_status,
             task_heartbeat_interval=CONFIG.console_task_heartbeat_seconds,
             task_order=tuple(task.name for task in coordinator.motion_tasks),
         )
-        sink = _find_evidence_sink(coordinator)
-        run_directory = getattr(sink, "run_directory", None)
         if run_directory is not None:
             console.note(
                 "运行记录目录：%s（结束时写 report.md）" % run_directory
+            )
+            console.note(
+                "终端状态行副本：%s；得分截图：%s"
+                % (run_directory / "console.log", run_directory / "scoring")
             )
         console.note(
             "marker 订阅：%s"

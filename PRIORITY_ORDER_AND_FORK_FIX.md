@@ -120,9 +120,14 @@ test_saved_old_tangent_rejects_old_line_and_accepts_perpendicular
 task_registry.py
 traffic_light.py
 coordinator.py                     # 仅注释更正（见下），无逻辑改动
+evidence.py                        # 运行记录：console.log + scoring/ + 关键帧封顶（第 7 节）
+main.py                            # 加 _TeeStream，把终端状态行同时写进 console.log
 tests/test_task_registry_order.py
 tests/test_traffic_light.py
 tests/test_fork_light_competition.py
+tests/test_evidence.py
+tests/test_evidence_photos.py
+tests/test_main_startup.py
 ```
 
 `coordinator.py` 只有一处**注释**改动：原来写"`traffic_light` 位置在注册表第 1 位"，
@@ -132,12 +137,13 @@ tests/test_fork_light_competition.py
 
 以下文件经 git blob 哈希比对，与 `integration` **逐字节相同**：
 
-`models.py`、`runtime.py`、`main.py`、`config.py`、
+`models.py`、`runtime.py`、`config.py`、
 `green_junction.py`、`obstacle.py`、`free_junction.py`、`route.py`、
-`number_marker.py`、`evidence.py`
+`number_marker.py`
 
-即：公共文件里只有 `coordinator.py` 动了（且只有注释），六个模块里只有
-`traffic_light.py` 改了逻辑（它正是出问题的那个）。
+即：六个功能模块里只有 `traffic_light.py` 改了逻辑（它正是出问题的那个）；
+公共文件里 `coordinator.py` 只动注释、`evidence.py` 与 `main.py` 为运行记录功能
+（见第 7 节），其余模块逐字节未变。
 
 ## 5. 未验证事项（必须如实说明）
 
@@ -169,3 +175,40 @@ python -m unittest tests.test_fork_light_competition -v
 ```python
 fork_light_competition: bool = False   # 退回旧的"红优先"
 ```
+
+## 7. 运行记录：终端日志 + 截图分家（2026-09-18）
+
+按用户要求"把终端输出记录到日志里、关键帧截图不要太多（一次限发 20 张）、
+得分截图单独放一个文件夹"。改动前 `captures/` 里两类图混在一起，终端状态行
+只存在于窗口里、关掉就没了。
+
+现在的目录结构（`captures/` 已被 `.gitignore` 排除）：
+
+```text
+captures/run_YYYYmmdd_HHMMSS/
+├── console.log      终端上打过的状态行副本（[  12.3s] …），main 用 tee 同时写终端和这里
+├── log.csv          每帧一行：帧号/采集时刻/循环时刻/已运行秒数/尺寸/亮度
+├── frame_*.jpg      关键帧，**上限 20 张**（DEFAULT_MAX_KEYFRAMES），调试用
+├── scoring/         **得分截图专用目录**：交作业只交它
+│   └── task_<标签>_<帧号>_<秒>s.jpg
+├── summary.json     含 console_log / scoring_directory / max_keyframes 字段
+└── report.md        结束时自动生成，得分截图清单写的是 `scoring/task_…` 真实相对路径
+```
+
+三条边界（都有测试钉住）：
+
+1. **关键帧封顶 20 张**（`DEFAULT_MAX_KEYFRAMES`，构造参数 `max_keyframes`，
+   `<=0` 表示不限制）。超了就不再存，`snapshots` 停在 20。
+2. **得分截图不封顶**：老师按 `scoring/` 里的张数算分，封顶就是丢分。
+   上限只作用于关键帧，两者走不同代码路径。
+3. **关键帧不许进 `scoring/`**，得分截图也不会掉到根目录（目录建不出来时才退回根，
+   宁可路径难看也不能"存不上分")。
+
+为什么关键帧留在根目录而不是另开子目录：`tests/test_evidence.py` 等用的是
+**非递归** `glob("frame_*.jpg")`，挪走会连带打断既有测试；而得分截图那边
+测试本来就用 `rglob`，挪进 `scoring/` 代价最小。
+
+关键帧数量怎么调（`main.build_coordinator` → `build_observers` →
+`EvidenceRecorder(directory=...)`）：想多留证据就调大 `snapshot_interval`
+（默认 2.0 秒一张）或调大 `max_keyframes`。**注意关键帧是调试用的，
+不是算分材料**，所以默认封顶偏保守。

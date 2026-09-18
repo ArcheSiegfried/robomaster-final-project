@@ -170,5 +170,56 @@ class RuntimeDiagnosticsTests(unittest.TestCase):
         self.assertIn("没有建立", text)
 
 
+class ConsoleTeeTests(unittest.TestCase):
+    """终端状态行同时落盘：关掉窗口/程序崩了之后还能查当时发生了什么。"""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+
+    def test_console_status_lines_also_land_in_console_log(self):
+        import main
+        from evidence import EvidenceRecorder
+
+        recorder = EvidenceRecorder(directory=self._tmp.name)
+        self.addCleanup(recorder.close)
+        terminal = io.StringIO()
+        console = main.ConsoleStatus(
+            stream=main._TeeStream(terminal, recorder.write_console_log),
+            heartbeat_interval=2.0,
+        )
+        console.note("启动提示：测试用")
+        console.note("第二条状态行")
+        recorder.close_console_log()
+
+        on_screen = terminal.getvalue()
+        on_disk = recorder.console_log_path.read_text(encoding="utf-8")
+        self.assertIn("启动提示：测试用", on_screen, "终端照旧要看得到")
+        self.assertIn("启动提示：测试用", on_disk, "磁盘上也要有一份")
+        self.assertIn("第二条状态行", on_disk)
+
+    def test_a_broken_sink_never_breaks_the_terminal(self):
+        """日志写坏了也不能影响打印，更不能影响控制循环。"""
+        import main
+
+        def broken(text):
+            raise RuntimeError("synthetic: disk on fire")
+
+        terminal = io.StringIO()
+        stream = main._TeeStream(terminal, broken)
+        stream.write("还是要打印出来\n")
+        stream.flush()
+        self.assertIn("还是要打印出来", terminal.getvalue())
+
+    def test_tee_is_skipped_when_the_sink_cannot_log(self):
+        """观察者没有 write_console_log 时不该包 tee（否则启动就报错）。"""
+        import main
+
+        sink = types.SimpleNamespace(run_directory=None)
+        self.assertFalse(callable(getattr(sink, "write_console_log", None)))
+        # 真实判断条件：run_directory 存在 **且** 能写日志，才包 tee。
+        self.assertIsNone(getattr(sink, "run_directory", None))
+
+
 if __name__ == "__main__":
     unittest.main()

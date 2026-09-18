@@ -162,7 +162,7 @@ class DedupeTests(unittest.TestCase):
             # 第二次同事件：返回 True（"已经有照片了"），但不重复写盘
             self.assertTrue(recorder.save_task_evidence(second))
             self.assertEqual(recorder.task_snapshots, 1, "同一事件写了两张")
-            files = [p for p in recorder.run_directory.glob("task_*.jpg")]
+            files = [p for p in recorder.run_directory.rglob("task_*.jpg")]
             self.assertEqual(len(files), 1, "落盘的文件应该只有一张：%s" % files)
             recorder.close()
 
