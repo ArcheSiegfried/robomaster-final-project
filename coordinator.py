@@ -437,6 +437,9 @@ class TaskCoordinator:
         self.active_task = task
         self.active_task_name = task.name
         self._active_started = now
+        # 必须归零：这是"当前任务等红灯被暂停"的累计秒数，要减在**当前任务**
+        # 的 max_task_seconds 上。残留上一个任务的值会让新任务的超时预算被
+        # 莫名扣掉（也是预约交接路径最容易漏掉的一处）。
         self._paused_seconds = 0.0
         self.state = TASK_ACTIVE
         if not self._apply_task_gimbal(update, errors):
