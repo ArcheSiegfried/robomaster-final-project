@@ -84,6 +84,7 @@
     python obstacle.py 样图.png [输出掩膜.png]
 """
 
+from dataclasses import replace
 from typing import Optional
 
 import time
@@ -92,6 +93,7 @@ import cv2
 import numpy as np
 
 from config import CONFIG
+from evidence import TEAM_NUMBER, make_evidence_photo
 from models import (
     FramePacket,
     MotionCommand,
@@ -191,6 +193,16 @@ LINE_CONFIRM_FRAMES = 2      # 找线时连续 2 帧看到蓝线，才算找回�
 REARM_SECONDS = 5.00         # 一次绕行结束后，这段时间内不再重新接管
 MAX_CONSECUTIVE_DODGES = 2   # 同一段路最多连绕 2 次，第 3 次直接停车要人来看
 CLEAR_SECONDS = 3.00         # 画面里连续这么久没有障碍，就认为换了段路，连绕计数归零
+
+# --- 得分照片（7.1 障碍绕行）---
+# 老师的要求：确认绕行那一刻要存一张照片，图上能看清障碍、还有一行字写清
+# "测到障碍 + 选了哪边绕"（文案模板在证据层 `evidence.ANNOTATION_TEMPLATES`，
+# 模块**不拼字符串**）。画框/写字/去重/落盘全在 `evidence.py`，模块只交请求。
+#
+# 照片是**加分项，不是绕行的前提**：写盘失败只放弃照片 —— 不 FAILED、不停车、
+# 也绝不在 step() 里等回执（否则一张截图就能把绕行拖成超时）。
+# 写盘失败最多重试这么多次就放弃，之后不再重复排队。
+MAX_EVIDENCE_ATTEMPTS = 2
 
 # 【v4 · 最重要的一条】两次 step() 之间隔这么久，就认为"我们被从外面踢掉了"。
 #
@@ -811,6 +823,12 @@ class ObstacleTask:
         self._last_step_at = None
         # 第一次被调用的时刻：启动预热用（STARTUP_GRACE_SECONDS，默认 0 即关闭）
         self._first_step_at = None
+        # 得分照片协议（7.1）：排队中的请求 / 已交出去的请求 / 已排过的事件键 /
+        # 真实的写盘结果。**这四个槽位不参与绕行决策**，只影响"有没有一张照片"。
+        self._queued_evidence = None
+        self._active_evidence = None
+        self._evidence_queued_kinds: set = set()
+        self._evidence_outcome = None
 
     # ---------------- 对外 ----------------
 
@@ -827,6 +845,88 @@ class ObstacleTask:
         这是本模块**唯一**的障碍观测入口，由主循环喂；模块自己不订阅 SDK。
         """
         self.detector.update_robot_observations(rows, observed_at)
+
+    # ------------------------------------------------------------------
+    # 得分照片协议（7.1）—— 主线每帧轮询这几个方法（照 traffic_light 的协议抄）
+    # ------------------------------------------------------------------
+
+    @property
+    def pending_evidence_request(self):
+        """看一眼排队的请求，但**不取走**。"""
+        return self._queued_evidence
+
+    def take_evidence_request(self):
+        """把一张请求交给集成侧的证据写入器。没有就返回 None。"""
+        request = self._queued_evidence
+        self._queued_evidence = None
+        return request
+
+    def acknowledge_evidence(self, request_id: str, saved: bool) -> bool:
+        """记录证据层**真实**的写盘结果；失败按上限重试。
+
+        绕行状态机**从不等待**这个回执：照片存没存成，车都照原样绕过去
+        （不 FAILED、不停车、也不占用"总共 11 秒"的绕行预算）。
+
+        `request_id` 是 `EvidencePhoto` 的**派生属性**（label + 帧号 + 次数算出来的），
+        **不是字段** —— 所以重试时只 `replace(attempt=...)`，绝不能把它传进 `replace`。
+        """
+        if (
+            self._active_evidence is None
+            or self._active_evidence.request_id != request_id
+        ):
+            return False
+        if saved:
+            self._evidence_outcome = True
+            self._active_evidence = None
+            return True
+        if self._active_evidence.attempt >= MAX_EVIDENCE_ATTEMPTS:
+            self._evidence_outcome = False
+            self._active_evidence = None
+            return True
+        retry = replace(
+            self._active_evidence,
+            attempt=self._active_evidence.attempt + 1,
+        )
+        self._active_evidence = retry
+        self._queued_evidence = retry
+        self._evidence_outcome = None
+        return True
+
+    def _queue_evidence(
+        self, frame: FramePacket, detection: VisualDetection, kind: str = KIND
+    ) -> None:
+        """排一张得分照片。**尽力而为**：排不上、造不出、写不成都不动绕行。
+
+        按**事件**去重（`_evidence_queued_kinds`）：障碍绕行是**一个**计分事件，
+        所以整段运行只排一张。证据层还会用同一个 `event_key`（默认 = 标签
+        `obstacle`）再兜一层，重复请求不会变成第二个文件、也不会重复算分。
+        """
+        if kind in self._evidence_queued_kinds:
+            return
+        if self._evidence_outcome is False:
+            return
+        if self._queued_evidence is not None or self._active_evidence is not None:
+            return
+        try:
+            request = self._make_evidence_request(frame, detection)
+        except Exception:
+            # 连"造请求"这一步出错也不许影响这一帧的绕行：这只是加分项。
+            self._evidence_outcome = False
+            return
+        self._evidence_queued_kinds.add(kind)
+        self._active_evidence = request
+        self._queued_evidence = request
+
+    def _make_evidence_request(self, frame: FramePacket, detection: VisualDetection):
+        """7.1 的得分照片：**矩形**框住障碍（红绿灯才用圆圈），文字写清往哪边绕。"""
+        return make_evidence_photo(
+            KIND,
+            frame,
+            detection=detection,
+            shape="rect",
+            side=self.last_side,
+            team=TEAM_NUMBER,
+        )
 
     def step(self, frame: FramePacket, now: float) -> TaskUpdate:
         """主循环每帧调用一次，必须立刻返回。"""
@@ -848,7 +948,7 @@ class ObstacleTask:
         if self.stage == "IDLE":
             detection = self.detect(frame.image, now)
             self.last_detection = detection
-            return self._step_idle(frame.image, detection, now)
+            return self._step_idle(frame, detection, now)
         # 绕行途中不再重复检测（结果只用于上报）；只有 SEEK / RECONFIRM 要看画面。
         return self._step_active(frame.image, now)
 
@@ -861,7 +961,9 @@ class ObstacleTask:
 
     # ---------------- 还没接管：判断要不要管 ----------------
 
-    def _step_idle(self, image, detection: VisualDetection, now: float) -> TaskUpdate:
+    def _step_idle(self, frame: FramePacket, detection: VisualDetection, now: float) -> TaskUpdate:
+        # 用整帧包（FramePacket），不用裸图：得分照片要连帧号/采集时刻一起交给证据层。
+        image = frame.image
         # 启动预热：默认关（STARTUP_GRACE_SECONDS = 0）。
         # 要压制"一启动就避障"，把它设成 3.0 左右即可。
         if (
@@ -942,6 +1044,11 @@ class ObstacleTask:
         # 选边：障碍偏哪边就往另一边绕（PDF 要求"看清后自己选左或右"）
         self._active_side = self._choose_side(detection)
         self.last_side = self._side_name()
+        # 【7.1 得分照片】就是这一帧：连续帧确认完成、绕行方向刚定下来，
+        # 紧接着就要下发第一脚侧移。图上要有障碍的矩形框 + 一行写清
+        # "Team 03 detects obstacle » the left/right side"（文案由证据层拼）。
+        # 只是**排队**：证据层什么时候写、写不写得成，都不影响下面的动作。
+        self._queue_evidence(frame, detection)
         if HOLD_BEFORE_GO > 0.0:
             self.stage = "HOLD"
             return TaskUpdate(

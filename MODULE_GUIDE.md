@@ -190,6 +190,41 @@ GimbalCommand(
   （默认接管顺序与实车行为不受影响），只从该入口启用；契约测试用
   `tests/test_task_contract.py::EXPERIMENT_ONLY_MODULES` 显式豁免，并**反向断言它不在注册表里**。
 
+### 得分照片（任务证据，统一层）
+
+**照片张数就是 Final 的分数**，而"画框/画圈/写字/去重/落盘/写进 report.md"全部由证据层
+（`evidence.py`，整合负责人维护）负责 —— 模块**只负责在得分那一刻把请求交出来**，
+并且**文案由证据层统一生成**（5 个模块各写一套必然口径不一）：
+
+```python
+from evidence import make_evidence_photo
+
+photo = make_evidence_photo(
+    "obstacle",                       # 见 evidence.ANNOTATION_TEMPLATES
+    frame,                            # FramePacket
+    detection=detection,              # 带 .box 的 VisualDetection（矩形/圆都用它）
+    shape="rect",                     # "rect"=框（障碍/堵车/路线/标识），"circle"=圈（灯）
+    side="left", chosen="right",      # 按模板需要填（漏填会当场 KeyError）
+)
+```
+
+交出去的链路与 `number_marker` / `traffic_light` 一样（`main.service_task_evidence()`
+每帧对所有任务轮询，**必须回执**）：
+
+```python
+request = task.take_evidence_request()                 # 任务交出
+saved = recorder.save_task_evidence(request)           # 证据层画 + 存，返回真实结果
+task.acknowledge_evidence(request.request_id, saved)   # 回传真实结果
+```
+
+两条硬规矩：
+
+* **尽力而为**：写盘失败绝不允许改变任务行为（不许因此 FAILED、停车或重试到超时）；
+* **同一事件只存一张**：`event_key` 默认 = 照片标签，证据层对同一个事件键只写一次
+  （红灯与绿灯是两个不同事件，必须分别保存）。
+
+完整对照表（老师后来明确的 5 组要求）见 [`EVIDENCE_PHOTOS.md`](EVIDENCE_PHOTOS.md)。
+
 ### 巡线暂停和恢复
 
 ```python

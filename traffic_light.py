@@ -35,6 +35,7 @@ from typing import List, Optional, Tuple
 import cv2
 import numpy as np
 
+from evidence import make_evidence_photo
 from models import (
     FramePacket,
     MotionCommand,
@@ -318,7 +319,8 @@ class TrafficLightTask:
         self._last_green_at = 0.0   # last frame that actually saw green
         self._queued_evidence = None
         self._active_evidence = None
-        self._evidence_done = False
+        #: 这一轮已经排过照片的事件（"traffic_light:red" / "traffic_light:green"）。
+        self._evidence_queued_kinds: set = set()
         self._evidence_outcome = None
 
     def _enter_hold(self, now: float) -> None:
@@ -362,7 +364,6 @@ class TrafficLightTask:
         ):
             return False
         if saved:
-            self._evidence_done = True
             self._evidence_outcome = True
             self._active_evidence = None
             return True
@@ -372,10 +373,6 @@ class TrafficLightTask:
             return True
         retry = replace(
             self._active_evidence,
-            request_id="{}:retry{}".format(
-                self._active_evidence.request_id,
-                self._active_evidence.attempt + 1,
-            ),
             attempt=self._active_evidence.attempt + 1,
         )
         self._active_evidence = retry
@@ -383,36 +380,37 @@ class TrafficLightTask:
         self._evidence_outcome = None
         return True
 
-    def _queue_evidence(self, frame: FramePacket, detection: VisualDetection) -> None:
-        """Queue one red-light screenshot per stop cycle (best effort)."""
-        if self._evidence_done or self._evidence_outcome is False:
+    def _queue_evidence(
+        self, frame: FramePacket, detection: VisualDetection, kind: str = "traffic_light:red"
+    ) -> None:
+        """Queue one screenshot per **event** (red stop / green release).
+
+        老师后来明确："红*T 和绿*T 是两个独立计分事件，应分别保存照片"。所以这里按
+        `kind` 分事件去重（`evidence.saved_events` 在证据层再兜一层）：
+        红灯确认存一张、绿灯放行再存一张，彼此不覆盖。
+        """
+        if kind in self._evidence_queued_kinds:
+            return
+        if self._evidence_outcome is False:
             return
         if self._queued_evidence is not None or self._active_evidence is not None:
             return
-        request = self._make_evidence_request(frame, detection)
+        request = self._make_evidence_request(frame, detection, kind)
+        self._evidence_queued_kinds.add(kind)
         self._active_evidence = request
         self._queued_evidence = request
 
     def _make_evidence_request(
-        self, frame: FramePacket, detection: VisualDetection
-    ) -> EvidenceRequest:
-        height, width = frame.image.shape[:2]
-        annotation = (
-            "Team {} detects a red light and stops the robot".format(
-                self.settings.team_number
-            )
-        )
-        return EvidenceRequest(
-            request_id="traffic_light:red:frame:{}:attempt:1".format(
-                frame.sequence
-            ),
-            marker_id="traffic_light_red",
-            frame_sequence=frame.sequence,
-            captured_at=frame.captured_at,
+        self, frame: FramePacket, detection: VisualDetection, kind: str = "traffic_light:red"
+    ):
+        """红灯/绿灯都用**圆圈**标出灯（老师要求"用圆圈标出红灯/绿灯"）。"""
+        return make_evidence_photo(
+            kind,
+            frame,
             detection=detection,
-            annotation=annotation,
-            text_anchor=(width // 2, height // 2),
-            image=frame.image.copy(),
+            shape="circle",
+            team=self.settings.team_number,
+            label=kind.replace(":", "_"),
         )
 
     def step(self, frame: FramePacket, now: float) -> TaskUpdate:
@@ -483,6 +481,10 @@ class TrafficLightTask:
             self._green_streak += 1
             self._last_green_at = now
             if self._green_streak >= s.green_confirm_frames:
+                # 老师："红*T 和绿*T 是两个独立计分事件，应分别保存照片"。
+                # 绿灯确认这一刻再存一张（红灯那张在确认停车时已经存了）。
+                # 照片是**这一帧的画面**，不阻塞状态机：是否写盘失败都不影响放行。
+                self._queue_evidence(frame, detection, "traffic_light:green")
                 self._back_to_idle()
                 return TaskUpdate(
                     TaskStatus.COMPLETED,

@@ -91,6 +91,13 @@ A17           **为什么灯判据归本模块**：2026-09-16 团队把 ``traffi
               (1) 一次扫描**两盏都报**（它只报一盏且红优先）；
               (2) **从不为了红灯停车/占住控制权** —— 只有真的看到绿灯才接管；
               (3) 只在**检测到岔路的帧**才调用，不给主循环加每帧一次的灯检测。
+A18           5.3 岔路选择还要存一张**得分照片**（老师后来明确：用圆圈标出识别到的
+              红灯/绿灯，并写明灯在哪条路、我们选了哪条路）。本模块只在"灯的哪一侧
+              被确认、分支选择定下来那一刻"把请求排队交出去；画圆、写字、去重、写盘
+              全在整合层的 ``evidence.py``，模块自己不画图、不写盘。
+              ``kind`` 按本模块自己的判据语义选（绿灯定路 → ``green_junction:green``，
+              红灯否决那条路 → ``green_junction:red``）；圆圈只用检测器**真的量到**的
+              灯心/半径，量不到就不画（绝不编坐标）。
 ============  ==========================================================
 
 修订说明（2026-09-15 实车测试报告）：本次改了三处，全部只在本文件里，
@@ -118,12 +125,25 @@ A17           **为什么灯判据归本模块**：2026-09-16 团队把 ``traffi
 6. 适用性再收紧一档（A14）：**只有真的拿到绿灯读数才接管**。只有红灯时本模块
    完全不接管（岔路交给后面的模块），绝不重演"为了红灯原地锁停"那件事；
    只有在**已经接管之后**灯才变红的情况下，才会原地停 + 超时 FAILED。
+7. 5.3 岔路选择要存一张**证据照片**（老师后来明确：用圆圈标出识别到的红灯/绿灯、
+   写明灯在哪条路以及我们选了哪条路）。本模块只负责在"灯的哪一侧被确认、分支
+   选择定下来那一刻"把请求**排队**交出（A18）：画圈、写字、去重、写盘、
+   记进 `report.md` 全在整合层的 `evidence.py`，模块自己不画图、不写盘。
+   * `kind` 按本模块**自己的判据语义**选：选中的这一边就是绿灯所在的那一边 →
+     `green_junction:green`（A15 的主判据，照片圈的是那盏绿灯）；只有"某一边是
+     红灯"把那条路排除掉、我们因此走了另一边 → `green_junction:red`（A16 的降级
+     判据，照片圈的是那盏红灯，文案是"红灯在某条路 + 我们走了另一条路"）。
+   * `side` = 灯在哪条分支，`chosen` = 我们实际选的分支。
+   * 照片上的圆圈用检测器**真的量到**的灯心/半径（`LightReading.center` /
+     `radius`，整幅图像素）。读数里没有坐标时 `detection=None`、不画圆圈
+     —— 圆圈被降级，也绝不编一个坐标出来。
+   * **尽力而为**：写盘成功与否都不改变转向和接管行为；同一事件只排一张。
 """
 
 from __future__ import annotations
 
 import collections.abc
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 from typing import Callable, List, Optional, Sequence, Tuple
 
@@ -132,6 +152,7 @@ import inspect
 import cv2
 import numpy as np
 
+from evidence import make_evidence_photo
 from models import (
     FramePacket,
     LineDetection,
@@ -192,11 +213,17 @@ class LightReading:
 
     ``branch`` 为 ``None`` 表示这一读数没有位置信息（只知道"看到绿灯"，
     不知道是哪一边的绿灯）——这时按 A7 的 ``fallback_rule`` 处理。
+
+    ``center`` / ``radius`` 是这盏灯在**整幅图**里的圆心和半径（像素），只记
+    检测器**真的量到**的值：证据照片要用它画圆圈（A18）。没有就是 ``None``，
+    调用方宁可不画圈，也不许按比例编一个出来。
     """
 
     color: LightColor = LightColor.UNKNOWN
     branch: Optional[Branch] = None
     confidence: float = 0.0
+    center: Optional[Tuple[float, float]] = None
+    radius: Optional[float] = None
 
 
 #: 灯判据的读取接口。3 号/1 号把它的函数注入进来即可，不需要本模块依赖 3 号的文件。
@@ -246,6 +273,8 @@ def _reading_from(
         return None
 
     branch: Optional[Branch] = None
+    center: Optional[Tuple[float, float]] = None
+    radius: Optional[float] = None
     image = _frame_image(frame)
     candidate = None if isinstance(value, str) else getattr(value, "center", None)
     if isinstance(candidate, (tuple, list)) and len(candidate) >= 1:
@@ -254,7 +283,22 @@ def _reading_from(
             if width > 0.0:
                 # 注意：``str`` 也有个 ``.center`` 方法，所以上面要先把字符串排掉。
                 branch = Branch.LEFT if float(candidate[0]) < width / 2.0 else Branch.RIGHT
-    return LightReading(color=color, branch=branch, confidence=confidence)
+            # 坐标也留给证据照片画圈用（A18）。**只在这条"整幅图坐标"的分支里填**：
+            # ``make_two_lamp_probe`` 那条路传进来的是半幅裁剪图，坐标是相对的，
+            # 在这里填就会把圆圈画到错的地方（那一路由适配器自己换算）。
+            if len(candidate) >= 2:
+                try:
+                    center = (float(candidate[0]), float(candidate[1]))
+                except (TypeError, ValueError):
+                    center = None
+            radius = _radius_from_box(_value_box(value))
+    return LightReading(
+        color=color,
+        branch=branch,
+        confidence=confidence,
+        center=center,
+        radius=radius,
+    )
 
 
 def _iter_probe_values(value):
@@ -397,6 +441,53 @@ def _value_center(value):
     return None
 
 
+def _value_center_pair(value) -> Optional[Tuple[float, float]]:
+    """``_value_center`` 的严格版：x、y **都要有**才算坐标。
+
+    画圆圈（A18）要用它：只报了一个分量的读数不能拿 ``0`` 顶成坐标。
+    """
+    if value is None or isinstance(value, (str, bytes)):
+        return None
+    inner = getattr(value, "detection", None)
+    if inner is not None:
+        return _value_center_pair(inner)
+    centre = getattr(value, "center", None)
+    if isinstance(centre, (tuple, list)) and len(centre) >= 2:
+        try:
+            return float(centre[0]), float(centre[1])
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def _value_box(value):
+    """从别人给的读数里挖出 ``(left, top, right, bottom)``；没有就返回 ``None``。"""
+    if value is None or isinstance(value, (str, bytes)):
+        return None
+    inner = getattr(value, "detection", None)
+    if inner is not None:
+        return _value_box(inner)
+    box = getattr(value, "box", None)
+    if isinstance(box, (tuple, list)) and len(box) >= 4:
+        try:
+            return tuple(float(item) for item in box[:4])
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def _radius_from_box(box) -> Optional[float]:
+    """用别人给的框算灯的半径（外接正方形的一半）；没有框或框是空的返回 ``None``。
+
+    这是**量出来的**几何，不是编的：``box`` 是检测器给的那盏灯的包围盒。
+    """
+    if box is None:
+        return None
+    left, top, right, bottom = box
+    half = max(abs(right - left), abs(bottom - top)) / 2.0
+    return half if half > 0.0 else None
+
+
 def make_two_lamp_probe(
     source,
     split: float = 0.5,
@@ -480,9 +571,18 @@ def make_two_lamp_probe(
                     # —— 左半 → 左，右半 → 右。要知道真实位置就得让来源报 center。
                     full_x = (start + stop) / 2.0
                 side = Branch.LEFT if full_x < cut else Branch.RIGHT
+                # 半幅裁剪图的坐标换回整幅图（横向裁剪，所以 y 不变）：证据照片要用
+                # 它画圈（A18）。来源没给坐标就留 None，绝不按"哪一半"猜一个位置。
+                pair = _value_center_pair(raw)
+                full_center = None if pair is None else (start + pair[0], pair[1])
+                radius = _radius_from_box(_value_box(raw))
                 for item in readings:
                     reading = LightReading(
-                        color=item.color, branch=side, confidence=item.confidence
+                        color=item.color,
+                        branch=side,
+                        confidence=item.confidence,
+                        center=full_center,
+                        radius=radius,
                     )
                     key = (side, item.color)
                     previous = kept.get(key)
@@ -610,6 +710,13 @@ class JunctionConfig:
     #: 设成 False = 老行为："接管 → 原地停 → 超时 FAILED"。
     require_rule_source: bool = True
     require_blue_branches: bool = True  # A1：关掉就只按亮度/形态找分叉
+
+    # --- 得分证据照片（A18；5.3 岔路选择："圆圈标出红灯/绿灯 + 一行说明文字"） ---
+    #: 队号。老师给的样例是 ``Team 10``，那是样例队号；我们队号是 03。
+    team_number: str = "03"
+    #: 同一张照片写盘失败时最多重试几次（和 ``traffic_light`` 一样有界）。
+    #: 重试用完就放弃 —— **绝不影响转向**：照片是得分副作用，不是任务本身。
+    max_evidence_attempts: int = 2
 
 
 # --------------------------------------------------------------------------
@@ -1273,6 +1380,10 @@ class LampSpotter:
                         color=light_colour,
                         branch=Branch.LEFT if center[0] < center_x else Branch.RIGHT,
                         confidence=confidence,
+                        # 灯心/半径是这一帧**真的量到**的（轮廓质心 + 面积换算的半径），
+                        # 证据照片的圆圈用它（A18）。
+                        center=(float(center[0]), float(center[1])),
+                        radius=float(radius),
                     )
                 )
         found.sort(key=lambda item: -item.confidence)
@@ -1383,6 +1494,54 @@ def evaluate_branches(
     return None, "light color unknown"
 
 
+def _lamp_visual(reading: Optional[LightReading]):
+    """把一条灯读数变成证据层要的"灯的检测结果 + 圆圈"（A18）。
+
+    :return: ``(detection, circle)``。读数里**真的量到**圆心时给一个
+        ``VisualDetection``（带 ``center``，有半径时再带 ``box``），以及
+        ``circle=(cx, cy, r)``；量不到就返回 ``(None, None)`` —— 照片没有圆圈
+        （"圆圈被降级"），宁可不画也**绝不编一个坐标**出来。
+    """
+    center = _value_center_pair(reading)
+    if center is None:
+        return None, None
+    cx, cy = center
+    radius = getattr(reading, "radius", None)
+    try:
+        radius = float(radius) if radius is not None else 0.0
+    except (TypeError, ValueError):
+        radius = 0.0
+    if radius <= 0.0:
+        # 只有圆心、没有半径：圈不出来（半径要量，不能猜），但圆心仍然如实带上。
+        return (
+            VisualDetection(
+                valid=True,
+                kind="green_junction",
+                center=(int(round(cx)), int(round(cy))),
+                color=getattr(getattr(reading, "color", None), "value", None),
+                confidence=float(getattr(reading, "confidence", 0.0) or 0.0),
+            ),
+            None,
+        )
+    box = (
+        int(round(cx - radius)),
+        int(round(cy - radius)),
+        int(round(cx + radius)),
+        int(round(cy + radius)),
+    )
+    return (
+        VisualDetection(
+            valid=True,
+            kind="green_junction",
+            center=(int(round(cx)), int(round(cy))),
+            color=getattr(getattr(reading, "color", None), "value", None),
+            confidence=float(getattr(reading, "confidence", 0.0) or 0.0),
+            box=box,
+        ),
+        (cx, cy, radius),
+    )
+
+
 # --------------------------------------------------------------------------
 # 任务状态机
 # --------------------------------------------------------------------------
@@ -1437,6 +1596,13 @@ class GreenJunctionTask:
         self._turn_started_at: Optional[float] = None
         self._rearm_ready_at: Optional[float] = None
 
+        # --- 得分照片（A18）：模块只排队，画圈/写字/写盘在 evidence.py ---
+        self._queued_evidence = None
+        self._active_evidence = None
+        #: 这一轮已经排过照片的事件（``"green_junction:green"`` / ``"green_junction:red"``）。
+        self._evidence_queued_kinds: set = set()
+        self._evidence_outcome: Optional[bool] = None
+
     # -- 对外状态 ---------------------------------------------------------
 
     @property
@@ -1476,6 +1642,164 @@ class GreenJunctionTask:
         self._run_started_at = None
         self._turn_started_at = None
         self._rearm_ready_at = None
+        # 得分照片的瞬态一起清掉：下一个岔路是**另一个事件**，可以再排一张
+        # （跨事件的重复由证据层的 ``saved_events`` 兜底）。
+        self._queued_evidence = None
+        self._active_evidence = None
+        self._evidence_queued_kinds = set()
+        self._evidence_outcome = None
+
+    # ------------------------------------------------------------------
+    # 得分照片协议（整合侧 main.service_task_evidence 每帧轮询这几个接口）
+    # ------------------------------------------------------------------
+
+    @property
+    def pending_evidence_request(self):
+        """看一眼排队中的请求，**不取走**。"""
+        return self._queued_evidence
+
+    def take_evidence_request(self):
+        """把一张请求交给整合侧的证据层（画圈、写字、写盘都在那边）。
+
+        这是"原子取出"：取走之后 ``pending_evidence_request`` 就是 ``None``，
+        直到有下一个事件排队。调用方必须拿回执来认领结果（见
+        :meth:`acknowledge_evidence`）。
+        """
+        request = self._queued_evidence
+        self._queued_evidence = None
+        return request
+
+    def acknowledge_evidence(self, request_id: str, saved: bool) -> bool:
+        """回传**真实写盘结果**；失败时有界重试。
+
+        和 ``traffic_light`` 同一套协议：``request_id`` 是请求上的派生属性
+        （不是 dataclass 字段），重试只改 ``attempt``（``request_id`` 会跟着变）。
+        状态机**从不等待**这个回执：照片存不存得下来都必须照常转向、照常交回
+        巡线 —— 分数按存下来的张数算，但"真的开进正确那条路"才是任务本身。
+        """
+        if (
+            self._active_evidence is None
+            or self._active_evidence.request_id != request_id
+        ):
+            return False
+        if saved:
+            self._evidence_outcome = True
+            self._active_evidence = None
+            return True
+        if self._active_evidence.attempt >= self.settings.max_evidence_attempts:
+            self._evidence_outcome = False
+            self._active_evidence = None
+            return True
+        retry = replace(
+            self._active_evidence,
+            attempt=self._active_evidence.attempt + 1,
+        )
+        self._active_evidence = retry
+        self._queued_evidence = retry
+        self._evidence_outcome = None
+        return True
+
+    def _evidence_for_choice(
+        self, chosen: Branch, readings: Sequence[LightReading]
+    ) -> Tuple[str, Branch, Optional[LightReading]]:
+        """按本模块**自己的判据语义**决定这张照片写成"绿灯"还是"红灯"（A18）。
+
+        :return: ``(kind, side, reading)``；``side`` = 灯在哪条分支，
+            ``reading`` = 要在照片上圈出来的那一盏（圈不出来时是 ``None``）。
+
+        判断依据就是 :func:`evaluate_branches` 那几条判据本身：
+
+        1. 选中的这一边**就是绿灯所在的那一边** → ``green_junction:green``，
+           圈那盏绿灯（文案 "detects a green light » <灯在哪条路> way and
+           <我们走哪条路>"）。A15 的主判据，两边各一盏灯时也走这一条。
+        2. 否则是**某一边的红灯**把那条路排除掉的（A16 的降级判据：绿灯只知道
+           存在、某一边是红灯 → 走另一边）→ ``green_junction:red``，圈那盏红灯，
+           ``side`` 是**红灯**在哪条路（文案 "detects a red light » left way and
+           right" 正是老师给的第二种样例）。
+        3. 剩下的降级路径（绿灯没定位 / 两边都报绿灯 / ``fallback_color="green"``）
+           仍然记成绿灯：判据本身就是"按绿灯走"，只是照片上圈不出具体哪一盏，
+           ``side`` 就写我们实际走的那条路。
+        """
+        greens = [item for item in readings if item.color is LightColor.GREEN]
+        reds = [item for item in readings if item.color is LightColor.RED]
+        green_on_chosen = next((item for item in greens if item.branch is chosen), None)
+        if green_on_chosen is not None:
+            return "green_junction:green", chosen, green_on_chosen
+        veto = next(
+            (
+                item
+                for item in reds
+                if item.branch is not None and item.branch is not chosen
+            ),
+            None,
+        )
+        if veto is not None:
+            return "green_junction:red", veto.branch, veto
+        return "green_junction:green", chosen, (greens[0] if greens else None)
+
+    def _queue_evidence_for_choice(
+        self, frame: FramePacket, chosen: Branch, readings: Sequence[LightReading]
+    ) -> None:
+        """选路那一刻的得分照片（A15/A16/A18）。"""
+        kind, side, reading = self._evidence_for_choice(chosen, readings)
+        self._queue_evidence(frame, kind, side, chosen, reading)
+
+    def _queue_evidence(
+        self,
+        frame: FramePacket,
+        kind: str,
+        side: Branch,
+        chosen: Branch,
+        reading: Optional[LightReading],
+    ) -> None:
+        """排队一张照片；**同一事件只排一张**，而且**尽力而为**。
+
+        老师按"存下来的张数"算分，同一件事存两张不会多得分；而写盘失败绝不允许
+        改变转向/接管行为（照片只是得分副作用），所以这里只入队，有异常也咽掉。
+        """
+        if kind in self._evidence_queued_kinds:
+            return
+        if self._evidence_outcome is False:
+            return
+        if self._queued_evidence is not None or self._active_evidence is not None:
+            return
+        try:
+            request = self._make_evidence_request(frame, kind, side, chosen, reading)
+        except Exception:
+            # 证据照片出问题绝不能影响开车：不排这张就是了。
+            return
+        if request is None:
+            return
+        self._evidence_queued_kinds.add(kind)
+        self._active_evidence = request
+        self._queued_evidence = request
+
+    def _make_evidence_request(
+        self,
+        frame: FramePacket,
+        kind: str,
+        side: Branch,
+        chosen: Branch,
+        reading: Optional[LightReading],
+    ):
+        """构造请求：**用圆圈标出那盏灯** + 一行说明文字（文案模板在证据层）。
+
+        坐标只用检测器**真的量到**的灯心/半径（``LightReading.center`` /
+        ``radius``）；量不到就是 ``detection=None``、不带圆圈
+        ——"圆圈被降级"，绝不编一个坐标出来。
+        """
+        detection, circle = _lamp_visual(reading)
+        return make_evidence_photo(
+            kind,
+            frame,
+            detection=detection,
+            shape="circle",
+            circle=circle,
+            side=side.value,
+            chosen=chosen.value,
+            team=self.settings.team_number,
+            label=kind.replace(":", "_"),
+        )
 
     # -- 内部工具 ---------------------------------------------------------
 
@@ -1837,6 +2161,9 @@ class GreenJunctionTask:
             )
 
         self.chosen_branch = chosen.side
+        # "灯的哪一侧被确认 + 走哪条路"在这一刻同时定下来了 → 存一张得分照片（A18）。
+        # 只入队，不阻塞：这一帧照样返回转向请求，写盘由整合层的证据层去做。
+        self._queue_evidence_for_choice(frame, chosen.side, readings)
         self._enter(JunctionState.TURN, now)
         return self._running(
             now,

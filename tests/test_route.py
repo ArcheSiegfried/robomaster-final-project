@@ -19,11 +19,14 @@ from route import (  # noqa: E402
     BRIDGING,
     BRIDGE_FORWARD_SPEED,
     BRIDGE_MIN_SECONDS,
-    END_APPROACH,
-    END_APPROACH_SPEED,
-    MONITORING,
     CENTERING,
     CORNERING,
+    END_APPROACH,
+    END_APPROACH_SPEED,
+    EVIDENCE_TEAM,
+    MONITORING,
+    REACQUIRING,
+    REACQUIRE_STABLE_FRAMES,
     SEARCHING,
     SEARCH_HARD_LIMIT_DEG,
     SEARCH_CONFIRM_YAW_SPEED,
@@ -530,6 +533,75 @@ class RouteRecoveryTests(unittest.TestCase):
         decision = harness.feed_image(3.16, far_fragment_frame(x=400))
         self.assertEqual(decision.command.forward, 0.0)
         self.assertNotEqual(decision.command.lateral, 0.0)
+
+    def test_confirming_the_recovered_route_queues_the_scoring_photo(self):
+        """8.1: the evidence photo is queued at the *confirmed* reacquisition.
+
+        ``_step_reacquiring`` is the task's own "recovery succeeded, hand back
+        to line following" moment: the normal base line detector has seen the
+        new route centered and heading-aligned for REACQUIRE_STABLE_FRAMES
+        frames, and the very next step returns COMPLETED.  That is the instant
+        the scoring photo must be queued, so the saved image shows the route
+        that was *found again*, not a frame from the still-searching descent.
+
+        The preceding states are staged directly instead of replayed frame by
+        frame: the full handoff chain is covered by other tests in this file,
+        and this test isolates the evidence contract at the confirmation step.
+        """
+        task, harness, _ = start_and_trigger()
+        settle_into_bridge(harness)
+        task.state = REACQUIRING
+        task.started_at = 2.16
+        task._phase_started_at = 2.16
+        # The camera is already lowered at this point, so no gimbal settle.
+        task._reacquire_view_already_low = True
+        task._stable_frames = 0
+        task._stable_last_sequence = None
+        task._line_detector.reset()
+
+        confirmed = None
+        for index in range(REACQUIRE_STABLE_FRAMES):
+            now = 3.00 + index * 0.05
+            decision = harness.feed_image(now, near_route_frame())
+            if index < REACQUIRE_STABLE_FRAMES - 1:
+                # Not yet confirmed: no photo may be queued before the task
+                # itself decides the correct route has been found again.
+                self.assertIsNone(
+                    task.pending_evidence_request,
+                    "photo queued before the route was confirmed",
+                )
+            confirmed = decision
+        self.assertEqual(confirmed.task_update.status, TaskStatus.COMPLETED)
+        self.assertEqual(
+            confirmed.task_update.message,
+            "base line detector confirmed centered new route",
+        )
+
+        request = task.take_evidence_request()
+        self.assertIsNotNone(request, "no scoring photo queued on confirmation")
+        self.assertEqual(request.kind, "route")
+        self.assertEqual(request.annotation, "Team 03 finds correct to follow")
+        self.assertEqual(EVIDENCE_TEAM, "03")
+        self.assertIsNotNone(request.image)
+        # The annotation must ride on the frame the route was confirmed in.
+        self.assertEqual(request.image.shape, near_route_frame().shape)
+        self.assertEqual(request.shape, "rect")
+        # 老师要求"照片里要显示出重新找到的路线并标注"：那一刻必须真的拿到框。
+        self.assertIsNotNone(request.detection)
+        self.assertIsNotNone(request.detection.box)
+        box_left, box_top, box_right, box_bottom = request.detection.box
+        height, width = request.image.shape[:2]
+        self.assertTrue(
+            0 <= box_left < box_right <= width and 0 <= box_top < box_bottom <= height,
+            f"evidence box {request.detection.box} leaves the frame",
+        )
+
+        # Same event, one photo only: re-queueing must not duplicate it.
+        task._queue_recovery_evidence(None, None)
+        self.assertIsNone(task.pending_evidence_request)
+        # The real writer result is acknowledged, but a failed write is
+        # tolerated: either way the task already handed control back.
+        self.assertTrue(task.acknowledge_evidence(request.request_id, True))
 
     def test_total_timeout_fails_stops_and_restores_line_view(self):
         _, harness, _ = start_and_trigger()
