@@ -92,6 +92,13 @@ class NumberMarkerConfig:
     pitch_kp: float = 45.0
     max_aim_yaw_rate: float = 45.0
     max_aim_pitch_rate: float = 30.0
+    #: 希望协调器额外补的前进量（m/s），只在"够不着、需要靠近"时生效。
+    #:
+    #: 本模块**自己不发这个前进量**（它的 MotionCommand 只有 yaw）——它只是
+    #: 报告"我想靠近多少"，由集成层叠加并限幅（见 `coordinator.APPROACH_HOOK`）。
+    #: 为什么需要：赛题要求标识宽度 > 画面宽 1/5 才计分，实测只有 3.4%，
+    #: 车不靠近就永远拿不到分。取 0.10 是保守值（低于巡线的 0.32）。
+    approach_forward: float = 0.10
     # Positive image-x error means the marker is to the right. The repository
     # convention says positive chassis yaw turns right, but hardware sign still
     # requires wheels-raised validation.
@@ -751,6 +758,35 @@ class NumberMarkerTask:
             selection.candidate, width,
             self.settings.trigger_min_marker_width_ratio,
         )
+
+    def approach_forward_mps(self, now: float) -> float:
+        """**只读**：本模块希望协调器额外补多少前进量（m/s），用来靠近标识。
+
+        为什么需要它（2026-09-18 实车）：本模块的 MotionCommand **只有 yaw、
+        没有 forward** —— 只原地转头瞄准、不会往前开。而赛题要求标识宽度
+        > 画面宽 1/5 才计分，实测 SDK 报出来的只有 **3.4%**（22 像素）：
+        车不靠近，标识永远不会变大，于是永远拿不到分。
+
+        集成层把它**叠加**在模块自己的指令上（见
+        `coordinator.APPROACH_HOOK` / `MAX_APPROACH_FORWARD`），仍然受
+        TaskConfig 限幅。**本模块不改变自己的运动语义**：它照旧只请求 yaw，
+        前进量由协调器决定加不加、加多少。
+
+        只在"已锁定目标、正在瞄准、而且宽度还没到计分门槛"时返回正数 ——
+        也就是"够不着、需要靠近"的那段时间。其余一律 0.0：
+        已经够大就别再冲、没锁定别乱动、存图期间停车。
+        """
+        try:
+            if self._target_id is None:
+                return 0.0
+            if self.state is not MarkerState.AIMING:
+                return 0.0
+            ratio = self._locked_target_width_ratio
+            if ratio is None or ratio >= self.settings.min_marker_width_ratio:
+                return 0.0        # 已经够格存图，别再往前冲
+            return float(self.settings.approach_forward)
+        except Exception:
+            return 0.0
 
     def step(self, frame: FramePacket, now: float) -> TaskUpdate:
         """Run one bounded state transition for the current shared frame."""

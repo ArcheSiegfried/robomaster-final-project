@@ -1004,5 +1004,49 @@ class CoordinatorIntegrationTests(unittest.TestCase):
         self.assertTrue(released.force_stop)
 
 
+class ApproachForwardTests(unittest.TestCase):
+    """靠近量：标识远小于计分门槛时，要报告"我想靠近"，否则永远拿不到分。
+
+    实车证据（captures/run_20260918_175238）：SDK 报出来的标识只有画面宽
+    **3.4%**（22 像素），而计分门槛是 1/5（0.20）。模块的 MotionCommand 只有
+    yaw、没有 forward，所以车不会靠近、标识永远不会变大 → 死锁 0 分。
+    这里验证模块会**报告**一个前进量给协调器叠加（见 coordinator.APPROACH_HOOK）。
+    """
+
+    def _feed(self, task, sequence, now, ratio, centered=True):
+        item = candidate(
+            "1", x=WIDTH / 2 if centered else 460, width=WIDTH * ratio
+        )
+        set_current(task, sequence, now, item)
+        return task.step(packet(sequence, now), now)
+
+    def test_a_marker_at_the_real_34_percent_asks_to_close_in(self):
+        """实车那一帧的尺寸（3.4%）：要接管、并且报告前进量。"""
+        task = NumberMarkerTask(SPLIT_CONFIG)
+        first = self._feed(task, 1, 1.0, 0.034)
+        self.assertIs(first.status, TaskStatus.RUNNING,
+                      "看到标识就该接管（触发门槛 0.03）")
+        # 进入 AIMING 后才会报告靠近量
+        update = self._feed(task, 2, 1.05, 0.034)
+        self.assertIs(update.status, TaskStatus.RUNNING)
+        self.assertGreater(task.approach_forward_mps(1.05), 0.0,
+                           "远小于计分门槛时必须报告前进量，否则永远靠不近")
+
+    def test_it_stops_closing_in_once_the_marker_is_big_enough(self):
+        """已经够格存图（>=0.20）就不许再往前冲。"""
+        task = NumberMarkerTask(SPLIT_CONFIG)
+        self._feed(task, 1, 1.0, 0.25)
+        self._feed(task, 2, 1.05, 0.25)
+        self.assertEqual(task.approach_forward_mps(1.05), 0.0)
+
+    def test_no_target_means_no_closing_in(self):
+        task = NumberMarkerTask(SPLIT_CONFIG)
+        self.assertEqual(task.approach_forward_mps(1.0), 0.0)
+
+    def test_the_hook_never_raises(self):
+        task = NumberMarkerTask(SPLIT_CONFIG)
+        self.assertIsInstance(task.approach_forward_mps(1.0), float)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -93,6 +93,25 @@ RESERVATION_HOOK = "wants_control"
 #: 已接管的模块至少要跑这么久，才允许被"预约"抢走（秒）。
 RESERVATION_MIN_HOLD_SECONDS = 1.0
 
+#: **靠近补充**：接手中的任务可以额外请求一个受限前向量（m/s）。
+#:
+#: 背景（2026-09-18 实车）：`number_marker` 的 MotionCommand **只有 yaw、没有
+#: forward** —— 它只原地转头瞄准，不会往前开。而赛题要求标识宽度 > 1/5 画面宽
+#: 才计分，实测 SDK 报出来的只有 3.4%（22 像素）。车不靠近，标识永远不会变大，
+#: 于是永远拿不到分（先是"不接管"的死锁，拆开接管门槛后变成"靠不近"的死锁）。
+#:
+#: 这里给集成层一个**不改模块语义**的补法：任务实现一个只读的
+#: ``approach_forward_mps(now) -> float``，协调器在任务**自己已经给出运动**时
+#: 把这个前向量**叠加**上去，再统一受 TaskConfig 限幅。
+#:   * 任务没有这个方法 → 行为完全不变；
+#:   * 返回 0 或负数 → 不叠加（模块自己就能喊停）；
+#:   * 永远不覆盖任务给的 forward，只是加上去。
+#: 目前只有 `number_marker` 用它。
+APPROACH_HOOK = "approach_forward_mps"
+
+#: 叠加量的上限（m/s）：再大就可能撞到标识或冲过岔路。默认很保守。
+MAX_APPROACH_FORWARD = 0.12
+
 # The base line must be armed before any module may claim motion from it.
 TAKEOVER_ALLOWED_STATES = (TRACKING, COASTING, LINE_LOST)
 
@@ -262,23 +281,51 @@ class TaskCoordinator:
         self.last_claims = tuple(claims) if probe_all else ()
         return winner
 
-    def _apply_task_motion(self, update: TaskUpdate, errors) -> MotionCommand:
+    def _apply_task_motion(self, update: TaskUpdate, errors, task=None,
+                           now: Optional[float] = None) -> MotionCommand:
         if update.motion is None:
             self.output.hard_stop()
             return STOP_COMMAND
-        command = clamp_task_command(update.motion, self.settings.tasks)
+        requested = self._with_approach_forward(update.motion, task, now, errors)
+        command = clamp_task_command(requested, self.settings.tasks)
         if (
-            command.forward != update.motion.forward
-            or command.lateral != update.motion.lateral
-            or command.yaw != update.motion.yaw
+            command.forward != requested.forward
+            or command.lateral != requested.lateral
+            or command.yaw != requested.yaw
         ):
             errors.append(
                 f"task command clamped from "
-                f"({update.motion.forward}, {update.motion.lateral}, {update.motion.yaw}) "
+                f"({requested.forward}, {requested.lateral}, {requested.yaw}) "
                 f"to ({command.forward}, {command.lateral}, {command.yaw})"
             )
         self.output.send(OWNER_EXTERNAL, command)
         return command
+
+    def _with_approach_forward(self, motion: MotionCommand, task, now,
+                               errors) -> MotionCommand:
+        """给"只会转头、不会前进"的任务叠加一个受限前向量（见 APPROACH_HOOK）。
+
+        绝不覆盖任务给的 forward，只做加法；没有钩子、钩子返回非正数、
+        或钩子抛异常时都原样返回。这是集成层的补丁，模块本身语义不变。
+        """
+        if task is None:
+            return motion
+        hook = getattr(task, APPROACH_HOOK, None)
+        if not callable(hook):
+            return motion
+        try:
+            extra = float(hook(now))
+        except Exception as error:
+            errors.append(f"{getattr(task, 'name', '?')} {APPROACH_HOOK} raised: {error}")
+            return motion
+        if not math.isfinite(extra) or extra <= 0.0:
+            return motion
+        extra = min(extra, MAX_APPROACH_FORWARD)
+        return MotionCommand(
+            forward=motion.forward + extra,
+            lateral=motion.lateral,
+            yaw=motion.yaw,
+        )
 
     def _apply_task_gimbal(self, update: TaskUpdate, errors) -> bool:
         if update.gimbal is None:
@@ -446,7 +493,7 @@ class TaskCoordinator:
             return self._release(
                 now, errors, "task gimbal request failed", reset_task=True
             )
-        command = self._apply_task_motion(update, errors)
+        command = self._apply_task_motion(update, errors, task=task, now=now)
         return CoordinatorDecision(
             state=TASK_ACTIVE,
             owner=self.output.owner,
@@ -508,7 +555,7 @@ class TaskCoordinator:
                 return self._release(
                     now, errors, "task gimbal request failed", reset_task=True
                 )
-            command = self._apply_task_motion(update, errors)
+            command = self._apply_task_motion(update, errors, task=task, now=now)
             return CoordinatorDecision(
                 state=TASK_ACTIVE,
                 owner=self.output.owner,
