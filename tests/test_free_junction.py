@@ -102,9 +102,14 @@ def draw_car(image, box):
     cv2.rectangle(image, (x1 - 14, y0 + 2), (x1 - 2, y1 - 2), CAR_ARMOR_GREEN, -1)    # 右装甲
 
 
-def fork_frame(car_left=False, car_right=False, stem_top=300, tips=(200, 440), x=320):
-    """合成岔路帧：主干 + 两条向上张开的分支，可选在某一侧停一辆车。"""
-    image = np.full((360, 640, 3), FLOOR, np.uint8)
+def fork_frame(car_left=False, car_right=False, stem_top=300, tips=(200, 440), x=320,
+               floor=None):
+    """合成岔路帧：主干 + 两条向上张开的分支，可选在某一侧停一辆车。
+
+    `floor` 可以换地面灰度（默认 `FLOOR`）—— 用来验证判据**与场地无关**：
+    考试场地是浅灰地面，练习场地是深色水磨石，两者都要成立。
+    """
+    image = np.full((360, 640, 3), FLOOR if floor is None else floor, np.uint8)
     cv2.rectangle(image, (x - 12, stem_top), (x + 12, 350), BLUE, -1)
     cv2.line(image, (x, stem_top), (tips[0], 190), BLUE, 18)
     cv2.line(image, (x, stem_top), (tips[1], 190), BLUE, 18)
@@ -246,6 +251,28 @@ class ColorlessCarTests(unittest.TestCase):
         # 有彩色装甲的车照旧认得出（颜色判据没被动过）
         colored = fork_frame(car_left=True)
         self.assertEqual(self.reading(colored, settings).reading, BLOCKAGE_LEFT)
+
+    def test_the_criterion_does_not_depend_on_the_venue(self):
+        """**换场地也要成立**：浅灰地面 + 光照偏亮时车身不再是"绝对深色"。
+
+        用户明确：考试场地地面是浅灰、和练习场地不一样；障碍车是 EP 小车、
+        停在岔路上、车下方有蓝线、离岔路口约 0.9~1.1 米。
+        所以判据不能靠"练习场地量出来的固定亮度 90"：
+        这里地面用 235（很亮的浅灰），车身用 135（光照下的中灰），
+        固定阈值（V<=90）会**整辆漏掉**，而"比自己邻域暗"的自适应取块照样认得出。
+        """
+        box = (175, 170, 265, 242)          # 约 1 米外的车，压在左支胶带上
+        image = fork_frame(floor=235)
+        cv2.rectangle(image, (box[0], box[1]), (box[2], box[3]), (135, 135, 135), -1)
+        # 1) 默认（自适应局部阈值）→ 必须认出来
+        reading = self.reading(image)
+        self.assertEqual(reading.reading, BLOCKAGE_LEFT,
+                         "浅灰地面上的车必须认出来：%s" % reading.describe())
+        # 2) 对照：切回"固定亮度 90"的旧口径 → 这一帧必然漏（说明自适应那条真的在起作用）
+        fixed = dataclasses.replace(FreeJunctionConfig(), occluder_mask_mode="fixed",
+                                    occluder_dark_mode="fixed")
+        self.assertEqual(self.reading(image, fixed).reading, BLOCKAGE_NONE,
+                         "固定阈值口径在这一帧应该漏掉（这正是换场地会失败的原因）")
 
     def test_a_car_one_metre_away_on_a_light_floor_is_seen(self):
         """**考试规范的距离**：车停在岔路口外约 1 米（画面里只有近处那辆的一半大）。

@@ -462,6 +462,18 @@ class FreeJunctionConfig:
     occluder_mask_ratio: float = 0.90
     occluder_mask_floor: int = 45
     occluder_mask_ceil: int = 150
+    #: **取块方式**（决定"哪块像素算车体"）：
+    #:   * ``"adaptive_local"``（**默认**）—— `cv2.adaptiveThreshold`：像素比自己**邻域**
+    #:     的均值暗 `occluder_local_margin` 就算车体。**与场地无关**：浅灰地面、深色地面、
+    #:     光照强弱都成立；而且远处那片"整体都暗"的背景**不会被连进来**（它邻域也是暗的）。
+    #:     这正是 2026-09-18 用"整条带的 p60 当参考"失败的原因（背景把参考拉低、车和背景连片）。
+    #:   * ``"fixed"`` —— 全局阈值 `occluder_dark_v_max`（练习场地口径，留作对照）。
+    occluder_mask_mode: str = "adaptive_local"
+    #: 自适应阈值的邻域大小（work 像素，会按缩放换算；实际取奇数、>=3）。
+    occluder_local_block_px: int = 31
+    #: "比自己邻域暗多少"才算车体（灰度级）。25 左右对深色车体足够，
+    #: 又不会把胶带的边缘、地面颗粒算进来。
+    occluder_local_margin: int = 25
     occluder_dark_v_max: int = 90            # mode="fixed" 时的阈值
     occluder_adaptive_margin: int = 40       # mode="adaptive" 时：地面亮度 - 这个值
     occluder_adaptive_floor: int = 45        # 自适应阈值下限（别低到分不开车）
@@ -1322,6 +1334,11 @@ class VehicleDetector:
         mode = str(getattr(self.settings, "occluder_dark_mode", "fixed")).strip().lower()
         return mode == "relative"
 
+    def local_threshold_mode(self) -> bool:
+        """取块是否用"比自己邻域暗"的自适应阈值（`occluder_mask_mode`）。"""
+        mode = str(getattr(self.settings, "occluder_mask_mode", "")).strip().lower()
+        return mode == "adaptive_local"
+
     def pick_occluder(
         self,
         region: np.ndarray,
@@ -1365,7 +1382,22 @@ class VehicleDetector:
         value = hsv[:, :, 2]
         reference = self.floor_reference(value)
         limit = self.dark_limit(value)
-        raw = (value <= limit).astype(np.uint8)
+        if self.local_threshold_mode():
+            # **与场地无关的取块**：比自己邻域暗 `occluder_local_margin` 才算车体。
+            # 浅灰地面（考试场地）和深色水磨石（练习场地）用同一套参数；
+            # 远处"整体都暗"的背景不会被连进来（它自己的邻域也暗）。
+            block = max(3, _scaled_px(settings.occluder_local_block_px, scale))
+            if block % 2 == 0:
+                block += 1
+            raw = cv2.adaptiveThreshold(
+                value, 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY_INV,
+                block, int(settings.occluder_local_margin),
+            )
+            # 再并上"绝对很暗"的像素：闪一下、反光等局部对比弱的地方也保住。
+            raw = cv2.bitwise_or(raw, (value <= limit).astype(np.uint8) * 255)
+            raw = (raw > 0).astype(np.uint8)
+        else:
+            raw = (value <= limit).astype(np.uint8)
         tape = np.zeros(raw.shape, np.uint8)
         if line is not None and bool(np.any(line)):
             tape[line] = 255
