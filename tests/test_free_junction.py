@@ -189,6 +189,57 @@ class ColorlessCarTests(unittest.TestCase):
         colored = fork_frame(car_left=True)
         self.assertEqual(self.reading(colored, settings).reading, BLOCKAGE_LEFT)
 
+    def test_a_car_one_metre_away_on_a_light_floor_is_seen(self):
+        """**考试规范的距离**：车停在岔路口外约 1 米（画面里只有近处那辆的一半大）。
+
+        合成帧的地面是浅灰（V=210），和用户说的考试场地（浅灰地面）同量级 ——
+        固定亮度阈值（V<=90）在浅灰地面上比在深色地面上更稳，因为车比地面暗得多。
+        """
+        image = fork_frame()
+        draw_far_car(image, FAR_CAR_LEFT_BOX)
+        reading = self.reading(image)
+        self.assertEqual(reading.reading, BLOCKAGE_LEFT,
+                         "1 米外的车也必须认出来：%s" % reading.describe())
+        self.assertIsNotNone(reading.left_box)
+
+    def test_the_official_reading_is_independent_of_distance(self):
+        """官方 SDK 读数**不看尺寸**：1 米外的车框很小也照样算数（`sdk_or_vision` 默认）。"""
+        task = FreeJunctionTask()
+        image = fork_frame()
+        # 归一化坐标：中心 (0.22, 0.45)，宽高只有 0.10 x 0.06 —— 相当于远处的小车
+        task.update_robot_observations([(0.22, 0.45, 0.10, 0.06)], observed_at=1.0)
+        fork, _roi, _line, rect = task.detector.analyze(image)
+        reading = task._read_blockage(fork, image, rect, 1.0)
+        self.assertEqual(reading.reading, BLOCKAGE_LEFT,
+                         "官方说左边有车，框小也必须采信：%s" % reading.describe())
+        self.assertEqual(reading.source, "sdk")
+
+    def test_a_dark_floor_scene_is_documented_not_guessed(self):
+        """深色地面（合成 V=70）下固定阈值会失灵 —— 这里把**已知边界**锁住。
+
+        不是为了让它"通过"，而是为了让"换到深色地面要重标定"这件事在测试里可见：
+        真到那种场地，正解是让集成层把官方 robot 识别接上（`blockage_source="sdk"`），
+        而不是继续用画面判据猜。
+        """
+        settings = FreeJunctionConfig()
+        self.assertEqual(settings.blockage_source, "sdk_or_vision",
+                         "默认必须官方优先 —— 换场地时靠它兜底")
+        self.assertTrue(settings.occluder_enabled)
+        self.assertEqual(settings.occluder_dark_mode, "fixed",
+                         "自适应阈值实测会在深色地面上误判空侧（124 帧 A/B）")
+
+
+#: **1 米以外**的车（考试规范：障碍车停在岔路口外约 1 米）。按几何推算，
+#: 1 米外 EP 车约 90x72 像素；合成帧地面是浅灰（V=210，和考试场地的浅灰地面同量级）。
+FAR_CAR_LEFT_BOX = (175, 170, 265, 242)
+FAR_CAR_RIGHT_BOX = (375, 170, 465, 242)
+
+
+def draw_far_car(image, box):
+    """画一辆"停在约 1 米外、没有彩色装甲"的车（比近处那辆小一半左右）。"""
+    x0, y0, x1, y1 = box
+    cv2.rectangle(image, (x0, y0), (x1, y1), CAR_BODY, -1)
+
 
 def noise_split_frame():
     """一条很宽的带子被"竖直噪声"等宽切开：上下间距完全一样，不是岔路。

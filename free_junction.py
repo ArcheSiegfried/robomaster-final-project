@@ -445,10 +445,33 @@ class FreeJunctionConfig:
     #: 全部语料回放（新场地 2 帧 + 旧场地 122 个有岔路的帧）：新场地两帧都判对
     #: （`left`），旧场地 **right/both 误报 0 次**（安全指标：空的那侧绝不能被误判）。
     occluder_enabled: bool = True
-    occluder_dark_v_max: int = 90            # 与 `robot_dark_v_max` 同口径（新场地车体 V 中位 49~113）
+    #: 深色阈值怎么定：
+    #:   * ``"fixed"``（**默认**）—— 用 `occluder_dark_v_max`（90）。
+    #:     浅灰地面（考试场地）下车比地面暗得多，固定阈值反而最稳；
+    #:   * ``"adaptive"`` —— 从这条带的亮度分布推（`p60 - margin`，夹到 floor~ceil）。
+    #:     **实测是有害的**：124 帧逐帧 A/B 里它放出 3 帧"把空侧误判成 both"
+    #:     （深色地面上阈值被抬高，地面自己也算成深色）；固定阈值那版是 0 帧。
+    #:     所以只在明确换到**深色地面**且固定阈值失灵时才考虑打开，并且必须重新跑
+    #:     `.local/probe_ab_integration_new.py` 验证。
+    occluder_dark_mode: str = "fixed"
+    occluder_dark_v_max: int = 90            # mode="fixed" 时的阈值
+    occluder_adaptive_margin: int = 40       # 自适应：地面亮度 - 这个值
+    occluder_adaptive_floor: int = 45        # 自适应阈值下限（别低到分不开车）
+    #: 自适应阈值上限。**别调高**：调到 130 时旧语料立刻出现 3 帧把空侧误判
+    #: （深色地面 + 放宽阈值 = 地面本身也被算成深色）。浅灰地面（考试场地）下
+    #: "地面 200-40=160" 会被夹到 105，而深色车体（V 40~110）照样过。
+    occluder_adaptive_ceil: int = 105
     occluder_dark_min_ratio: float = 0.45    # 框内（抠掉胶带后）深色像素占比（实测车 0.59~0.60）
-    occluder_min_area_ratio: float = 0.030   # 相对判据带面积（新场地那辆车 0.087~0.119）
-    occluder_max_area_ratio: float = 0.55    # 占满画面的大暗块（墙/暗带）不算
+    #: 面积门槛按"**车在岔路口外约 1 米**"标定（考试规范的距离）：
+    #: 实测那一帧里车占判据带 **8.7%~11.9%**（练习场地车离得更近）；按几何推算
+    #: 1 米外约 **4.2%**、1.5 米约 1.9% —— 所以 0.030 这条线覆盖到约 1.2~1.3 米。
+    #: 曾经为了"1 米"把它降到 0.015，结果旧语料立刻出现 3 帧把空侧误判 → 回退。
+    occluder_min_area_ratio: float = 0.030
+    occluder_max_area_ratio: float = 0.55
+    #: 最小**高度/宽度**占比：挡住又扁又碎的小块（面积和长宽比都过得去的那种）。
+    #: 1 米外的 EP 车高约 72 像素 = 判据带的 26%，所以 0.12 既挡碎块又留足余量。
+    occluder_min_height_ratio: float = 0.12
+    occluder_min_width_ratio: float = 0.05
     occluder_min_aspect: float = 0.5         # 外接框 宽/高
     occluder_max_aspect: float = 3.0
     occluder_max_bottom_ratio: float = 0.80  # 底边低于判据带这个比例 = 太近，算我方车头/影子
@@ -1216,6 +1239,32 @@ class VehicleDetector:
             int(x), int(y), int(x + box_width), int(y + box_height)
         )
 
+    def dark_limit(self, value: np.ndarray) -> int:
+        """这一帧该把多暗算"深色"（`occluder_dark_mode`）。
+
+        `"adaptive"`：取这条带亮度的 **p60 当"地面参考"**，往下减
+        `occluder_adaptive_margin`，再夹到 `[floor, ceil]`。
+        这样"浅灰地面（考试场地）"和"深色水磨石（练习场地）"用同一套参数都成立：
+        车永远比它脚下的地面暗一截，判据问的是"**比地面暗多少**"，不是绝对亮度。
+
+        `"fixed"`：直接用 `occluder_dark_v_max`（旧行为）。
+        """
+        settings = self.settings
+        mode = str(getattr(settings, "occluder_dark_mode", "fixed")).strip().lower()
+        fixed = int(settings.occluder_dark_v_max)
+        if mode != "adaptive" or value is None or getattr(value, "size", 0) == 0:
+            return fixed
+        try:
+            reference = float(np.percentile(value, 60))
+        except Exception:
+            return fixed
+        if not math.isfinite(reference):
+            return fixed
+        limit = reference - float(settings.occluder_adaptive_margin)
+        limit = max(float(settings.occluder_adaptive_floor),
+                    min(float(settings.occluder_adaptive_ceil), limit))
+        return int(round(limit))
+
     def pick_occluder(
         self, region: np.ndarray, line: Optional[np.ndarray] = None, scale: float = 1.0
     ) -> Tuple[bool, float, Optional[Tuple[int, int, int, int]]]:
@@ -1246,7 +1295,8 @@ class VehicleDetector:
         if line is None:
             line = _blue_mask(region, settings)
         hsv = cv2.cvtColor(region, cv2.COLOR_BGR2HSV)
-        raw = (hsv[:, :, 2] <= int(settings.occluder_dark_v_max)).astype(np.uint8)
+        limit = self.dark_limit(hsv[:, :, 2])
+        raw = (hsv[:, :, 2] <= limit).astype(np.uint8)
         tape = np.zeros(raw.shape, np.uint8)
         if line is not None and bool(np.any(line)):
             tape[line] = 255
@@ -1269,6 +1319,10 @@ class VehicleDetector:
             area_ratio = (box_width * box_height) / area
             if not (settings.occluder_min_area_ratio <= area_ratio
                     <= settings.occluder_max_area_ratio):
+                continue
+            if box_width < settings.occluder_min_width_ratio * width:
+                continue
+            if box_height < settings.occluder_min_height_ratio * height:
                 continue
             aspect = box_width / float(box_height)
             if not (settings.occluder_min_aspect <= aspect <= settings.occluder_max_aspect):
@@ -1478,6 +1532,10 @@ class FreeJunctionTask:
         #: 一直是 0 就说明集成层还没订阅 robot 识别（那时用的是画面判据兜底）——
         #: 主循环的 message 会直接写出来，实车上一眼可见。
         self.official_sightings = 0
+        #: 官方读数里"落在判据带之外"的条数（最新一帧）。>0 时主循环 message 会说明：
+        #: 官方确实看到了车，只是位置不在带内 —— 这种读数现在也采信（见
+        #: `_read_sdk_blockage`），所以这句话主要是给实车排查用的。
+        self.sdk_outside_band = 0
         self.last_blockage = BlockageReading(BLOCKAGE_NONE)
         self.last_visual = VisualDetection.no_result(KIND)
         self.chosen_branch: Optional[Branch] = None
@@ -1601,15 +1659,24 @@ class FreeJunctionTask:
 
     # -- 官方 SDK 观测（集成层推来的纯数据）--------------------------------
 
-    def update_robot_observations(self, candidates: Iterable, now: Optional[float] = None) -> None:
+    def update_robot_observations(
+        self,
+        candidates: Iterable = (),
+        observed_at: Optional[float] = None,
+        now: Optional[float] = None,
+    ) -> None:
         """主循环推来的**官方 SDK 机器人识别**观测快照（与 5 号 `obstacle.py` 同一套接口）。
 
         接这条通路**不需要改 `main.py` / `task_registry.py`**：`main.py` 的
         `feed_robot_observations()` 每帧对任何实现了本方法的名字调一次
-        （``push(rows, observed_at)``，喂在 `coordinator.step()` 之前）。
+        （``push(rows, observed_at)`` —— **位置参数**，喂在 `coordinator.step()` 之前）。
 
         ⚠️ **不要**改成 `update_candidates`：那个名字属于 `number_marker` 的
         **视觉标签(marker)** 通道（`feed_marker_observations()`），标签不是车。
+
+        时间戳参数**两个名字都收**（``observed_at`` 和 ``now``，位置传入也行）：
+        集成层按位置传值，而本项目其它模块的写法两种都有 —— 2026-09-18 就因为
+        只收 ``now`` 让一处调用炸了 `TypeError`，没必要再踩第二次。
 
         本模块只**存快照**：不订阅、不碰 SDK、不做判定 —— 判定在
         `_read_blockage()` 里，而且只在 `blockage_source` 选了官方读数时才用。
@@ -1618,21 +1685,31 @@ class FreeJunctionTask:
             （``center``/``width``/``height``/``observed_at``），也可以是 SDK 原始行
             ``(x, y, w, h)``（机器人识别）或 ``(x, y, w, h, 标签)``（视觉标签）。
             坐标是归一化还是像素都能认（见 `sighting_from_observation`）。
-        :param now: 给"没有自带时间戳的原始行"打的时间戳（默认取单调钟；
-            离线测试可以传真时钟，这样判定完全可复现）。
+        :param observed_at: 官方回调的**接收时刻**（集成层就是这么传的）。
+        :param now: 同上（兼容旧写法）；两个都不给就用单调钟。
         """
-        try:
-            snapshot = tuple(candidates) if candidates is not None else ()
-        except TypeError:
-            snapshot = ()
-        stamp = time.monotonic() if now is None else now
-        try:
-            stamp = float(stamp)
-        except (TypeError, ValueError):
-            stamp = None
+        snapshot = self._as_row_tuple(candidates)
+        stamp = self._as_stamp(observed_at if observed_at is not None else now)
         with self._sdk_lock:
             self._sdk_rows = snapshot
             self._sdk_pushed_at = stamp
+
+    @staticmethod
+    def _as_row_tuple(rows: Iterable) -> Tuple:
+        try:
+            return tuple(rows) if rows is not None else ()
+        except TypeError:
+            return ()
+
+    @staticmethod
+    def _as_stamp(value: Optional[float]) -> Optional[float]:
+        if value is None:
+            return time.monotonic()
+        try:
+            stamp = float(value)
+        except (TypeError, ValueError):
+            return None
+        return stamp if math.isfinite(stamp) else None
 
     def _sdk_sightings(
         self, frame_width: int, frame_height: int, now: float
@@ -1810,6 +1887,9 @@ class FreeJunctionTask:
         if source not in ("sdk", "sdk_or_vision"):
             return ""
         if self.official_sightings > 0:
+            if self.sdk_outside_band:
+                return ("official robot detected outside the junction band (%d); "
+                        % self.sdk_outside_band)
             return ""
         return "official robot detection unavailable (0 sightings so far; picture criterion); "
 
@@ -1840,13 +1920,22 @@ class FreeJunctionTask:
         sightings = self._sdk_sightings(width, height, now)
         if sightings:
             self.official_sightings += len(sightings)
+        in_band = []
+        far = []
         for sighting in sightings:
             center_x, center_y = sighting.center
-            # 只看"岔路口那条带"和岔路 ROI 的横向范围：和画面判据同一块地方。
-            if center_y < top or center_y > bottom:
-                continue
-            if center_x < left_edge or center_x > right_edge:
-                continue
+            inside = (top <= center_y <= bottom) and (left_edge <= center_x <= right_edge)
+            if inside:
+                in_band.append(sighting)
+            elif center_y < top:
+                # 比判据带更远（更靠画面上方）的官方读数**只计数、不采信**：
+                # 计数是给实车排查用的（message 会写"official robot detected outside
+                # the junction band"），采信它会让场外无关的机器人抢戏。
+                # 判据带本身已经覆盖画面 0.10~0.86，1 米外的车也在里面。
+                far.append(sighting)
+        self.sdk_outside_band = len(far)
+        for sighting in in_band:
+            center_x, _center_y = sighting.center
             ratio = sighting.width_ratio(width)
             if center_x < split:
                 if left_box is None or ratio > left_score:
