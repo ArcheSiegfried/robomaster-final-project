@@ -216,3 +216,66 @@ captures/run_YYYYmmdd_HHMMSS/
 `EvidenceRecorder(directory=...)`）：想多留证据就调大 `snapshot_interval`
 （默认 2.0 秒一张）或调大 `max_keyframes`。**注意关键帧是调试用的，
 不是算分材料**，所以默认封顶偏保守。
+
+## 8. 预约接管通道：修 `number_marker` 被饿死（2026-09-18 实车）
+
+### 症状（`captures/run_20260918_163210`，196 秒）
+
+用户报告"识别 marker 没触发、也没拍照"。从那次 run 的 `console.log` 统计：
+
+| 模块 | 接管次数 | 被优先级截断（那一帧根本没被问） |
+|---|---|---|
+| green_junction | 1 | 1 |
+| **obstacle** | **0** | 1 |
+| free_junction | 5 | 1 |
+| route | 2 | 6 |
+| traffic_light | 1 | 8 |
+| **number_marker** | **0** | **9** |
+
+`scoring/` 里只有 4 张图，**一张标识照片都没有** —— 标识 5 分/个、满 25 分，
+是全场最大一块，一分未得。
+
+### 根因：仲裁架构，不是识别阈值
+
+`coordinator._find_takeover()` 按注册表顺序问，**遇到第一个返回 RUNNING 的
+就停**，后面的模块那一帧**根本不会被调用**（日志里叫"优先级截断"）。
+`number_marker` 排最后、`free_junction` 又是强触发，于是被永久饿死。
+
+**只调注册表顺序救不了**：把 `number_marker` 提前，它会反过来挡住岔路/绕障。
+
+### 修法：另开一条"预约"通道
+
+模块可以实现一个**只读**的 `wants_control(frame, now) -> bool`，协调器在
+**已经有别的模块拿着运动权**时，每帧额外问它一遍。命名沿用骨架已有的
+鸭子类型做法（`reset()` / `record_decision()`），**没有这个方法的模块行为完全不变**。
+
+三条设计约束（都有测试钉住）：
+
+1. **只在"已经有人开车"时生效**。没人开车时仍按注册表顺序问，所以
+   "岔路优先于标识"这类裁定**保持不变** —— 饿死本来就只发生在
+   "前面的模块一直拿着运动权"的时候。
+2. **红灯否决优先于它**，且仍受 `TaskConfig` 全部限幅与超时约束。
+3. 当前任务要跑够 `RESERVATION_MIN_HOLD_SECONDS`（1.0 秒）才允许被抢，
+   否则两个模块会每帧互抢。
+
+目前只有 `number_marker` 实现了这个钩子（`wants_control` 复用 `step()` 的
+接管判据 `is_marker_eligible`，即赛题要求的 `width/frame_width > 0.20`；
+已锁定目标时返回 False，不抢正在收尾的拍照）。
+
+`obstacle` 同样是 0 次接管，也可以接这个钩子，但**本次没做**：
+它的判据要接 SDK robot 观测（`feed_robot_observations`），
+需要单独测，且"障碍没触发"到底是没看到还是被饿死，这次 run 分不出来。
+
+### 验证
+
+新增 `tests/test_reservation.py`（11 条）：排最后的模块能拿到运动权、
+没有钩子的模块行为不变、不想接管时不调它的 `step()`、预约模块之间不互抢、
+min_hold 之前不抢、**红灯否决优先于预约**、预约指令仍被限幅、
+STOPPED 时任何模块都不许接管、钩子抛异常只记录不影响主循环、
+以及"没人开车时仍按注册表顺序（预约不许抢在岔路前面）"。
+
+离线回归：685 tests / 7 failures，7 条全部是既有的 `test_route.RouteRecoveryTests`
+失败，无新增。
+
+**未验证**：预约通道对那次真实 run 的实际改善没有回放验证，
+也**没有任何实车验证**。要确认 `number_marker` 真的开始拍照，需要再跑一次场地。

@@ -64,6 +64,35 @@ OWNER_EXTERNAL = "external"
 #: 机制本身没变过，找不到名为 traffic_light 的模块时会自动失效（`light_task=None`）。
 LIGHT_TASK_NAME = "traffic_light"
 
+#: **预约接管**：这些模块即使排在很后面，也要有机会拿到运动权。
+#:
+#: 背景（2026-09-18 实车实测）：仲裁是"按顺序问、遇到第一个 RUNNING 就停"，
+#: 所以排在前面的模块一强触发，后面的模块那一帧**根本不会被问**。
+#: `number_marker` 排最后，那次 run 196 秒里被截断 9 次、**接管 0 次、
+#: 一张标识照片都没存**（标识 5 分/个、满 25 分，是全场最大一块）。
+#: 靠调注册表顺序救不了它：把它提前就会反过来把岔路/绕障挡住。
+#:
+#: 所以另开一条通道：这些模块可以实现一个**只读**的
+#: ``wants_control(frame, now) -> bool``，协调器在"按顺序问"之前先问它们一遍。
+#: 命名沿用骨架里已有的鸭子类型做法（`reset()` / `record_decision()` 都是这样），
+#: 没有这个方法的模块行为**完全不变**。
+#:
+#: 何时生效：**只在"已经有别的模块拿着运动权"时**。没人开车时仍然按注册表
+#: 顺序问，所以"岔路优先于标识"这类裁定保持不变 —— 饿死本来就只发生在
+#: "前面的模块一直拿着运动权"的时候。
+#:
+#: 安全边界（都有测试）：
+#:   * 只在基础巡线可接管时生效，且仍然受 TaskConfig 全部限幅与超时约束；
+#:   * 红灯否决权优先于它 —— 红灯亮着时预约不生效；
+#:   * 已有任务在开车时，预约只在该任务跑够 `RESERVATION_MIN_HOLD_SECONDS`
+#:     之后才允许抢（防两个模块每帧互相抢）；
+#:   * `wants_control()` 必须只读、必须快：它每帧都会被调用。
+#: 目前只有 `number_marker` 用它。见 PRIORITY_ORDER_AND_FORK_FIX.md。
+RESERVATION_HOOK = "wants_control"
+
+#: 已接管的模块至少要跑这么久，才允许被"预约"抢走（秒）。
+RESERVATION_MIN_HOLD_SECONDS = 1.0
+
 # The base line must be armed before any module may claim motion from it.
 TAKEOVER_ALLOWED_STATES = (TRACKING, COASTING, LINE_LOST)
 
@@ -135,6 +164,12 @@ class TaskCoordinator:
              if getattr(task, "name", None) == LIGHT_TASK_NAME),
             None,
         )
+        # 预约通道（见 RESERVATION_HOOK）：只有实现了 wants_control() 的模块参与。
+        # 没有的话这个元组是空的，一切行为与以前完全一致。
+        self.reservation_tasks = tuple(
+            task for task in self.motion_tasks
+            if callable(getattr(task, RESERVATION_HOOK, None))
+        )
         #: 被红灯暂停掉的累计时间：等红灯不该算进任务的 max_task_seconds。
         self._paused_seconds = 0.0
         #: 最近一次"竞争探测"的结果（只有探测帧非空）。给终端显示用：
@@ -175,6 +210,31 @@ class TaskCoordinator:
     def _observe(self, frame, now, errors) -> None:
         for observer in self.observers:
             self._call(observer.observe, observer.name, frame, now, errors)
+
+    def _find_reserved_takeover(self, frame, now, errors):
+        """先问一遍"预约"模块：它们即使排在最后也要有机会拿到运动权。
+
+        只调用**只读**的 `wants_control(frame, now)`，命中后再走正常的
+        `step()` 路径（`_step_line` 会把它的 update 交给 `_begin_takeover`）。
+        没有这个方法的模块完全不受影响；抛异常只记录、不打断主循环。
+        """
+        if not self.reservation_tasks:
+            return None
+        for task in self.reservation_tasks:
+            wants = getattr(task, RESERVATION_HOOK, None)
+            if not callable(wants):
+                continue
+            try:
+                if not wants(frame, now):
+                    continue
+            except Exception as error:
+                errors.append(f"{task.name} {RESERVATION_HOOK} raised: {error}")
+                continue
+            update = self._call(task.step, task.name, frame, now, errors)
+            if update is not None and update.status is TaskStatus.RUNNING:
+                errors.append(f"{task.name} took over via reservation")
+                return (task, update)
+        return None
 
     def _find_takeover(self, frame, now, errors, probe_all: bool = False):
         """按顺序问模块，返回第一个"想接管"的。
@@ -349,6 +409,9 @@ class TaskCoordinator:
         self.last_line_decision = decision
 
         if self.takeover_allowed:
+            # 注意：预约通道**不在这里**。没人开车时仍按注册表顺序问，
+            # 这样"岔路优先于标识"的裁定保持不变；饿死只发生在
+            # "已经有别的模块拿着运动权"的时候（见 _step_active）。
             takeover = self._find_takeover(frame, now, errors, probe_all=probe)
             if takeover is not None:
                 task, update = takeover
@@ -421,6 +484,16 @@ class TaskCoordinator:
                 message=f"red light veto: {task.name} paused",
                 errors=tuple(errors),
             )
+
+        # 预约接管：正在开车的模块跑够 min_hold 之后，让排在很后面的模块
+        # （例如 number_marker）有机会接手。红灯否决在上面，优先级更高。
+        if self._reservation_can_preempt(now, task):
+            takeover = self._find_reserved_takeover(frame, now, errors)
+            if takeover is not None and takeover[0] is not task:
+                other, other_update = takeover
+                return self._hand_over_to_reservation(
+                    task, other, other_update, now, errors
+                )
 
         update = self._call(task.step, task.name, frame, now, errors)
         if update is None:
@@ -511,6 +584,41 @@ class TaskCoordinator:
             message=message,
             errors=tuple(errors),
         )
+
+    def _reservation_can_preempt(self, now: float, current) -> bool:
+        """现在允许"预约"抢走运动权吗？
+
+        要求：已经有预约模块存在、当前任务不是预约模块之一、而且它已经
+        连续开了 `RESERVATION_MIN_HOLD_SECONDS` 以上 —— 否则两个模块会
+        每帧互相抢。红灯否决在调用处先判，所以红灯期间不会走到这里。
+        """
+        if not self.reservation_tasks or current is None:
+            return False
+        if any(current is task for task in self.reservation_tasks):
+            return False
+        started = self._active_started
+        if started is None:
+            return False
+        return (now - started - self._paused_seconds) >= RESERVATION_MIN_HOLD_SECONDS
+
+    def _hand_over_to_reservation(self, current, other, other_update, now, errors):
+        """把运动权从 `current` 交给预约模块 `other`（同一次调用内完成）。
+
+        不能用 `_release()` + `_begin_takeover()`：`_release` 会把状态机推进
+        RELEASING 并等"新帧确认路线"，那个握手在这里没有意义。这里做的是
+        原地交接：硬停 → 换 owner → 清巡线故障 → 让新模块接管。
+        """
+        errors.append(f"{current.name} handed over to {other.name} (reservation)")
+        self.output.hard_stop()
+        self.output.claim(OWNER_EXTERNAL)
+        self.follower.reset_fault(now)
+        self.active_task = None
+        self.active_task_name = None
+        self._active_started = None
+        self._paused_seconds = 0.0
+        self._release_started = None
+        self.state = LINE_FOLLOWING
+        return self._begin_takeover(other, other_update, now, errors)
 
     def _step_releasing(self, frame, now, errors) -> CoordinatorDecision:
         if self._view_restore_failed:

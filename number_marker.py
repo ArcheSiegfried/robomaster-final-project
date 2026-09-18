@@ -698,6 +698,37 @@ class NumberMarkerTask:
             self._queued_evidence = None
             self._evidence_outcome = None
 
+    def wants_control(self, frame: FramePacket, now: float) -> bool:
+        """只读体检：这一帧有没有"够大且没拍过"的标识，值不值得拿运动权。
+
+        这是给协调器的**预约通道**用的（见 `coordinator.RESERVATION_HOOK`）。
+        为什么需要它：仲裁是"按顺序问、遇到第一个 RUNNING 就停"，本模块排最后，
+        2026-09-18 实车 196 秒里被截断 9 次、**接管 0 次、一张标识照片都没存**
+        （标识 5 分/个、满 25 分）。只调注册表顺序救不了：提前就会挡住岔路/绕障。
+
+        严格与 `step()` 的接管判据一致（`is_marker_eligible`，即赛题要求的
+        ``width / frame_width > 0.20``）；已经锁定了目标时返回 False，
+        避免抢走正在收尾的拍照流程。
+
+        **必须只读且快**：协调器每帧都会调用它。这里的副作用只有
+        `_last_raw_target`（`detect()` 本来就会写），不改变状态机。
+        """
+        if self._target_id is not None:
+            return False
+        try:
+            selection = self.detect(frame, now, None)
+        except Exception:
+            return False
+        if selection is None:
+            return False
+        try:
+            height, width = frame.image.shape[:2]
+        except Exception:
+            return False
+        return is_marker_eligible(
+            selection.candidate, width, self.settings.min_marker_width_ratio
+        )
+
     def step(self, frame: FramePacket, now: float) -> TaskUpdate:
         """Run one bounded state transition for the current shared frame."""
 
