@@ -357,3 +357,104 @@ STOPPED 时任何模块都不许接管、钩子抛异常只记录不影响主循
 | 断线第一次没过 | route 视觉判据失败，非超时 | console.log 42.2s / 49.7s |
 
 **这些都没有修**，本文只记录诊断与证据。下一步优先级待用户决定。
+
+## 10. 第三次实车（三个短 run，`165321` / `165452` / `165522`）
+
+用户报告："中间断了 3 次，marker 还是没识别，避障一直调用的是 route"。
+三个 run 都在 30~80 秒内被人工重启。
+
+### 10.1 marker 依旧：SDK 回调全是空的
+
+`run_20260918_165522`：
+
+```
+## 数字标识观测（SDK marker 订阅）
+| callbacks | 3 | empty_callbacks | 3 |
+| markers_in_snapshot | 0 | observed_candidates | 0 |
+| callback_hz | 25.64 |
+```
+
+**回调频率 25.64 Hz 说明 SDK 的识别器在跑，只是什么都没认出来**（不是订阅没建起来）。
+三次 run 累计：callbacks 2 / 3，`observed_candidates` 恒为 0。
+→ `CONFIG.marker_color` 必须试 `"red"`；若仍为 0，就要怀疑**考场标牌不是
+DJI 官方 vision marker**，SDK 这条路走不通，得改成自己用相机帧识别。
+
+### 10.2 绕障：SDK 机器人框太小 / 判不出小车
+
+`run_20260918_165522`：
+
+```
+| callbacks | 808 | empty_callbacks | 788 | callback_hz | 25.26 |
+| observed_boxes | 31 | max_width_ratio | 0.034 | robots_in_snapshot | 0 |
+| 提醒 | 看到过的最宽机器人框只有画面宽的 3.4%（中心(457,98)），
+        低于模块要求的 6%：障碍模块会认为「太远」而不绕。把车开近些再复测。 |
+```
+
+对比 `run_20260918_164540` 的 `observed_boxes 2554 / max_width_ratio 0.3 /
+robots_in_snapshot 0`：**两次 run 都不是"没有框"，而是框从来没被 SDK 判成机器人**。
+`obstacle` 与 `free_junction` 的拥堵判据都依赖 `robots_in_snapshot`，所以：
+
+* `obstacle` 三次 run **接管 0 次**（拦截面 1/0/0 次，不是被饿死，是没目标）；
+* `free_junction` 退回图像判据后**在缺口处触发并选边**。
+
+### 10.3 "避障一直调用的是 route" —— 用户观察成立，但那是**丢线恢复**
+
+`run_20260918_165452`：
+
+```
+[  5.2s] 巡线 LINE_LOST —— 丢线，底座开始找回
+[  5.2s] >>> 模块开始运行：route ｜ task took over
+[  6.0s] route: crossing bounded blank; candidate history disabled during initial old-line clearance
+[  9.1s] -- 巡线 STOPPED | 任务 route          ← 人工停车
+```
+
+`route` 是**断线恢复**模块，它只在巡线进入 `LINE_LOST` 之后才接管
+（`route.step` 要求 `not line.valid` 且有下方旧线；骨架规定
+"长断线必须在短时容错边界之后接管"）。所以看到 `route` 就说明**车已经丢线了**，
+不是"避障调用了 route"。
+
+用真检测器复跑该 run 的关键帧，确认丢线是**真丢**（不是状态机误判）：
+
+```
+frame_000008_0000.00s.jpg  valid=True  conf=0.444
+frame_000069_0002.01s.jpg  valid=True  conf=0.896
+frame_000128_0004.01s.jpg  valid=True  conf=0.847
+frame_000190_0006.05s.jpg  valid=True  conf=0.765
+frame_000250_0008.05s.jpg  valid=False conf=0.000   ← 画面里确实没有可用的线
+frame_000310_0010.05s.jpg  valid=True  conf=0.886
+```
+
+喂给 `LineFollower` 后同样在 8.05s 判 `LINE_LOST`（`line-loss timeout;
+reset and resume required`）。所以**线段是真丢**，`route` 接管是正确反应。
+
+### 10.4 因果链（本次最重要的结论）
+
+三条证据指向同一条链：
+
+```
+free_junction 在没有官方机器人识别的情况下，凭图像判据判定"某侧拥堵"并选边
+        ↓（选了一条边 → 车跟着那条边走 → 离开了本来要走的线）
+巡线进入 LINE_LOST（真丢线）
+        ↓
+route 接管（断线恢复）
+        ↓
+用户看到"避障一直调用的是 route"
+```
+
+`free_junction` 在三次短 run 里分别接管 4 / 1 / 3 次，且 `165321` 里
+13.2s 那次 0.3 秒就 FAILED（`no vehicle on either branch`）——
+**它在没有拥堵证据时也会进接管流程**（有 `require_blockage_to_trigger` 挡着，
+但它用的是图像判据，不是官方识别）。
+
+**推论（未证实）**：第一个岔路口应该由 `green_junction`（选绿灯那侧）处理；
+`free_junction` 抢在它前面选边，很可能就是 10.4 那条链的起点。
+需要现场验证：**把 `free_junction` 暂时停用（或提高它的证据门槛），
+看车是否就不再丢线**。这一步会直接区分"free_junction 选错边"与"线本身有问题"。
+
+### 10.5 还没做的修复
+
+本轮**只做诊断，没有改任何代码**。待用户决定优先级，候选：
+1. `marker_color="red"` 试一次（一行配置，25 分）；
+2. 确认考场标牌是否为官方 marker（决定要不要改写识别方案）；
+3. `free_junction` 的证据门槛 / 与 `green_junction` 的竞争（10.4 那条链）；
+4. `obstacle` 对"框太小/没判成机器人"的处理（是否该退回自己的灰度判据并降低门槛）。
