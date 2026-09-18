@@ -806,14 +806,19 @@ def _startup_crash_report(error: BaseException):
     `build_coordinator()` **之前**，所以启动阶段一崩就什么都留不下 ——
     `captures/` 目录还没建，用户只看到满屏 SDK 栈，问"为什么没有报告"。
 
-    这份记录落在 `captures/crashes/`，内容包含：完整 traceback、本机所有
-    IPv4 地址、以及关键配置。绝不抛异常（它自己崩了就返回 None）。
+    位置：**锚定到本文件所在目录**（`main.py` 旁边的 `captures/crashes/`），
+    不跟当前工作目录走。2026-09-18 的教训：原来用相对路径，用户在
+    `py_project_vscode` 下启动，记录被写到工作区外面去了，找都找不到。
+
+    内容包含：完整 traceback、**所有非回环 IPv4 地址**、以及关键配置。
+    绝不抛异常（它自己崩了就返回 None）。
     """
     try:
         import datetime
         import traceback
 
-        directory = Path(DEFAULT_CAPTURE_DIRECTORY) / "crashes"
+        base = Path(__file__).resolve().parent
+        directory = base / DEFAULT_CAPTURE_DIRECTORY / "crashes"
         directory.mkdir(parents=True, exist_ok=True)
         stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         target = directory / ("crash_%s.txt" % stamp)
@@ -821,36 +826,66 @@ def _startup_crash_report(error: BaseException):
         lines = [
             "RoboMaster 启动/运行崩溃记录",
             "时间: %s" % datetime.datetime.now().isoformat(timespec="seconds"),
+            "工作目录: %s" % Path.cwd(),
+            "记录位置: %s" % directory,
             "",
             "== traceback ==",
             "".join(traceback.format_exception(
                 type(error), error, error.__traceback__
             )),
-            "== 本机 IPv4 地址 ==",
+            "== 本机 IPv4 地址（非回环）==",
         ]
-        try:
-            host = socket.gethostname()
-            for info in socket.getaddrinfo(host, None, socket.AF_INET):
-                lines.append("  %s" % (info[4][0],))
-        except Exception as lookup_error:
-            lines.append("  （取不到: %s）" % lookup_error)
+        addresses = _local_ipv4_addresses()
+        lines.extend("  %s" % item for item in (addresses or ["（一个都没取到）"]))
         lines += [
             "== 相关配置 ==",
-            "  ROBOT_AP_ADDRESS = 192.168.2.1",
-            "  ROBOT_AP_PORT    = 20020",
+            "  ROBOT_AP_ADDRESS = 192.168.2.1   （车固定地址）",
+            "  ROBOT_AP_PORT    = 20020         （UDP 控制端口）",
             "  video_gap_stop_seconds = %s" % getattr(
                 CONFIG, "video_gap_stop_seconds", "?"),
-            "  viewer = %s" % sys.executable,
+            "  解释器 = %s" % sys.executable,
             "",
-            "提示：SDK 连不上时会抛 `TypeError: exceptions must derive from",
-            "BaseException`（client.py:95 用字符串 raise），它**盖住了真原因**。",
-            "看本机有没有 192.168.2.x：没有就是没连上车的热点。",
-            "也可以跑 scripts/check_robot_link.py 直接问车在不在。",
+            "怎么读这份记录：",
+            "  1) 上面的 IPv4 里**有没有 192.168.2.x** —— 没有就是没连上车的热点",
+            "     （车的热点 SSID 形如 RMEP-XXXX；连不上时 Windows 可能回退到别的网）。",
+            "  2) 有 192.168.2.x 却仍失败 → 车没开机/控制服务卡住，重启车。",
+            "  3) SDK 连不上时会抛 `TypeError: exceptions must derive from",
+            "     BaseException`（client.py:95 用字符串 raise），它**盖住了真原因**，",
+            "     别被这行误导。",
+            "  4) 也可以跑 scripts/check_robot_link.py 直接问车在不在（带超时）。",
         ]
         target.write_text("\n".join(lines), encoding="utf-8")
         return target
     except Exception:
         return None
+
+
+def _local_ipv4_addresses():
+    """本机所有非回环 IPv4 地址。
+
+    不能用 `socket.getaddrinfo(gethostname())`：实测在 Windows 上常常只返回
+    127.0.0.1（2026-09-18 那份崩溃记录就只有回环地址，等于没用）。
+    这里用 UDP 路由查询法挨个目标问一次，能拿到真实网卡地址。
+    """
+    found = []
+    for target in (("192.168.2.1", 20020), ("192.168.1.1", 80), ("8.8.8.8", 53)):
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+                probe.settimeout(0.3)
+                probe.connect(target)
+                address = probe.getsockname()[0]
+        except Exception:
+            continue
+        if address and address not in found and not address.startswith("127."):
+            found.append(address)
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+            address = info[4][0]
+            if address and address not in found and not address.startswith("127."):
+                found.append(address)
+    except Exception:
+        pass
+    return found
 
 
 if __name__ == "__main__":
