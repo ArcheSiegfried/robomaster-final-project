@@ -40,7 +40,20 @@ import number_marker  # noqa: E402
 
 WIDTH = 640
 HEIGHT = 360
-BASE_CONFIG = NumberMarkerConfig(team_number="10")
+#: 历史边界语义：**触发门槛 = 计分门槛 = 0.20**（2026-09-18 之前的行为）。
+#: 下面那批测试钉的是"触发/跟踪边界的精确数值"（0.20 触发、0.17 跟踪）——
+#: 那是与两档设计无关的语义，所以这里把 trigger 压到和 min 一样，
+#: 边界仍然是 0.20 / 0.17，测试意图不变。
+BASE_CONFIG = NumberMarkerConfig(
+    team_number="10",
+    trigger_min_marker_width_ratio=0.20,
+    tracking_min_marker_width_ratio=0.17,
+)
+
+#: **当前默认两档配置**：触发 0.03 / 计分 0.20 —— 实车用的就是这个组合。
+#: 见 number_marker.NumberMarkerConfig.trigger_min_marker_width_ratio 的说明：
+#: 实测 SDK 报出来的标识只有画面宽 3.4%，若沿用 0.20 作触发门槛就会**死锁**。
+SPLIT_CONFIG = NumberMarkerConfig(team_number="10")
 
 
 def packet(sequence=1, now=1.0):

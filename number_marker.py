@@ -63,8 +63,22 @@ class MarkerState(str, Enum):
 class NumberMarkerConfig:
     """Module-local settings pending an integration-owned config migration."""
 
+    #: **计分门槛**：赛题"只瞄准宽度 > 画面宽 1/5 的标识"才**存图**。
+    #: 它管的是存图质量，不是"要不要接管"。
     min_marker_width_ratio: float = 0.20
-    tracking_min_marker_width_ratio: float = 0.17
+    #: **检测/接管门槛**（2026-09-18 新增）。
+    #:
+    #: 为什么必须和上面那个分开：实测（captures/run_20260918_175238）
+    #: SDK 报出来的标识框只有画面宽的 **3.4%**（22 像素），而接管门槛是 20%，
+    #: 于是模块永远 `TARGET_TOO_SMALL`、永远不接管、车也不会靠近，
+    #: 标识永远不会变大 —— **死锁，一分不得**。
+    #: 这不是"走慢一点"能解决的：要靠得近约 6 倍才够 20%。
+    #:
+    #: 分开之后：**看到**标识就允许接管去瞄准/靠近（本门槛），
+    #: "够不够大、要不要真的存图"仍由 `min_marker_width_ratio` 把关。
+    #: 默认取实测值（0.03）再留一点余量。
+    trigger_min_marker_width_ratio: float = 0.03
+    tracking_min_marker_width_ratio: float = 0.02
     aim_stable_frames: int = 3
     # Engineering interpretation of the ambiguous "1/10 marker size" center
     # region: these are full zone fractions, so the error limits are half.
@@ -400,7 +414,15 @@ class NumberMarkerTask:
     def _validate_settings(self) -> None:
         if not 0.0 < self.settings.min_marker_width_ratio < 1.0:
             raise ValueError("min_marker_width_ratio must be between 0 and 1")
-        if not 0.0 < self.settings.tracking_min_marker_width_ratio < self.settings.min_marker_width_ratio:
+        if not 0.0 < self.settings.trigger_min_marker_width_ratio < 1.0:
+            raise ValueError("trigger_min_marker_width_ratio must be between 0 and 1")
+        # 接管门槛**不得高于**计分门槛：否则就是"看到标识但够不着门槛 → 永远不接管
+        # → 车不靠近 → 标识永远不变大"的死锁（实车 3.4% vs 20%）。
+        if self.settings.trigger_min_marker_width_ratio > self.settings.min_marker_width_ratio:
+            raise ValueError(
+                "trigger_min_marker_width_ratio must not exceed min_marker_width_ratio"
+            )
+        if not 0.0 < self.settings.tracking_min_marker_width_ratio < self.settings.trigger_min_marker_width_ratio:
             raise ValueError("tracking_min_marker_width_ratio must be below the trigger threshold")
         if self.settings.aim_stable_frames < 1:
             raise ValueError("aim_stable_frames must be at least 1")
@@ -726,7 +748,8 @@ class NumberMarkerTask:
         except Exception:
             return False
         return is_marker_eligible(
-            selection.candidate, width, self.settings.min_marker_width_ratio
+            selection.candidate, width,
+            self.settings.trigger_min_marker_width_ratio,
         )
 
     def step(self, frame: FramePacket, now: float) -> TaskUpdate:
@@ -790,12 +813,15 @@ class NumberMarkerTask:
         if self._target_id is not None:
             if ratio < self.settings.tracking_min_marker_width_ratio:
                 return self._step_target_lost(frame, now, candidate)
-            if ratio > self.settings.min_marker_width_ratio and self._tracking_below_trigger:
+            # "恢复到可追踪"看的是**检测门槛**（够得着就继续跟），不是计分门槛。
+            if (ratio > self.settings.trigger_min_marker_width_ratio
+                    and self._tracking_below_trigger):
                 self._tracking_below_trigger = False
                 self._note_observation("TRACKING_RECOVERED", frame, now, candidate, emit=True)
 
+        # 接管用 trigger_*（看到就接管去瞄准）；min_* 只判"够不够格存图"。
         if self._target_id is None and not is_marker_eligible(
-            candidate, width, self.settings.min_marker_width_ratio
+            candidate, width, self.settings.trigger_min_marker_width_ratio
         ):
             self.state = MarkerState.TARGET_TOO_SMALL
             return TaskUpdate(
