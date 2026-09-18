@@ -129,6 +129,82 @@ class DetectorTests(unittest.TestCase):
         self.assertTrue(result.valid)
         self.assertEqual(result.color, "red")
 
+    def test_a_square_red_marker_is_not_a_red_light(self):
+        """2026-09-18 实车回归：**方形红色标识**被当成红灯，车停死 15 秒。
+
+        样本是那次运行的真实帧（`tests/samples/real_marker_square_red.jpg`，
+        frame_001155，38.16s）。画面里那块红色方形标牌画着数字 1：
+        aspect≈0.81、fill≈0.77，通过旧的"长条红物"形状门，圆度只有 0.74
+        也挡不住。它一旦被判成红灯，红灯 2 帧就接管 → 原地停到
+        `max_hold_seconds` 超时，而且 `number_marker` 的拍照会被优先级截断
+        （console.log 原话："优先级截断：… number_marker"）。
+
+        判据是径向一致性：方形四角半径比边长大 √2 倍，实测 0.179~0.291；
+        真圆灯实测 0.012~0.070。阈值 0.12。
+        """
+        sample = pathlib.Path(ROOT) / "tests" / "samples" / "real_marker_square_red.jpg"
+        self.assertTrue(sample.exists(), "缺少回归样本 %s" % sample)
+        image = cv2.imread(str(sample))
+        self.assertIsNotNone(image)
+
+        detector = TrafficLightDetector()
+        result = detector.detect(image)
+        self.assertFalse(
+            result.valid and result.color == "red",
+            "方形红色标识又被当成红灯了（车会停死 15 秒）: %s" % (result.color,),
+        )
+
+    def test_the_round_gate_does_not_weaken_green(self):
+        """松绿色、严红色：绿色候选不许被径向判据误删。
+
+        绿色误检**不会接管**（绿灯从 IDLE 永不接管），只在已停在红灯前时
+        用于放行；把它一起删掉等于削弱"绿灯放行"。所以闸门只对红灯生效。
+        """
+        sample = pathlib.Path(ROOT) / "tests" / "samples" / "real_marker_square_red.jpg"
+        image = cv2.imread(str(sample))
+        s = TrafficLightDetector().settings
+        height, width = image.shape[:2]
+        roi = image[0:int(height * s.roi_bottom),
+                    int(width * s.roi_left):int(width * s.roi_right)]
+        hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+        _, green_mask = TrafficLightDetector()._mask(hsv)
+        roi_height, roi_width = roi.shape[:2]
+        greens = TrafficLightDetector()._score(green_mask, roi_width, roi_height)
+        self.assertEqual(len(greens), 0,
+                         "这一帧本来就没有绿灯候选，测试前提要重新确认")
+
+    def test_a_round_red_lamp_still_passes_the_gate(self):
+        """补上反面：真圆红灯必须照旧被认出来，别把功能一起关掉。"""
+        image = blank_frame()
+        cv2.circle(image, (260, 120), 24, (0, 0, 220), -1)
+        result = TrafficLightDetector().detect(image)
+        self.assertTrue(result.valid, "圆红灯不该被径向判据挡掉")
+        self.assertEqual(result.color, "red")
+        self.assertAlmostEqual(result.center[0], 260, delta=6)
+
+    def test_the_gate_rejects_a_square_and_accepts_a_disc(self):
+        """直接量判据本身：正方形不合格、同样大小的圆合格。"""
+        detector = TrafficLightDetector()
+        square = np.zeros((80, 80), np.uint8)
+        square[20:60, 20:60] = 255
+        disc = np.zeros((80, 80), np.uint8)
+        cv2.circle(disc, (40, 40), 20, 255, -1)
+        square_ratio = max(
+            detector._radial_ratio(c)
+            for c in cv2.findContours(square, cv2.RETR_EXTERNAL,
+                                      cv2.CHAIN_APPROX_SIMPLE)[0]
+        )
+        disc_ratio = max(
+            detector._radial_ratio(c)
+            for c in cv2.findContours(disc, cv2.RETR_EXTERNAL,
+                                      cv2.CHAIN_APPROX_SIMPLE)[0]
+        )
+        gate = detector.settings.max_radial_ratio
+        self.assertGreater(square_ratio, gate, "正方形应该被判为不圆")
+        self.assertLess(disc_ratio, gate, "圆应该被判为圆")
+        self.assertGreater(square_ratio, disc_ratio * 2,
+                           "两者要拉得开，阈值才稳")
+
     def test_center_and_box_are_full_frame_coordinates(self):
         result = self.detector.detect(light_frame("red", center=(320, 120)))
         self.assertTrue(result.valid)

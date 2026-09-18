@@ -118,6 +118,27 @@ class TrafficLightConfig:
     min_aspect_ratio: float = 0.6
     min_fill_ratio: float = 0.5
 
+    #: **红灯专用**的径向一致性上限：std(半径)/mean(半径)，从质心量到轮廓。
+    #:
+    #: **为什么需要它**：2026-09-18 实车把标识当成红灯，车停死 15 秒、`number_marker`
+    #: 的拍照也被红灯按优先级截断。那个标识是**正方形**的红色标牌（画着数字 1），
+    #: aspect≈0.81、fill≈0.77 完美通过上面两条形状门 —— 那两条本是为"排除长条红物"
+    #: 设计的，而正方形两项都满足。圆度（circularity）也救不了：22×27 px 的轮廓
+    #: 锯齿太重，实测在 0.68~0.74 之间摇摆，阈值放 0.72 会时灵时不灵。
+    #:
+    #: 径向一致性对这件事**本来就能分开**，而且不怕锯齿：
+    #:   真圆灯（合成 r=6/10/15/28）实测 0.012 ~ 0.070
+    #:   误检的方形红色标识（真实场地帧）实测 0.179 ~ 0.291
+    #: 取 0.12 两边都留足余量。正方形四角半径比边长大 √2 倍，所以它天然 ≥0.12。
+    #:
+    #: **为什么只管红灯**：两类误判的后果差一个量级。红色误检会把车**停死**
+    #: （红灯 2 帧就接管、然后停到超时），必须严格；绿色误检**不会接管**
+    #: （绿灯从 IDLE 永不接管，只在已停在红灯前时用于放行），宽松一点更安全。
+    #: 实测（真实场地帧）：这条闸门干掉 7 个红色误检，同时会顺手删掉 19 个
+    #: **绿色标识/招牌图块** —— 那些是真实存在的目标，删了就削弱"绿灯放行"，
+    #: 所以绿色不套这条。
+    max_radial_ratio: float = 0.12
+
     # Scoring weights; confidence = score / (sum of weights) -> full mark = 1.0.
     vertical_weight: float = 1.2
     center_weight: float = 0.8
@@ -203,10 +224,34 @@ class TrafficLightDetector:
         green_mask = cv2.morphologyEx(green_mask, cv2.MORPH_CLOSE, kernel_close)
         return red_mask, green_mask
 
+    @staticmethod
+    def _radial_ratio(contour: np.ndarray) -> float:
+        """轮廓的径向一致性：``std(半径) / mean(半径)``（从质心量到轮廓各点）。
+
+        真圆接近 0；正方形四角比边长大 √2 倍，所以天然偏大。见
+        `max_radial_ratio` 的说明：这是把"方形红色标识"从"圆形红灯"里分出来的判据。
+        取不到足够点时保守地返回 1.0（= 不合格），宁可漏报也不误停。
+        """
+        points = contour.reshape(-1, 2).astype(np.float64)
+        if len(points) < 5:
+            return 1.0
+        center_x = points[:, 0].mean()
+        center_y = points[:, 1].mean()
+        radii = np.hypot(points[:, 0] - center_x, points[:, 1] - center_y)
+        mean = float(radii.mean())
+        if mean <= 1e-6:
+            return 1.0
+        return float(radii.std() / mean)
+
     def _score(
-        self, mask: np.ndarray, width: int, height: int
+        self, mask: np.ndarray, width: int, height: int, require_round: bool = False
     ) -> List[Tuple[float, Tuple[int, int], Tuple[int, int, int, int]]]:
-        """Score blobs by shape (roundness), size, coverage and centering."""
+        """Score blobs by shape (roundness), size, coverage and centering.
+
+        ``require_round=True`` 时额外要求径向一致性合格 —— **只给红灯用**，
+        用来把方形红色标识挡在外面（见 `max_radial_ratio`）。绿灯不套这条：
+        绿色误检不会接管，削弱它反而会削弱"绿灯放行"。
+        """
         s = self.settings
         frame_area = max(width * height, 1)
         candidates = []
@@ -228,6 +273,12 @@ class TrafficLightDetector:
                 continue
             fill = area / max(w * h, 1)
             if fill < s.min_fill_ratio:
+                continue
+            # 灯是**圆**的。2026-09-18 实车教训：画着数字的**方形**红色标识
+            # aspect/fill 都合格（0.81 / 0.77），被当成红灯把车停死 15 秒。
+            # 这条把它挡掉：方形实测 0.179~0.291，真圆灯 0.012~0.070。
+            # 只对红灯生效（require_round），绿灯不套 —— 见 max_radial_ratio。
+            if require_round and self._radial_ratio(contour) > s.max_radial_ratio:
                 continue
             center_x = x + w / 2.0
             center_y = y + h / 2.0
@@ -264,7 +315,9 @@ class TrafficLightDetector:
         hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
         red_mask, green_mask = self._mask(hsv)
         roi_height, roi_width = roi.shape[:2]
-        red_candidates = self._score(red_mask, roi_width, roi_height)
+        # 红灯必须"圆"（挡掉方形红色标识）；绿灯不套这条，见 max_radial_ratio。
+        red_candidates = self._score(red_mask, roi_width, roi_height,
+                                     require_round=True)
         green_candidates = self._score(green_mask, roi_width, roi_height)
 
         best_red = max(red_candidates, default=None)
