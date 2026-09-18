@@ -279,3 +279,81 @@ STOPPED 时任何模块都不许接管、钩子抛异常只记录不影响主循
 
 **未验证**：预约通道对那次真实 run 的实际改善没有回放验证，
 也**没有任何实车验证**。要确认 `number_marker` 真的开始拍照，需要再跑一次场地。
+
+## 9. 第二次实车（2026-09-18，`run_20260918_164540`）暴露的四个真问题
+
+这次跑完，预约通道**没有生效**（console.log 里 `reservation` 痕迹 0 处）。
+查 `report.md` 的接线层自检，根因不在仲裁，而在**上游根本没数据**：
+
+### 9.1 数字标识：SDK 一个 marker 都没给
+
+```
+## 数字标识观测（SDK marker 订阅）
+| subscribed | True | callbacks | 2 | empty_callbacks | 2 |
+| markers_in_snapshot | 0 | observed_candidates | 0 |
+| 提醒 | 还没有收到任何 marker 回调。 |
+```
+
+整场 156 秒只回调 **2 次、且都是空的**。所以 `number_marker.wants_control()`
+永远没机会返回 True —— **预约通道没生效是因为它上游没数据，不是通道本身坏了**。
+
+排查方向（按顺序）：
+1. `CONFIG.marker_color` 目前是空字符串（不设过滤器）。`marker_source.py:30` 自己写着
+   "一直收不到任何 marker 就把 color 依次改成 red / green / blue 再试"。
+   现场看到的标识是一块**红色方牌**（`tests/samples/real_marker_square_red.jpg`），
+   先试 `"red"`。
+2. 确认考场那些标牌**是不是 DJI 官方 vision marker**。如果只是打印的号码牌，
+   SDK 的 marker 识别永远不会有回调，必须换方案（自己用相机帧识别）。
+3. `coordinate_mode` 是 `auto`，回调进来后要核对它判成像素还是归一化。
+
+### 9.2 绕障 / 拥堵：SDK 识别到 2554 个框，0 个"小车"
+
+```
+## 障碍物观测（SDK 机器人识别）
+| callbacks | 2629 | callback_hz | 22.86 |
+| observed_boxes | 2554 | max_width_ratio | 0.3 | widest_robot_at | 中心(534,192) |
+| robots_in_snapshot | 0 |
+```
+
+识别**在跑**、画面里也有东西（2554 个框、最宽 0.3 倍画面），但 SDK **一次都没
+把它判成机器人**。`obstacle` 与 `free_junction` 的拥堵判据都依赖它，所以：
+`obstacle` 接管 0 次；`free_junction` 只能退回"图像判据"
+（日志：`official robot detection unavailable (0 sightings so far; picture criterion)`），
+于是**在第一个岔路口就抢在 green_junction 前面接管**，还 FAILED 过一次
+（`no vehicle on either branch`）。
+
+### 9.3 第一个岔路口为什么先被 free_junction 抢走
+
+两个模块的触发条件**不对等**：
+* `free_junction` 不需要灯就能接管（官方识别不可用时退回图像判据）；
+* `green_junction` 要 **3 帧确认岔路 + 一个绿灯读数**（A14/A15），天然慢 3 帧。
+
+实测时序：`[14.5s] free_junction` 先抢到并"完成"，`[18.4s] green_junction`
+才在下一个岔路口完成。用户观察"一开始是 free_junction，后来变成 green_junction
+且成功通过"与日志一致。
+
+### 9.4 断线：两次都是**判据失败**，不是超时
+
+```
+[42.2s] route 接管 | 云台 pitch=-12 | crossing bounded blank along old-route tangent
+[45.5s] 巡线 STOPPED                      ← 用户看到的"第一次停住了"
+[48.2s] Resumed on a fresh valid line
+[49.7s] route 又接管 | 云台 pitch=-25 | lowering camera; stopped before endpoint approach
+[52.4s] route（FAILED，共 2.7s）
+[78.3s] Resumed on a fresh valid line     ← "退一段再启动又好了"
+```
+
+`route` 只在接管后 2~4 秒就 FAILED（模块预算有 19 秒），说明卡在视觉判据
+（`crossing bounded blank` / `stopped before endpoint approach`），
+不是没时间。用户"退一段重启就好了"= 人退车后巡线重新接上、后续岔路正常通过。
+
+### 结论：这次三个抱怨里，两个的根因在 **SDK 侧没有数据**，不在仲裁或阈值
+
+| 抱怨 | 根因 | 证据 |
+|---|---|---|
+| marker 没识别/没拍照 | SDK marker 回调 2 次全空 | `report.md` 数字标识小节 |
+| 避障识别不到小车 | SDK 识别 2554 框、0 个机器人 | `report.md` 障碍物小节 |
+| 第一个岔路先 free 后 green | 两模块触发条件不对等（free 不需灯） | console.log 14.5s / 18.4s |
+| 断线第一次没过 | route 视觉判据失败，非超时 | console.log 42.2s / 49.7s |
+
+**这些都没有修**，本文只记录诊断与证据。下一步优先级待用户决定。
