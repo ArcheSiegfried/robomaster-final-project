@@ -14,7 +14,14 @@ Design assumptions (module-local, adjustable, see TrafficLightConfig):
   and fill ratio) keep the wide range from matching long red/green objects.
 - Red and green never light at the same time; if both are detected (glare,
   other objects), "red" wins by default: stopping is always safer than an
-  unconfirmed release.
+  unconfirmed release. **Exception, and it is the default: a fork.** When red
+  and green are both visible in one frame, the scene is the fork of task 4
+  ("left red / right green"), where the car must pick the green side instead
+  of stopping. This module reports "no result" there and never takes over
+  (`fork_light_competition`), because it only knows colour, not which side the
+  lamp is on; choosing the branch belongs to `green_junction`. The self-chosen
+  "stop on red / go on green" spot (task 6) has a single lamp and is
+  unaffected.
 - Green confirmation tolerates dropped frames: a missing green inside
   `green_gap_grace` does NOT reset the streak, so 1-2 frame flicker or a video
   hiccup cannot hold the car forever in front of a lit green lamp.
@@ -119,7 +126,22 @@ class TrafficLightConfig:
     coverage_full_ratio: float = 0.20
 
     # If both colours are visible in one frame, treat it as red (conservative).
+    # **只有当 `fork_light_competition` 关掉时这一条才生效**，见下面那个开关。
     red_priority: bool = True
+
+    # 红绿同框（岔路口的"左红右绿"，赛题 4）时本模块**不接管**。
+    #
+    # 为什么必须是默认行为：岔路口红绿两盏灯同框，而本模块只认颜色不认位置，
+    # `red_priority` 会把这一帧判成红灯 → 2 帧后接管 → 原地停到
+    # `max_hold_seconds` 超时。而 `green_junction` 要 3 帧才确认岔路，
+    # 所以它永远赢不了这场赛跑；灯模块接管之后，协调器的红灯否决权又会把岔路
+    # 模块按停（否决时**不调用**它的 step）。实测后果：600 帧里 599 帧零指令，
+    # 车钉死在第一岔路口，赛题 4 的 15 分丢失。
+    #
+    # "往绿灯那侧走"的判据本来就归 `green_junction`（它内置的 LampSpotter 会
+    # 同时报出红绿两盏以及各自在画面哪一边）。自选地点的"红灯停绿灯行"
+    # （赛题 6）按定义只有一盏灯，不受这条影响。
+    fork_light_competition: bool = True
 
     # Scoring-image config: the final score counts saved images, e.g.
     # "Team 10 detects a red light and stops the robot". One screenshot is
@@ -248,7 +270,14 @@ class TrafficLightDetector:
         best_red = max(red_candidates, default=None)
         best_green = max(green_candidates, default=None)
         if best_red is not None and best_green is not None:
-            # Both visible: conservative choice, never release on doubt.
+            # 红绿同框 = 岔路口的"左红右绿"（赛题 4），不是"自选地点的红灯停"
+            # （赛题 6，那里只有一盏灯）。两盏同时可见时我们**不报**其中任何一盏：
+            # 只认颜色不认位置的读数在岔路口必然把车按停（实测 599/600 帧零指令，
+            # 见 tests/test_red_light_veto.py 的 fork 用例），而"往绿灯那边走"的
+            # 判据归 green_junction（它的 LampSpotter 会同时报出两盏和各自在哪边）。
+            # 关掉 fork_light_competition 就退回旧的"红优先"行为。
+            if s.fork_light_competition:
+                return VisualDetection.no_result("traffic_light")
             if s.red_priority:
                 best_green = None
             else:
@@ -259,6 +288,35 @@ class TrafficLightDetector:
         if best_green is not None:
             return self._detection("green", best_green, left, top)
         return VisualDetection.no_result("traffic_light")
+
+    def sees_both_colours(self, frame: np.ndarray) -> bool:
+        """这一帧是否同时看到红和绿（= 岔路口"左红右绿"，赛题 4）。
+
+        `detect()` 在红绿同框时按 `fork_light_competition` 返回"无结果"，
+        所以任务层需要这个**独立**判据来区分两种"没结果"：
+          * 真的没有灯 → 保持原来的行为；
+          * 红绿同框 → 这是岔路口，本模块不该接管（见 Task 里的闸门）。
+        只允许在"本来就没报出颜色"的帧上调用；它只回答"两色是不是都在"。
+        """
+        if frame is None or frame.ndim != 3 or frame.shape[2] != 3:
+            return False
+        height, width = frame.shape[:2]
+        s = self.settings
+        left = int(width * s.roi_left)
+        right = int(width * s.roi_right)
+        top = int(height * s.roi_top)
+        bottom = int(height * s.roi_bottom)
+        if right <= left or bottom <= top:
+            return False
+        roi = frame[top:bottom, left:right]
+        if roi.size == 0:
+            return False
+        hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+        red_mask, green_mask = self._mask(hsv)
+        roi_height, roi_width = roi.shape[:2]
+        red = self._score(red_mask, roi_width, roi_height)
+        green = self._score(green_mask, roi_width, roi_height)
+        return bool(red) and bool(green)
 
     @staticmethod
     def _detection(
@@ -419,6 +477,21 @@ class TrafficLightTask:
         color = detection.color if detection.valid else None
 
         if self._state == IDLE:
+            if (
+                getattr(s, "fork_light_competition", True)
+                and not detection.valid
+                and self.detector.sees_both_colours(frame.image)
+            ):
+                # 岔路口（红绿同框）：选道判据归 green_junction。
+                # 本模块从 IDLE 状态**绝不接管**，否则它会只认颜色不认位置、
+                # 在第 2 帧就把车按在岔路口（见 TrafficLightConfig 里的说明）。
+                self._red_streak = 0
+                self._green_streak = 0
+                return TaskUpdate(
+                    TaskStatus.NOT_TRIGGERED,
+                    detection=detection,
+                    message="red+green in one frame; a fork decides by light colour",
+                )
             if color == RED:
                 self._red_streak += 1
                 if self._red_streak >= s.red_confirm_frames:

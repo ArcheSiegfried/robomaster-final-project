@@ -103,11 +103,29 @@ class DetectorTests(unittest.TestCase):
         result = self.detector.detect(light_frame("red", radius=3))
         self.assertFalse(result.valid)
 
-    def test_red_wins_when_both_colours_visible(self):
+    def test_both_colours_visible_reports_no_result(self):
+        """红绿同框 = 岔路口的"左红右绿"（赛题 4），本模块不报任何一盏。
+
+        它只认颜色不认位置：在岔路口报红会把车原地锁停，把"往绿灯那边走"
+        的 15 分让给一个停着不动的车。修复前这里是"红优先"，实测后果是
+        600 帧里 599 帧零指令（见 tests/test_fork_light_competition.py）。
+        """
         image = blank_frame()
         cv2.circle(image, (260, 120), 22, (0, 0, 220), -1)
         cv2.circle(image, (380, 120), 22, (0, 200, 0), -1)
         result = self.detector.detect(image)
+        self.assertFalse(result.valid)
+        self.assertIsNone(result.color)
+
+    def test_red_priority_still_available_when_the_fork_gate_is_off(self):
+        """关掉岔路闸门就退回旧行为（留一个现场临时回退的口子）。"""
+        detector = TrafficLightDetector(
+            TrafficLightConfig(fork_light_competition=False)
+        )
+        image = blank_frame()
+        cv2.circle(image, (260, 120), 22, (0, 0, 220), -1)
+        cv2.circle(image, (380, 120), 22, (0, 200, 0), -1)
+        result = detector.detect(image)
         self.assertTrue(result.valid)
         self.assertEqual(result.color, "red")
 

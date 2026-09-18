@@ -20,26 +20,34 @@ from traffic_light import TrafficLightTask
 
 # 功能模块：一个文件 = 一个名额 = 一个人。顺序即接管优先级。
 #
-# 2026-09-17 变更（集成负责人确认）：**`traffic_light.py` 回来了**（3 号 ASmoon540 重新提交）。
-# 它 09-16 被删的理由是"实车上反复把红色物体判成红灯并原地锁停"，这版把那条治了：
-#   * 红灯 2 帧就停、绿灯 5 帧 + 0.30s 丢帧宽限才放行（停得快、放得慢，偏向安全）；
-#   * **"总停车时钟"（`max_hold_seconds=15`）不被绿灯闪断重置** → 卡死最终一定 FAILED，
-#     不会像老版本那样无限锁停；
-#   * **绿灯从 IDLE 状态永不接管**（绿灯只用来"放行"，不抢正在开车的车）；
-#   * 顺带把红灯的得分截图接上了 evidence 通道（`Team 10 detects a red light and stops the robot`）。
-# 位置放回第 1 位（红绿灯是安全项）。两个副作用都要知道：
-#   1. `coordinator.py` 的"红灯否决权"**重新生效**：任何任务在开车时遇到红灯都会被暂停
-#      （暂停时间不计入任务预算），红灯消失后原任务继续；
-#   2. 灯色判据现在**两个模块都有**（本模块 + `green_junction` 的内置认灯器）；岔路口的
-#      绿灯仍归 `green_junction`（本模块绿灯不接管）。
-# 老提醒仍然成立：`obstacle` 优先于岔路/巡回/标识接管。
+# 2026-09-18 变更（按期末考场场景顺序重排，用户批准）：
+# 依据是决赛要求 PDF（16-Final_Project_Requirements v8）第 41 页的六项现场任务顺序：
+# 岔路选绿灯那侧 → 绕障 → 岔路避开拥堵 → 断线恢复 → 红灯停绿灯行 → 标识 1~5 拍照。
+# 而考场第一个岔路口是**左红右绿**：`traffic_light` 排第 1 时只认颜色不认位置，
+# 红灯 2 帧就返回 RUNNING + 零运动原地锁停，会把 `green_junction` 的选路权整个吃掉
+# （15 分），所以岔路选路必须排在它前面。
+#
+#   1 green_junction  第一岔路：左红右绿，往绿灯那侧走（赛题 4）
+#   2 obstacle        绕障：车头前的障碍必须先处理（赛题 3）
+#   3 free_junction   第二岔路：避开停着小车的拥堵岔路（赛题 5）
+#   4 route           断线恢复：线消失才触发，优先级高于"选路"（赛题 2）
+#   5 traffic_light   自选地点红灯停绿灯行（赛题 6）
+#   6 number_marker   标识 1~5 拍照计分，不抢在会动作的模块前面（赛题 1）
+#
+# 两个必须知道的点：
+#   1. `traffic_light` 移到第 5 位**不影响红灯停车**：`coordinator.py` 的"红灯否决权"
+#      是按 **name** 在任务列表里找它（`coordinator.py:127-129`），与位次无关，
+#      所以任何任务在开车时遇到红灯仍会被暂停（暂停时间不计入任务预算）；
+#   2. `green_junction` 的认灯判据**不依赖** `traffic_light` 模块：
+#      它自带 `builtin_lamp_detection`（`green_junction.py:689`）和
+#      `red_blocks_branch`（A18），降到第 5 位不会让第一岔路失去判据。
 MOTION_TASK_CLASSES = (
-    TrafficLightTask,  # 1 红绿灯（红灯停、绿灯确认后放行）
-    GreenJunctionTask,  # 2 红绿灯岔路
-    ObstacleTask,  # 3 障碍物绕行
-    RouteTask,  # 4 短线巡回
-    FreeJunctionTask,  # 5 障碍物岔路
-    NumberMarkerTask,  # 6 数字识别
+    GreenJunctionTask,  # 1 第一岔路：左红右绿，往绿灯那侧走（赛题 4）
+    ObstacleTask,  # 2 绕障（赛题 3）
+    FreeJunctionTask,  # 3 第二岔路：避开拥堵（赛题 5）
+    RouteTask,  # 4 断线恢复（赛题 2）
+    TrafficLightTask,  # 5 自选地点红灯停绿灯行（赛题 6）
+    NumberMarkerTask,  # 6 标识 1~5 拍照（赛题 1）
 )
 
 # 基础设施观察者：每帧都能看到，但永远不能接管运动。
