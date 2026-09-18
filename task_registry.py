@@ -10,6 +10,7 @@
 `tests/test_task_contract.py` 会直接失败并告诉你该加到哪一行。
 """
 
+from control_arbiter import LINE_PRIORITY, SAFETY_PRIORITY
 from evidence import EvidenceRecorder
 from free_junction import FreeJunctionTask
 from green_junction import GreenJunctionTask
@@ -47,6 +48,54 @@ MOTION_TASK_CLASSES = (
 OBSERVER_CLASSES = (
     EvidenceRecorder,
 )
+
+# ---------------------------------------------------------------------------
+# 显式优先级表（2026-09-18，仲裁层 v0.3）
+#
+# 数值顺序 = 与集成负责人确认过的接管顺序（见 tests/test_task_registry_order.py
+# 顶部注释："红绿灯 → 红绿灯岔路 → 障碍物绕行 → 短线巡回 → 障碍物岔路 → 数字识别"）。
+# **本次不改动任何既有优先级**：这张表就是把原来的"元组位置"写成显式数字。
+#
+# 为什么要显式化：元组位置表达优先级太脆 —— 往中间插一行就会静默改掉所有人的相对
+# 优先级（`number_marker` 就是这样从第 2 位掉到最末的）。有了这张表，
+# tests/test_task_registry_order.py 会同时锁住"表里的降序展开 == 原来的元组顺序"，
+# 插新模块必须显式给出优先级，否则测试直接红。
+#
+# 90 = 安全级（`control_arbiter.SAFETY_PRIORITY`）：可以**随时**抢占任何正在开车的
+# 模块。今天只有红绿灯（红灯停）在这一级。
+# ---------------------------------------------------------------------------
+TASK_PRIORITIES = {
+    "traffic_light": 90,
+    "green_junction": 80,
+    "obstacle": 70,
+    "route": 60,
+    "free_junction": 50,
+    "number_marker": 40,
+}
+
+
+def priority_of(task_or_name) -> int:
+    """取一个任务类/实例/名字的优先级；未登记的名字按巡线处理（最低）。"""
+    name = task_or_name if isinstance(task_or_name, str) else getattr(
+        task_or_name, "name", task_or_name)
+    return TASK_PRIORITIES.get(name, LINE_PRIORITY)
+
+
+def ranked_task_classes():
+    """按优先级降序排列的注册表（同优先级保持注册顺序，保证确定性）。"""
+    return tuple(
+        sorted(
+            MOTION_TASK_CLASSES,
+            key=lambda cls: (-priority_of(cls), MOTION_TASK_CLASSES.index(cls)),
+        )
+    )
+
+
+# 让每个任务类自己带上优先级：协调器读 `task.priority`，不必认识这张表。
+# 只给类挂一个只读属性，**不改任何成员模块的源码**。
+for _task_class in MOTION_TASK_CLASSES:
+    if not hasattr(_task_class, "priority"):
+        _task_class.priority = priority_of(_task_class)
 
 
 def build_motion_tasks(enabled_names=None):

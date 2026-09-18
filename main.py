@@ -258,6 +258,8 @@ class ConsoleStatus:
         self._lost_since = None
         self._last_heartbeat = None
         self._errors: tuple = ()
+        #: 最近一次打过的控制权变更行（同一行不重复打）。
+        self._owner_change = None
 
     # -- 对外 ----------------------------------------------------------
     def note(self, text: str) -> None:
@@ -287,8 +289,9 @@ class ConsoleStatus:
     def _modules_after(self, name):
         """排在赢家后面、这一帧根本没被问到的模块（调优先级用）。
 
-        协调器按注册表顺序依次问，遇到第一个返回 RUNNING 的模块就接管，所以
-        排在它后面的模块这一帧不会被调用。这个信息是免费的——不需要额外问任何模块。
+        协调器按**优先级顺序**依次问（`task_registry.TASK_PRIORITIES`），遇到第一个
+        返回 RUNNING 的模块就接管，所以排在它后面的模块这一帧不会被调用。
+        这个信息是免费的——不需要额外问任何模块。
         """
         order = list(self.task_order)
         if not name or name not in order:
@@ -354,6 +357,14 @@ class ConsoleStatus:
                 # 忘掉过渡期的巡线状态，回到巡线后再重新报一次真实状态。
                 self._line_state = None
 
+        # 控制权变更（仲裁器 v0.3）：谁把车交给了谁、为什么、优先级差多少。
+        # 由协调器在 CoordinatorDecision.owner_change 里给出文本，这里只负责打印
+        # （协调器不 print，保持它"不碰终端/相机/网络"的分层）。
+        owner_change = getattr(decision, "owner_change", None)
+        if owner_change and owner_change != self._owner_change:
+            self._owner_change = owner_change
+            self._say(now, owner_change)
+
         line_state = getattr(getattr(decision, "line", None), "state", None)
         if line_state is not None and line_state != self._line_state:
             self._line_state = line_state
@@ -403,13 +414,15 @@ class ConsoleStatus:
         parts = ["竞争探测：本帧问了 %d 个模块" % len(claims)]
         if wanted:
             parts.append("想接管 → %s" % "、".join(
-                "%s(%s)" % (c.get("name"), (c.get("message") or "—")[:28]) for c in wanted))
+                "%s(p%s: %s)" % (c.get("name"), c.get("priority", "?"),
+                                 (c.get("message") or "—")[:28])
+                for c in wanted))
         else:
             parts.append("无人想接管 → 继续巡线")
         if quiet:
             parts.append("不想 → %s" % "、".join(str(c.get("name")) for c in quiet))
         if wanted:
-            parts.append("判给 %s（顺序里第一个想接管的）" % wanted[0].get("name"))
+            parts.append("判给 %s（优先级最高的）" % wanted[0].get("name"))
         return "?? " + " ｜ ".join(parts)
 
     def _heartbeat_text(self, decision, now: float) -> str:

@@ -133,18 +133,26 @@ def blank_frame(height=360, width=640):
 class TaskHarness:
     """Wire one module into the real coordinator with fake hardware."""
 
-    def __init__(self, task=None, observer=None, config=CONFIG):
+    def __init__(self, task=None, observer=None, config=CONFIG, tasks=None):
         self.config = config
         self.chassis = FakeChassis()
         self.follower = LineFollower(config)
         self.output = MotionOutput(self.chassis, config)
         self.gimbal = FakeGimbal()
         self.gimbal_output = GimbalOutput(self.gimbal, config)
+        #: `tasks=` 挂多个任务（仲裁相关测试要同时看两个模块的竞争）；
+        #: `task=` 是原来的单模块写法，保持兼容。
+        if tasks is not None:
+            motion_tasks = tuple(tasks)
+        elif task is None:
+            motion_tasks = ()
+        else:
+            motion_tasks = (task,)
         self.coordinator = TaskCoordinator(
             config,
             self.follower,
             self.output,
-            motion_tasks=() if task is None else (task,),
+            motion_tasks=motion_tasks,
             observers=() if observer is None else (observer,),
             gimbal_output=self.gimbal_output,
         )

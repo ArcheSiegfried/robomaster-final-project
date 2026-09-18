@@ -65,5 +65,39 @@ class RegistryOrderTests(unittest.TestCase):
                          "装出来的实例顺序必须和注册表一致（终端显示的就是它）")
 
 
+class PriorityTableTests(unittest.TestCase):
+    """显式优先级表必须与"顺序即优先级"完全一致（2026-09-18 仲裁层 v0.3）。"""
+
+    def test_priority_table_matches_the_confirmed_order(self):
+        ordered = [
+            name
+            for name, _ in sorted(
+                task_registry.TASK_PRIORITIES.items(), key=lambda item: -item[1]
+            )
+        ]
+        self.assertEqual(tuple(ordered), EXPECTED_ORDER)
+
+    def test_safety_priority_constant_equals_the_top_module(self):
+        top = max(task_registry.TASK_PRIORITIES, key=task_registry.TASK_PRIORITIES.get)
+        self.assertEqual(top, "traffic_light")
+        self.assertEqual(task_registry.TASK_PRIORITIES[top], task_registry.SAFETY_PRIORITY)
+
+    def test_every_registered_class_exposes_its_priority(self):
+        for cls in task_registry.MOTION_TASK_CLASSES:
+            self.assertEqual(cls.priority, task_registry.TASK_PRIORITIES[cls.name])
+
+    def test_ranked_task_classes_is_the_priority_order(self):
+        self.assertEqual(
+            tuple(cls.name for cls in task_registry.ranked_task_classes()),
+            EXPECTED_ORDER,
+        )
+
+    def test_priority_of_accepts_a_name_a_class_and_an_instance(self):
+        self.assertEqual(task_registry.priority_of("obstacle"), 70)
+        self.assertEqual(task_registry.priority_of(task_registry.ObstacleTask), 70)
+        self.assertEqual(task_registry.priority_of(task_registry.ObstacleTask()), 70)
+        self.assertEqual(task_registry.priority_of("not_registered"), task_registry.LINE_PRIORITY)
+
+
 if __name__ == "__main__":
     unittest.main()
