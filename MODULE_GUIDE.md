@@ -304,8 +304,8 @@ python -m unittest discover -s tests -v
 每个文件已在 `task_registry.py` 里登记好，组员**只替换文件内容**即可：
 
 ```python
-MOTION_TASK_CLASSES = (GreenJunctionTask, ObstacleTask, ...)  # 可接管运动，顺序即优先级
-OBSERVER_CLASSES = (EvidenceRecorder,)                            # 每帧可见，永不接管
+TASK_PRIORITIES = {"traffic_light": 90, "green_junction": 80, ...}  # 显式接管优先级
+OBSERVER_CLASSES = (EvidenceRecorder,)                              # 每帧可见，永不接管
 ```
 
 漏登记不会静默失效：`tests/test_task_contract.py` 会扫出根目录下所有带
@@ -341,8 +341,12 @@ class YourObserver:
 |---|---|
 | 唯一运动出口 | 只有 `coordinator.py` 调用 `MotionOutput`；模块只返回 `MotionCommand` |
 | 接管时机 | 仅当基础巡线处于 `TRACKING` / `COASTING` / `LINE_LOST` 时可接管；`STOPPED`（人工暂停或复位后）和 `VIDEO_LOST` **一律不许**，模块不可能自己启动车 |
-| 接管顺序 | 按 `MOTION_TASK_CLASSES` 顺序询问，第一个返回 `RUNNING` 的拿到控制权 |
-| 唯一 owner | 接管期间其他模块不再被询问 |
+| 接管顺序 | 按 `task_registry.TASK_PRIORITIES` **优先级降序**询问，第一个返回 `RUNNING` 的拿到控制权（数值与"顺序即优先级"时代**完全一致**：`traffic_light` 90 → `green_junction` 80 → `obstacle` 70 → `route` 60 → `free_junction` 50 → `number_marker` 40） |
+| 唯一 owner | 一帧只有一个模块能下发运动指令（`control_arbiter.ControlArbiter` 决定）；接管期间只问"优先级更高的模块 + 当前任务" |
+| 安全级抢占 | 优先级 ≥ 90 的模块（今天只有红绿灯）**可以随时抢占**任何正在开车的模块，把车停住；其余模块默认不能中途抢占（见下） |
+| 租约 TTL | 模块每次返回 `RUNNING` 就是一次续租；连续多帧不被调用或不再返回 `RUNNING` 时控制权会失效并交回（硬停 → 归还巡线） |
+| 卡死保护 | 同一模块**连续 5 帧**单步耗时超过 `max_step_seconds` 会被强制释放并硬停车（原来只记一条 error） |
+| 任务时钟 | 传给 `step()` 的 `now` **只累计该模块真正被调用的时段**。被跳过的帧、被红灯冻结的帧不计入 —— 所以"等红灯/被别人开车"不会把模块自己的墙钟超时耗掉 |
 | 命令限幅 | 前进 ≤ 0.30 m/s、横移 ≤ 0.25 m/s、yaw ≤ 90 deg/s（见 `config.TaskConfig`），超限自动裁剪并写入 `decision.errors` |
 | 数值安全 | `nan` / `inf` 一律置零 |
 | 硬超时 | 单个任务连续接管超过 20 秒被强制释放并硬停车 |
@@ -353,6 +357,21 @@ class YourObserver:
 
 **一旦返回 `RUNNING`，就必须持续返回 `RUNNING`，直到返回 `COMPLETED` 或 `FAILED`。**
 中途返回 `NOT_TRIGGERED` 会被判为失败并强制归还控制权。
+
+**关于"抢占"（`preempt_all`）**：默认 **关闭**。关闭时，一个模块开车期间只有安全级
+（优先级 ≥ 90，即红绿灯）能抢它；其他模块必须等它自己结束。打开后，任何**优先级严格更高**
+的模块都能中途接管（还有一个 `min_hold_seconds` 最小持有时间防止抖动）。这个开关故意
+不写进 `config.TaskConfig`（那是"基础底座"的文件）：要打开得先在 `config.py` 里加一行
+`preempt_all: bool = True`，并且**必须实车复验** —— 它会改变实车行为（例如绿灯岔路能在
+避障绕行中途夺走控制权，今天不会）。
+
+**控制权日志**：每次换人终端都会打一行，用来现场排查"谁把车交给了谁"：
+
+```text
+[  12.3s] [ARB] owner changed: line -> obstacle  reason=obstacle confirmed; stepping aside  priority=70 > 10
+[  15.0s] [ARB] owner changed: obstacle -> traffic_light  reason=holding red  priority=90 > 70
+[  18.2s] [ARB] owner changed: traffic_light -> obstacle  reason=stepping aside  priority=70 <= 90
+```
 
 ### 6.4 单独测试一个模块
 
