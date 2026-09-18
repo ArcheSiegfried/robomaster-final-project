@@ -117,6 +117,89 @@ def approach_frame(fork_y=290, far_y=120, reach=110):
     return image
 
 
+def rotated_fork_frame(fork_x=420, left_x=260, right_x=620, fork_y=290, far_y=120):
+    """**车已经转过去**的岔路：下面的腿偏在右侧（近处窄带不居中），
+    选中的左分支已经基本在正前方（≈ +2.4°）。
+
+    这就是 2026-09-17 22:20 实车 settle 阶段的样子：整个 Y 在画面里往右跑，
+    近处窄带误差 0.31（> near_error_deadband 0.20），"线回中央"永远等不到。
+    """
+    image = blank_frame()
+    cv2.line(image, (fork_x, fork_y), (fork_x, HEIGHT - 2), TAPE_BGR, TAPE_HALF * 2)
+    cv2.line(image, (fork_x, fork_y), (left_x, far_y), TAPE_BGR, TAPE_HALF * 2)
+    cv2.line(image, (fork_x, fork_y), (right_x, far_y), TAPE_BGR, TAPE_HALF * 2)
+    return image
+
+
+def fork_scene(car_yaw_deg=0.0, chosen=Branch.RIGHT, tilt0=40.0, spread=170.0,
+               lamp=None, lamp_x=None, travel=0.0, pass_at=0.18):
+    """按"车已经转过 ``car_yaw_deg``"画出岔路口（用**画线**，不是旋转整幅图）。
+
+    为什么要这样造画面：A23 的收尾判据是"**选中的那条分支带子在画面里竖直**"，
+    所以测试里必须有"车真的转过去"这个环节。直接旋转整幅图会把分支转出 ROI，
+    检测当场失效（探针实测：转 20° 就 `branch centre is outside the ROI`），
+    于是永远收不了尾。这里改成按转动量画出带子：岔路始终在 ROI 里。
+
+    偏斜角与转动量按**实车量到的 1:1 关系**给：实车探针实测"车转 -10°，带子的
+    偏斜从 -60.5° 变 -50.5°"，所以这里让 `tilt(car_yaw) = tilt0 - car_yaw`，
+    再把偏斜换算成 y=120 处的横向偏移（``dx = 170·tan(tilt)``）。这样"转到偏斜
+    小于 branch_align_deg"与"转过决策时锁下的角度"是同一件事，判据才自洽。
+
+    ``lamp``/``lamp_x`` 可选地在画面上加一盏红/绿灯（给灯判据的用例）。
+
+    ``travel``：车已经往前开了多少米（A24：完成必须"口子已在车后"，所以用例必须
+    让车真的开过去）。开过 ``pass_at`` 米之后，画面里就只剩**选中的那条带子**了
+    —— 岔路形态消失、近处带子居中，正是判据要等的那一刻。
+    """
+    if float(travel) >= float(pass_at):
+        image = blank_frame()
+        cv2.line(image, (WIDTH // 2, HEIGHT - 2), (WIDTH // 2, 20), TAPE_BGR, TAPE_HALF * 2)
+        if lamp is not None and lamp_x is not None:
+            colour = (0, 0, 255) if lamp == "red" else (0, 255, 0)
+            cv2.circle(image, (int(lamp_x), 100), 22, colour, -1)
+        return image
+    image = blank_frame()
+    fork_y = 290
+    far_y = 120
+    rows = float(fork_y - far_y)
+    cv2.line(image, (WIDTH // 2, fork_y), (WIDTH // 2, HEIGHT - 2), TAPE_BGR, TAPE_HALF * 2)
+    sign = 1 if chosen is Branch.RIGHT else -1
+    tilt_now = max(0.0, float(tilt0) - abs(float(car_yaw_deg)))
+    dx = sign * rows * np.tan(np.radians(tilt_now))
+    cv2.line(
+        image,
+        (WIDTH // 2, fork_y),
+        (int(round(WIDTH // 2 + dx)), far_y),
+        TAPE_BGR,
+        TAPE_HALF * 2,
+    )
+    # 另一侧：固定在反方向张开，保证它始终是"另一条分支"
+    cv2.line(
+        image,
+        (WIDTH // 2, fork_y),
+        (int(round(WIDTH // 2 - sign * spread)), far_y),
+        TAPE_BGR,
+        TAPE_HALF * 2,
+    )
+    if lamp is not None and lamp_x is not None:
+        colour = (0, 0, 255) if lamp == "red" else (0, 255, 0)
+        cv2.circle(image, (int(lamp_x), 100), 22, colour, -1)
+    return image
+
+
+def rotated_view(image, car_yaw_deg):
+    """近似"车转过 ``car_yaw_deg``"之后的画面（绕画面下方一点旋转）。
+
+    真实透视当然更复杂，但"车左转 → 画面内容右移、带子在画面里趋于竖直"这个趋势
+    是对的 —— 状态机测试需要的正是这个趋势：画面不动的话，A22 的伺服永远收敛不了。
+    """
+    height, width = image.shape[:2]
+    matrix = cv2.getRotationMatrix2D(
+        (width / 2.0, height * 1.4), float(car_yaw_deg), 1.0
+    )
+    return cv2.warpAffine(image, matrix, (width, height), borderValue=GROUND)
+
+
 def green_lamp_frame(center=(500, 100), radius=22):
     """实车朝向的岔路 + 画面右上方一盏绿灯（给 3 号的检测器认）。"""
     image = approach_frame()
@@ -444,11 +527,26 @@ class RuleTests(unittest.TestCase):
         )
         self.assertIs(chosen.side, Branch.LEFT)
 
-    def test_red_on_a_branch_selects_nothing(self):
+    def test_red_on_a_branch_blocks_that_branch(self):
+        """A18：只有红灯、但知道在哪一边 → 红的那边不能走，走另一边。
+
+        依据 2026-09-16 官方规则说明：岔道口可以只放红灯（另一边不放灯）。
+        """
         chosen, reason = evaluate_branches(
             self.branches,
             LightReading(color=LightColor.RED, branch=Branch.LEFT),
             self.settings,
+        )
+        self.assertIsNotNone(chosen)
+        self.assertIs(chosen.side, Branch.RIGHT)
+        self.assertIn("red", reason)
+
+    def test_red_blocking_can_be_switched_off(self):
+        settings = JunctionConfig(red_blocks_branch=False)
+        chosen, reason = evaluate_branches(
+            self.branches,
+            LightReading(color=LightColor.RED, branch=Branch.LEFT),
+            settings,
         )
         self.assertIsNone(chosen)
         self.assertIn("red", reason)
@@ -493,13 +591,20 @@ class StateMachineTests(unittest.TestCase):
         task = GreenJunctionTask(light_probe=lambda frame, now: green(Branch.RIGHT))
         statuses = []
         now = 100.0
-        for index in range(30):
+        car_yaw = 0.0
+        travel = 0.0
+        update = None
+        for index in range(60):
             now += FRAME_DT
             line = fake_line(error=0.0 if index >= 10 else 0.9)
-            update = task.step(
-                packet(junction_frame(), index + 1, now), now, line
-            )
+            frame = fork_scene(car_yaw, travel=travel, chosen=Branch.RIGHT)
+            update = task.step(packet(frame, index + 1, now), now, line)
             statuses.append(update.status)
+            if task.active and update.motion is not None:
+                car_yaw += float(update.motion.yaw) * FRAME_DT
+                travel += float(update.motion.forward) * FRAME_DT
+            if task.finished:
+                break
         self.assertEqual(task.state, JunctionState.COMPLETED)
         self.assertEqual(statuses[-1], TaskStatus.COMPLETED)
         self.assertEqual(update.detection.target_id, "right")
@@ -507,7 +612,6 @@ class StateMachineTests(unittest.TestCase):
         # 一旦接管过，就没有任何一帧改口成 NOT_TRIGGERED（红线 8）
         first_running = statuses.index(TaskStatus.RUNNING)
         self.assertNotIn(TaskStatus.NOT_TRIGGERED, statuses[first_running:])
-
     def test_turn_command_is_bounded_and_points_at_the_branch(self):
         task = GreenJunctionTask(light_probe=lambda frame, now: green(Branch.RIGHT))
         now = self._advance_until(task, JunctionState.TURN)
@@ -638,7 +742,10 @@ class StateMachineTests(unittest.TestCase):
             self.assertIn("no usable light reading", update.message)
 
     def test_green_then_red_still_stops_safely(self):
-        """已经接管之后灯变红 → 原地停 + 超时 FAILED（安全方向，不许硬闯）。"""
+        """已经看到过绿灯、之后绿灯没了只剩红灯 → 不许"猜另一边"，停车失败。
+
+        （A18 只对"这个岔路口从头到尾没见过绿灯"成立，见 ``_saw_green``。）
+        """
         settings = JunctionConfig(decision_timeout=0.4, fallback_rule="none")
         state = {"red": False}
 
@@ -653,8 +760,8 @@ class StateMachineTests(unittest.TestCase):
         now += settings.decision_timeout + 0.5
         update = task.step(packet(junction_frame(), 7, now), now, fake_line(error=0.9))
         self.assertEqual(update.status, TaskStatus.FAILED)
-        self.assertIn("red", update.message)
         self.assertEqual(update.motion, STOP)
+        self.assertIsNone(task.chosen_branch, "绿灯消失后不许顺手猜另一边")
 
     def test_the_fail_safe_path_is_still_available_on_request(self):
         """想要老行为（接管 → 停住 → 超时 FAILED）时，一个参数切回去。"""
@@ -672,14 +779,21 @@ class StateMachineTests(unittest.TestCase):
         task = GreenJunctionTask(settings=settings)
         statuses = []
         now = 500.0
-        for index in range(30):
+        car_yaw = 0.0
+        travel = 0.0
+        for index in range(60):
             now += FRAME_DT
             line = fake_line(error=0.0 if index >= 10 else 0.9)
-            update = task.step(packet(junction_frame(), index + 1, now), now, line)
+            frame = fork_scene(car_yaw, travel=travel, chosen=Branch.RIGHT)
+            update = task.step(packet(frame, index + 1, now), now, line)
             statuses.append(update.status)
+            if task.active and update.motion is not None:
+                car_yaw += float(update.motion.yaw) * FRAME_DT
+                travel += float(update.motion.forward) * FRAME_DT
+            if task.finished:
+                break
         self.assertEqual(task.state, JunctionState.COMPLETED)
         self.assertIn(TaskStatus.RUNNING, statuses)
-
     def test_turn_timeout_fails_and_stops(self):
         settings = JunctionConfig(turn_min_duration=10.0, turn_timeout=0.4)
         task = GreenJunctionTask(
@@ -703,7 +817,7 @@ class StateMachineTests(unittest.TestCase):
         update = task.step(packet(junction_frame(), 9, now), now, fake_line(error=0.9))
         self.assertEqual(update.status, TaskStatus.FAILED)
         self.assertEqual(update.motion, STOP)
-        self.assertIn("did not return", update.message)
+        self.assertIn("could not confirm entering", update.message)
 
     def test_losing_the_junction_before_a_rule_fails_and_stops(self):
         settings = JunctionConfig(decision_timeout=0.5, fallback_rule="none")
@@ -744,24 +858,33 @@ class StateMachineTests(unittest.TestCase):
         self.assertNotIn("drove past", task.last_message)
 
     def test_completes_without_the_line_argument(self):
-        """P0 接口修复：协调器只调 ``step(frame, now)`` 也必须能走完整条流程。
+        """P0 接口修复：协调器只调 ``step(frame, now)`` 也要走完整条流程。
 
-        老代码的 TURN→SETTLE→COMPLETED 两道门全靠 ``line``，实车上恒为 False，
-        只能超时失败。
+        上一次 TURN→SETTLE→COMPLETED 三道门全在等 ``line``，实车上恒为 False。
+        A23 之后收尾看"选中的带子在画面里是否竖直"，所以画面随车的转动量变化
+        （见 :func:`fork_scene`）。
         """
         task = GreenJunctionTask(light_probe=lambda frame, now: green(Branch.RIGHT))
         statuses = []
         now = 200.0
-        for index in range(30):
+        car_yaw = 0.0
+        travel = 0.0
+        update = None
+        for index in range(60):
             now += FRAME_DT
-            update = task.step(packet(approach_frame(), index + 1, now), now)  # 只有两个参数
+            frame = fork_scene(car_yaw, travel=travel, chosen=Branch.RIGHT)
+            update = task.step(packet(frame, index + 1, now), now)
             statuses.append(update.status)
+            if task.active and update.motion is not None:
+                car_yaw += float(update.motion.yaw) * FRAME_DT
+                travel += float(update.motion.forward) * FRAME_DT
+            if task.finished:
+                break
         self.assertIn(TaskStatus.RUNNING, statuses)
         self.assertEqual(task.state, JunctionState.COMPLETED)
         self.assertEqual(update.status, TaskStatus.COMPLETED)
         self.assertEqual(update.motion, STOP)
         self.assertEqual(update.detection.target_id, "right")
-
     def test_single_contradictory_frame_is_not_enough_to_fail(self):
         """单帧巧合不算：判定"开过了"要连续几帧都矛盾。"""
         settings = JunctionConfig(decision_timeout=5.0, fallback_rule="none")
@@ -774,18 +897,30 @@ class StateMachineTests(unittest.TestCase):
         update = task.step(packet(junction_frame(), 41, now), now, fake_line(error=0.9))
         self.assertEqual(update.status, TaskStatus.RUNNING)
 
-    def test_losing_the_junction_while_turning_fails_after_the_grace(self):
-        settings = JunctionConfig(junction_gap_grace=0.2, turn_min_duration=10.0)
+    def test_losing_the_junction_mid_turn_is_bounded_not_fatal(self):
+        """A22：转向中途岔路检测丢掉是**预期**现象，不能立刻判失败。
+
+        2026-09-17 22:38 实车：车已经转过去、对准了左边分支，却因为岔路形态在
+        画面里散开而报 `lost the junction while turning`。改成：丢掉之后按
+        「转过锁死目标角度」收尾，转向仍然有界（不会一直转下去）。
+        """
+        settings = JunctionConfig(junction_gap_grace=0.2, turn_min_duration=0.0)
         task = GreenJunctionTask(
             settings=settings, light_probe=lambda frame, now: green(Branch.RIGHT)
         )
         now = self._advance_until(task, JunctionState.TURN)
-        now += 1.0
-        update = task.step(packet(blank_frame(), 31, now), now, fake_line(error=0.9))
-        self.assertEqual(update.status, TaskStatus.FAILED)
-        self.assertEqual(update.motion, STOP)
-        self.assertIn("lost the junction", update.message)
-
+        update = None
+        # A26 转速压到 25°/s 之后，累积到目标角度需要更多帧
+        for index in range(120):
+            now += FRAME_DT
+            update = task.step(
+                packet(blank_frame(), 40 + index, now), now, fake_line(error=0.9)
+            )
+            if task.state is not JunctionState.TURN:
+                break
+        self.assertNotEqual(update.status, TaskStatus.FAILED)
+        self.assertIn(task.state, (JunctionState.SETTLE, JunctionState.COMPLETED))
+        self.assertLessEqual(abs(task._turn_rotated_deg), abs(task._chosen_tilt or 0.0) + 1.0)
     def test_short_junction_flicker_does_not_take_over(self):
         """只闪一帧的岔路形态不算岔路（连续确认）。"""
         task = GreenJunctionTask(
@@ -815,17 +950,26 @@ class StateMachineTests(unittest.TestCase):
         self.assertEqual(update.status, TaskStatus.NOT_TRIGGERED)
 
     def test_rearm_cooldown_blocks_an_immediate_retrigger(self):
-        """刚走过一个岔路后，同一个岔路形状不会立刻被处理第二遍（A9）。"""
+        """走过一个岔路后同一个岔路形状不再立刻触发第二次（A9）。"""
         settings = JunctionConfig(fallback_color="green", rearm_cooldown=2.0)
         task = GreenJunctionTask(settings=settings)
         now = 700.0
-        for index in range(30):
+        car_yaw = 0.0
+        travel = 0.0
+        update = None
+        for index in range(60):
             now += FRAME_DT
             line = fake_line(error=0.0 if index >= 10 else 0.9)
-            update = task.step(packet(junction_frame(), index + 1, now), now, line)
+            frame = fork_scene(car_yaw, travel=travel, chosen=Branch.RIGHT)
+            update = task.step(packet(frame, index + 1, now), now, line)
+            if task.active and update.motion is not None:
+                car_yaw += float(update.motion.yaw) * FRAME_DT
+                travel += float(update.motion.forward) * FRAME_DT
+            if task.finished:
+                break
         self.assertEqual(update.status, TaskStatus.COMPLETED)
 
-        # coordinator 交出控制权后会复位模块；冷却期内不许重复触发。
+        # coordinator 复位后会复位模块；在冷却期内不许重复触发。
         task.reset()
         task._rearm_ready_at = now + settings.rearm_cooldown
         for index in range(3):
@@ -834,30 +978,36 @@ class StateMachineTests(unittest.TestCase):
             self.assertEqual(blocked.status, TaskStatus.NOT_TRIGGERED)
             self.assertIn("cooldown", blocked.message)
 
-        # 冷却时间过去以后，新的岔路可以正常触发。
+        # 冷却时间过去以后，新的岔路应该重新能触发。
         now += settings.rearm_cooldown + 0.1
         for index in range(settings.confirm_frames):
             now += FRAME_DT
             armed = task.step(packet(junction_frame(), 200 + index, now), now, fake_line(error=0.9))
         self.assertTrue(task.active)
         self.assertEqual(armed.status, TaskStatus.RUNNING)
-
     def test_finished_state_keeps_reporting_the_terminal_status(self):
-        """完成后重复调用必须继续报 COMPLETED，不能改口。"""
+        """完成之后重复调用必须仍报 COMPLETED，不能改口。"""
         task = GreenJunctionTask(settings=JunctionConfig(fallback_color="green"))
         now = 950.0
         update = None
-        for index in range(30):
+        car_yaw = 0.0
+        travel = 0.0
+        for index in range(60):
             now += FRAME_DT
             line = fake_line(error=0.0 if index >= 10 else 0.9)
-            update = task.step(packet(junction_frame(), index + 1, now), now, line)
+            frame = fork_scene(car_yaw, travel=travel, chosen=Branch.RIGHT)
+            update = task.step(packet(frame, index + 1, now), now, line)
+            if task.active and update.motion is not None:
+                car_yaw += float(update.motion.yaw) * FRAME_DT
+                travel += float(update.motion.forward) * FRAME_DT
+            if task.finished:
+                break
         self.assertEqual(update.status, TaskStatus.COMPLETED)
         for index in range(5):
             now += FRAME_DT
             again = task.step(packet(junction_frame(), 99, now), now, fake_line(error=0.9))
             self.assertEqual(again.status, TaskStatus.COMPLETED)
             self.assertEqual(again.motion, STOP)
-
     def test_missing_frame_image_while_owning_control_fails(self):
         task = GreenJunctionTask(light_probe=lambda frame, now: green(Branch.RIGHT))
         now = self._advance_until(task, JunctionState.TURN)
@@ -872,7 +1022,98 @@ class StateMachineTests(unittest.TestCase):
         self.assertIsNotNone(task.chosen_bearing_deg)
         self.assertGreater(task.chosen_bearing_deg, 0.0)
 
-    # -- helpers ---------------------------------------------------------
+    def test_rotation_target_comes_from_the_tape_direction(self):
+        """A22：要转多少度按**带子方向**（tilt）算，不按分支的**中心**偏角。
+
+        2026-09-17 22:28 实车：左分支带子在画面里几乎水平（tilt ≈ -86°），
+        中心偏角只有 -23.9°，模块因此只转了 20° 就宣布"已在正前方"交回巡线 ——
+        车还横着，巡线一接管就上了另一条带子（用户看到的"选了错误的路"）。
+        探针实测 tilt 与真实转动量近似 1:1（车转 -10°，tilt 从 -60.5 变 -50.5），
+        所以它才是正确的目标。
+        """
+        settings = JunctionConfig(turn_min_duration=0.0)
+        task = GreenJunctionTask(settings=settings)
+        detection = JunctionDetector(settings).detect(approach_frame(reach=300))
+        self.assertTrue(detection.valid)
+        left = detection.branch(Branch.LEFT)
+        self.assertIsNotNone(left.tilt_deg)
+        task.last_detection = detection
+        task.chosen_branch = Branch.LEFT
+        task._chosen_bearing = float(left.bearing_deg)   # ≈ -18.7（旧目标）
+        task._chosen_tilt = float(left.tilt_deg)         # ≈ -60.5（新目标）
+        task._enter(JunctionState.TURN, 2500.0)
+        now = 2500.0
+        yaws = []
+        while now < 2502.0:
+            now += FRAME_DT
+            yaws.append(task._turn_command(now).yaw)
+            if not task._turn_still_needed():
+                break
+        self.assertTrue(all(y < 0.0 for y in yaws), "左分支必须一直左转")
+        self.assertGreater(
+            abs(task._turn_rotated_deg), 40.0,
+            "要转到带子方向那一档（≈54°），而不是中心偏角那一档（≈13°）",
+        )
+        self.assertGreater(
+            abs(task._turn_rotated_deg), abs(task._chosen_bearing) + 20.0
+        )
+
+    def test_servo_is_bounded_by_the_locked_target(self):
+        """A22c：伺服信号一直很大时，转过"锁死目标角度"就必须收手。
+
+        2026-09-17 22:47 两次实测：yaw 被钉在 -75°/s 转了 1.0~1.3 秒（约 80~100°），
+        线被转出画面（蓝=0/0）→ `line did not return after the turn`。
+        这里用静态画面模拟"tilt 永远不收敛"，验证仍有上限。
+        """
+        settings = JunctionConfig(turn_min_duration=0.0)
+        task = GreenJunctionTask(settings=settings)
+        detection = JunctionDetector(settings).detect(approach_frame(reach=300))
+        left = detection.branch(Branch.LEFT)
+        task.last_detection = detection
+        task.chosen_branch = Branch.LEFT
+        task._chosen_bearing = float(left.bearing_deg)
+        task._chosen_tilt = float(left.tilt_deg)
+        task._enter(JunctionState.TURN, 3000.0)
+        now = 3000.0
+        command = None
+        for _ in range(200):
+            now += FRAME_DT
+            command = task._turn_command(now)
+            if command.yaw == 0.0:
+                break
+        self.assertIsNotNone(command)
+        self.assertEqual(command.yaw, 0.0, "到达锁死目标角度后必须停")
+        self.assertLessEqual(abs(task._turn_rotated_deg), abs(task._chosen_tilt) + 1e-6)
+
+    def test_fallback_rotation_target_is_used_when_there_is_no_tilt(self):
+        """A21 兜底：算不出带子方向时，仍然按"转过锁死偏角"收手并缓出。
+
+        （旧实车日志 22:09/22:20 的现象：恒定 yaw 一直转，把线转出画面。）
+        """
+        settings = JunctionConfig(turn_min_duration=0.0)
+        task = GreenJunctionTask(settings=settings)
+        detection = JunctionDetector(settings).detect(junction_frame())
+        self.assertTrue(detection.valid)
+        task.last_detection = None   # 当前帧算不出带子方向 → 走兜底
+        task.chosen_branch = Branch.LEFT
+        self.assertIsNone(task.chosen_tilt_deg)
+        task._chosen_bearing = -22.0          # 锁死的偏角
+        task._chosen_tilt = None              # 算不出方向 → 走兜底
+        task._enter(JunctionState.TURN, 2000.0)
+        now = 2000.0
+        yaws = []
+        while now < 2003.0:
+            now += FRAME_DT
+            command = task._turn_command(now)
+            yaws.append(command.yaw)
+            if not task._turn_still_needed():
+                break
+        self.assertGreater(len(yaws), 2)
+        self.assertLess(abs(yaws[-1]), abs(yaws[0]), "接近目标时要缓出")
+        self.assertLessEqual(abs(task._turn_rotated_deg), 22.0)
+        # 转到位之后不再加转（A21b）
+        self.assertEqual(task._turn_command(now + FRAME_DT).yaw, 0.0)
+
 
     @staticmethod
     def _advance_until(task, state, limit=40, line=None):
@@ -890,151 +1131,94 @@ class StateMachineTests(unittest.TestCase):
         raise AssertionError("module never reached %s" % state.value)
 
 
-class EvidencePhotoTests(unittest.TestCase):
-    """A18：5.3 岔路选择要在"灯在哪一侧 + 我们走哪一侧"定下来那一刻存一张证据照片。
+    def test_alignment_by_tape_direction_completes_without_a_hand_tuned_angle(self):
+        """A23-1：判据只认"选中的带子在画面里竖直"，与手调角度无关。
 
-    画圈、写字、去重、写盘都在整合层的 ``evidence.py``（老师按**存下来的张数**算分），
-    本模块只把请求排队交出去：``take_evidence_request()`` 取走、
-    ``acknowledge_evidence()`` 回执。**照片只是得分副作用**：写盘失败绝不允许影响
-    转向和接管 —— "只识别和拍照、没有真的开进正确那条路"不算完成。
-    """
-
-    #: ``two_lamp_frame`` 里两盏灯的坐标（半径 22、y=100）。
-    LAMP_Y = 100.0
-    GREEN_LEFT_X = 100.0
-    GREEN_RIGHT_X = 500.0
-
-    @staticmethod
-    def _drive_to_turn(task, image, limit=20):
-        """用假时钟把状态机推到"分支已经选定、开始转向"那一刻，返回当时的时刻。"""
-        now = 100.0
-        for index in range(limit):
-            now += FRAME_DT
-            task.step(packet(image, index + 1, now), now, fake_line(error=0.9))
-            if task.state is JunctionState.TURN:
-                return now
-        raise AssertionError("module never chose a branch")
-
-    @staticmethod
-    def _drive_to_completion(task, image, now, limit=14):
-        for index in range(limit):
-            now += FRAME_DT
-            task.step(packet(image, 60 + index, now), now, fake_line(error=0.0))
-            if task.state is JunctionState.COMPLETED:
-                return now
-        raise AssertionError("module never completed the junction")
-
-    def test_green_light_on_the_left_queues_one_circled_photo(self):
-        """实车配置（不注入探针，靠内置认灯器）：绿灯在左 → 走左，照片圈那盏绿灯。"""
-        task = GreenJunctionTask()
-        now = self._drive_to_turn(task, two_lamp_frame(green_on_left=True))
-
-        request = task.pending_evidence_request
-        self.assertIsNotNone(request, "选定分支那一刻必须排一张照片")
-        self.assertEqual(
-            request.annotation, "Team 03 detects a green light » left way and left"
-        )
-        self.assertEqual(request.kind, "green_junction:green")
-        self.assertEqual(request.shape, "circle")
-        self.assertIsNotNone(request.image, "照片要带上那一帧的全幅画面")
-        self.assertEqual(request.frame_sequence, 5)
-        # 圆圈是检测器**真的量到**的绿灯灯心/半径（合成图：圆心 (100,100)、半径 22）。
-        self.assertIsNotNone(request.circle, "量到了坐标就必须画圆")
-        cx, cy, radius = request.circle
-        self.assertLess(abs(cx - self.GREEN_LEFT_X), 6.0)
-        self.assertLess(abs(cy - self.LAMP_Y), 6.0)
-        self.assertGreater(radius, 10.0)
-        self.assertTrue(request.detection.valid)
-        self.assertEqual(request.detection.color, "green")
-        self.assertIsNotNone(request.detection.box)
-
-        # 同一个岔路事件只排一张：走完整个岔路也不会冒出第二张。
-        self._drive_to_completion(task, two_lamp_frame(green_on_left=True), now)
-        self.assertEqual(task.state, JunctionState.COMPLETED)
-        self.assertIs(task.take_evidence_request(), request)
-        self.assertIsNone(task.take_evidence_request(), "一个事件只存一张照片")
-
-    def test_green_light_on_the_right_queues_the_right_way(self):
-        """绿灯在右 → 走右；文案里的左右必须跟着画面走（不是写死的）。"""
-        task = GreenJunctionTask()
-        self._drive_to_turn(task, two_lamp_frame(green_on_left=False))
-        request = task.take_evidence_request()
-        self.assertIsNotNone(request)
-        self.assertEqual(
-            request.annotation, "Team 03 detects a green light » right way and right"
-        )
-        self.assertEqual(task.chosen_branch, Branch.RIGHT)
-        self.assertLess(abs(request.circle[0] - self.GREEN_RIGHT_X), 6.0)
-
-    def test_red_light_veto_queues_the_red_variant(self):
-        """红灯否决（A16：绿灯只知道存在、左边是红灯 → 走右边）写"红灯"那张。
-
-        文案就是老师给的第二种样例：``... detects a red light » left way and right``
-        —— ``side`` 是**红灯**在哪条路，``chosen`` 是我们走的那条路。
+        这里把安全上限关掉（``turn_max_deg=0``），完成就只能来自"带子真的竖直了"。
         """
-        red = LightReading(
-            color=LightColor.RED,
-            branch=Branch.LEFT,
-            confidence=1.0,
-            center=(90.0, 96.0),
-            radius=20.0,
+        task = GreenJunctionTask(
+            settings=JunctionConfig(turn_max_deg=0.0),
+            light_probe=lambda frame, now: green(Branch.RIGHT),
         )
-
-        def probe(frame, now):
-            return [LightReading(color=LightColor.GREEN, branch=None), red]
-
-        task = GreenJunctionTask(light_probe=probe)
-        self._drive_to_turn(task, junction_frame())
-        request = task.take_evidence_request()
-        self.assertIsNotNone(request)
-        self.assertEqual(
-            request.annotation, "Team 03 detects a red light » left way and right"
-        )
-        self.assertEqual(request.kind, "green_junction:red")
-        self.assertEqual(task.chosen_branch, Branch.RIGHT)
-        self.assertEqual(request.detection.color, "red")
-        self.assertEqual(request.circle, (90.0, 96.0, 20.0))
-
-    def test_photo_keeps_the_text_when_no_lamp_coordinates_exist(self):
-        """读数里没有灯心坐标时：照片照排、文案照写，但**不画圆、不编坐标**。"""
-        task = GreenJunctionTask(light_probe=lambda frame, now: green(Branch.RIGHT))
-        self._drive_to_turn(task, junction_frame())
-        request = task.take_evidence_request()
-        self.assertIsNotNone(request)
-        self.assertEqual(
-            request.annotation, "Team 03 detects a green light » right way and right"
-        )
-        self.assertIsNotNone(request.image)
-        self.assertIsNone(request.circle, "没量到坐标就不许画圆")
-        self.assertIsNone(request.detection, "没量到坐标就不许编一个灯的位置")
-
-    def test_evidence_failure_does_not_change_the_turn(self):
-        """回执 ``False`` 后行为不变：照样转向、照样走完这个岔路。"""
-        task = GreenJunctionTask()
-        now = self._drive_to_turn(task, two_lamp_frame(green_on_left=False))
-        request = task.take_evidence_request()
-        self.assertIsNotNone(request)
-        # 第一次写盘失败 → 有界重试（attempt 2）；再失败就放弃，不再排。
-        self.assertTrue(task.acknowledge_evidence(request.request_id, False))
-        retry = task.take_evidence_request()
-        self.assertEqual(retry.attempt, 2)
-        self.assertTrue(task.acknowledge_evidence(retry.request_id, False))
-        self.assertIsNone(task.take_evidence_request())
-        self.assertFalse(task.acknowledge_evidence(request.request_id, True))
-
-        # 照片存不下来完全不改变状态机：这一帧照样给出转向请求（右分支 → 右转）。
-        update = task.step(
-            packet(two_lamp_frame(green_on_left=False), 30, now), now, fake_line(error=0.9)
-        )
-        self.assertEqual(update.status, TaskStatus.RUNNING)
-        self.assertNotEqual(update.motion, STOP)
-        self.assertGreater(update.motion.yaw, 0.0)
-        self.assertEqual(task.chosen_branch, Branch.RIGHT)
-
-        self._drive_to_completion(task, two_lamp_frame(green_on_left=False), now)
+        now = 1100.0
+        car_yaw = 0.0
+        travel = 0.0
+        update = None
+        for index in range(60):
+            now += FRAME_DT
+            frame = fork_scene(car_yaw, travel=travel, chosen=Branch.RIGHT, tilt0=40.0)
+            update = task.step(packet(frame, index + 1, now), now)
+            if task.active and update.motion is not None:
+                car_yaw += float(update.motion.yaw) * FRAME_DT
+                travel += float(update.motion.forward) * FRAME_DT
+            if task.finished:
+                break
         self.assertEqual(task.state, JunctionState.COMPLETED)
-        self.assertIsNotNone(task.chosen_bearing_deg)
+        self.assertIn("fork behind", task.last_message)
+        self.assertLess(
+            abs(task._turn_rotated_deg), 50.0,
+            "只该转「带子偏斜量」那一档（≈40°），不该靠安全上限",
+        )
 
+    def test_fork_gone_and_line_centred_counts_as_entered(self):
+        """A23-2：岔路形态散掉（口子已在车后）+ 近处带子居中 → 算进了分支。
+
+        转向中途岔路检测散掉是**预期**的（车转进分支后 Y 形在画面里就散了），
+        这时不能当成失败，也不能卡着不动。
+        """
+        task = GreenJunctionTask(
+            settings=JunctionConfig(settle_timeout=1.0),
+            light_probe=lambda frame, now: green(Branch.RIGHT),
+        )
+        now = 1200.0
+        car_yaw = 0.0
+        travel = 0.0
+        for index in range(20):
+            now += FRAME_DT
+            update = task.step(packet(fork_scene(car_yaw, travel=travel, chosen=Branch.RIGHT), index + 1, now), now)
+            if task.active and update.motion is not None:
+                car_yaw += float(update.motion.yaw) * FRAME_DT
+                travel += float(update.motion.forward) * FRAME_DT
+            if task.state is JunctionState.TURN:
+                break
+        # 前提：这条直带子确实"岔路已散 + 近处居中"（否则测不到 A23-2）
+        straight = line_frame()
+        self.assertFalse(
+            JunctionDetector(JunctionConfig()).detect(straight).valid,
+            "直道不该被判成岔路",
+        )
+        centred, _ = task._line_centered(packet(straight, 1, now), now)
+        self.assertTrue(centred, "直道近处应该居中")
+        for index in range(10):
+            now += FRAME_DT
+            update = task.step(packet(straight, 300 + index, now), now)
+            if task.finished:
+                break
+        self.assertEqual(task.state, JunctionState.COMPLETED)
+        self.assertIn("fork behind", task.last_message)
+
+    def test_stem_centred_alone_is_not_enough_to_declare_entry(self):
+        """A23-3 回归：岔路还在、近处居中的那条是**车自己上来的主带**、带子还横着
+        → 不许收尾。
+
+        2026-09-17 22:28 就是这么误判成"进了分支"、交回巡线后拐上另一条路的。
+        画面一直不动（车没真转），所以永远对不准 → 必须明确失败，而不是假装成功。
+        """
+        task = GreenJunctionTask(
+            settings=JunctionConfig(settle_timeout=0.4),
+            light_probe=lambda frame, now: green(Branch.RIGHT),
+        )
+        now = 1300.0
+        frame = fork_scene(0.0, chosen=Branch.RIGHT)     # 车没有转：带子一直横着
+        update = None
+        for index in range(80):
+            now += FRAME_DT
+            update = task.step(packet(frame, index + 1, now), now)
+            if task.finished:
+                break
+        self.assertNotEqual(task.state, JunctionState.COMPLETED)
+        self.assertEqual(task.state, JunctionState.FAILED)
+        self.assertIn("could not confirm entering", task.last_message)
 
 class LightProbeAdapterTests(unittest.TestCase):
     """v3 报告第三节那条断掉的链：3 号没有 ``reading()``，本模块给适配器（A13）。
@@ -1149,35 +1333,40 @@ class LightProbeAdapterTests(unittest.TestCase):
             make_light_probe(42)
 
     def test_builtin_spotter_drives_the_whole_module(self):
-        """用**内置**检测器（本模块自己的 LampSpotter）把整条链跑通。
+        """用**内置**检测器（本模块自己的 LampSpotter）把整条链跑通：
 
-        ``traffic_light.py`` 已在 ``6dc2c1f`` 被删除，所以这条链现在不依赖任何
-        外部模块：绿灯 → 岔路 → 接管 → 转向 → 交回巡线。
+        ``traffic_light.py`` 已被 ``6dc2c1f`` 删除，所以本模块必须内置灯判据，
+        现场不依赖任何外部模块：绿灯 → 岔路 → 接管 → 转向 → 完成 → 交回巡线。
+        A23：画面随车的转动量变化（见 :func:`fork_scene`）。
         """
         spotter = LampSpotter()
         readings = spotter.readings(green_lamp_frame())
-        self.assertTrue(readings, "内置检测器应该认出这盏绿灯")
+        self.assertTrue(readings, "内置检测器应该认出那盏绿灯")
         self.assertIs(readings[0].color, LightColor.GREEN)
 
-        # 注入形态也支持（把 spotter 当别人给的检测器用）。
         task = GreenJunctionTask(light_probe=make_light_probe(spotter))
         harness = TaskHarness(task=task)
         harness.start_line(now=1.0)
         now = 1.05
-        for _ in range(60):
+        car_yaw = 0.0
+        travel = 0.0
+        for _ in range(120):
             now += 0.05
-            decision = harness.feed_image(now, green_lamp_frame())
+            frame = fork_scene(car_yaw, travel=travel, chosen=Branch.RIGHT, lamp="green", lamp_x=500)
+            decision = harness.feed_image(now, frame)
+            command = getattr(decision, "command", None)
+            if harness.owner == "external" and command is not None:
+                car_yaw += float(command.yaw) * 0.05
+                travel += float(command.forward) * 0.05
             if task.finished and decision.owner == "line":
                 break
         self.assertTrue(
             any(row.task_name == "green_junction" for row in harness.traces),
-            "绿灯亮着时模块应该接管",
+            "绿灯出现时模块应该接管",
         )
         self.assertEqual(task.chosen_branch, Branch.RIGHT)
         self.assertEqual(task.state, JunctionState.COMPLETED)
         self.assertEqual(harness.owner, "line")
-
-
 class TwoLampTests(unittest.TestCase):
     """A15/A16：岔路口两边各一盏灯（一边红一边绿，灯立在路边），往绿灯那边走。"""
 
@@ -1238,16 +1427,18 @@ class TwoLampTests(unittest.TestCase):
             self.settings,
         )
         self.assertIsNone(chosen)
-        self.assertIn("red", reason)
+        self.assertIn("both branches are red", reason)
 
-    def test_one_red_only_is_still_red(self):
+    def test_one_red_only_blocks_that_side(self):
+        """A18：只放红灯时，红的那边不能走 → 走另一边。"""
         chosen, reason = evaluate_branches(
             self.branches,
             [LightReading(color=LightColor.RED, branch=Branch.LEFT)],
             self.settings,
         )
-        self.assertIsNone(chosen)
-        self.assertIn("left branch", reason)
+        self.assertIsNotNone(chosen)
+        self.assertIs(chosen.side, Branch.RIGHT)
+        self.assertIn("red", reason)
 
     def test_green_without_a_side_plus_a_red_side_takes_the_other_side(self):
         """A16：只知道"看到绿灯"，但知道左边是红灯 → 走右边。"""
@@ -1385,29 +1576,42 @@ class TwoLampTests(unittest.TestCase):
             )
 
     def test_no_probe_at_all_drives_the_module_to_the_green_side(self):
-        """**实车配置**：不注入任何探针，靠内置检测器；绿灯在哪边就走哪边。"""
+        """**实车场景**：不注入任何探针，靠内置检测器认灯，绿灯在哪边就走哪边。
+
+        A23：画面随车的转动量变化（见 :func:`fork_scene`）；两盏灯一边红一边绿，
+        灯立在路边。
+        """
         for green_on_left, expected in ((True, Branch.LEFT), (False, Branch.RIGHT)):
-            task = GreenJunctionTask()  # 没有 light_probe
+            task = GreenJunctionTask()  # 没有 light_probe，用内置检测器
             harness = TaskHarness(task=task)
             harness.start_line(now=1.0)
             now = 1.05
-            for _ in range(60):
+            car_yaw = 0.0
+            travel = 0.0
+            green_x, red_x = (100, 500) if green_on_left else (500, 100)
+            for _ in range(200):
                 now += 0.05
-                decision = harness.feed_image(now, two_lamp_frame(green_on_left=green_on_left))
+                frame = fork_scene(car_yaw, travel=travel, chosen=expected)
+                cv2.circle(frame, (green_x, 100), 22, (0, 255, 0), -1)
+                cv2.circle(frame, (red_x, 100), 22, (0, 0, 255), -1)
+                decision = harness.feed_image(now, frame)
+                command = getattr(decision, "command", None)
+                if harness.owner == "external" and command is not None:
+                    car_yaw += float(command.yaw) * 0.05
+                travel += float(command.forward) * 0.05
                 if task.finished and decision.owner == "line":
                     break
             self.assertTrue(
                 any(row.task_name == "green_junction" for row in harness.traces),
-                "绿灯亮着时模块应该接管",
+                "绿灯出现时模块应该接管",
             )
             self.assertEqual(
                 task.chosen_branch,
                 expected,
-                "绿灯在%s边却走了 %s" % ("左" if green_on_left else "右", task.chosen_branch),
+                "绿灯在%s，却选了 %s" % ("左" if green_on_left else "右", task.chosen_branch),
             )
             self.assertEqual(task.state, JunctionState.COMPLETED)
             self.assertEqual(harness.owner, "line")
-
     def test_two_lamp_readings_are_exposed_for_logging(self):
         task = GreenJunctionTask()
         now = 10.0
@@ -1446,6 +1650,42 @@ class BuiltinLampTests(unittest.TestCase):
             lambda img: cv2.rectangle(img, (60, 60), (300, 90), (0, 0, 255), -1)
         )
         self.assertEqual(self.spotter.readings(image), [])
+
+    def test_lamp_on_the_centre_line_does_not_claim_a_side(self):
+        """A20：灯骑在画面中线上时只报颜色，不报"哪一边"。
+
+        实车日志里灯心 x=321→319 就翻边（画面宽 640，中线 320），
+        "左/右"标签在决策那一瞬间是噪声，不能拿它选道。
+        """
+        image = approach_frame()
+        cv2.circle(image, (321, 100), 22, (0, 255, 0), -1)
+        strict = LampSpotter(JunctionConfig(lamp_center_deadband=0.06))
+        readings = strict.readings(image)
+        self.assertEqual(len(readings), 1)
+        self.assertIs(readings[0].color, LightColor.GREEN)
+        self.assertIsNone(readings[0].branch, "中线附近不得认边")
+        self.assertEqual(readings[0].center[0], 321.0, "坐标还是要报，日志靠它定位")
+
+        # 离中线足够远（真的立在路边）→ 照旧认边。
+        far = approach_frame()
+        cv2.circle(far, (100, 100), 22, (0, 255, 0), -1)
+        self.assertIs(strict.readings(far)[0].branch, Branch.LEFT)
+
+        # 默认 0 = 关闭死区 → 旧行为不变（x=321 依旧是"右"）。
+        self.assertIs(self.spotter.readings(image)[0].branch, Branch.RIGHT)
+
+    def test_centre_line_lamp_with_fallback_none_refuses_to_guess(self):
+        """A20 + fallback_rule=none：分不清左右时**不乱猜**，返回理由。"""
+        image = approach_frame()
+        cv2.circle(image, (321, 100), 22, (0, 255, 0), -1)
+        readings = LampSpotter(JunctionConfig(lamp_center_deadband=0.06)).readings(image)
+        branches = JunctionDetector(JunctionConfig()).detect(junction_frame()).branches
+        self.assertEqual(len(branches), 2, "合成岔路画面应该给出两条分支")
+        chosen, reason = evaluate_branches(
+            branches, readings, JunctionConfig(fallback_rule="none")
+        )
+        self.assertIsNone(chosen)
+        self.assertIn("cannot tell left from right", reason)
 
     def test_tiny_speck_is_not_a_lamp(self):
         """半径太小（< lamp_min_radius）的亮点不是灯。"""
@@ -1520,6 +1760,40 @@ class BuiltinLampTests(unittest.TestCase):
         self.assertIn("take right branch", update.message)
 
 
+def one_lamp_frame(colour="red", x=100, y=100, radius=22):
+    """岔路 + 只有一盏灯（官方规则允许"只放红灯"或"只放绿灯"）。"""
+    image = approach_frame()
+    cv2.circle(image, (x, y), radius, (0, 0, 255) if colour == "red" else (0, 255, 0), -1)
+    return image
+
+
+class RedBranchTests(unittest.TestCase):
+    """A18：官方规则（2026-09-16）——岔道口可以"一红一绿 / 只放红 / 只放绿"。
+
+    只放红灯时：红的那边不能走，走另一边。
+    （"自选地点红灯停绿灯行"是另一个记分任务、由别人负责，本模块不做 —— A19。）
+    """
+
+    def test_red_only_fork_takes_the_other_branch(self):
+        """岔路口只有红灯（左边）→ 红的那边不能走，走右边；画面随车转（A23）。"""
+        task = GreenJunctionTask()   # 用内置检测器，不注入探针
+        now = 100.0
+        statuses = []
+        car_yaw = 0.0
+        travel = 0.0
+        for index in range(60):
+            now += FRAME_DT
+            frame = fork_scene(car_yaw, travel=travel, chosen=Branch.RIGHT, lamp="red", lamp_x=100)
+            update = task.step(packet(frame, index + 1, now), now)
+            statuses.append(update.status)
+            if task.active and update.motion is not None:
+                car_yaw += float(update.motion.yaw) * FRAME_DT
+                travel += float(update.motion.forward) * FRAME_DT
+            if task.finished:
+                break
+        self.assertIn(TaskStatus.RUNNING, statuses)
+        self.assertIs(task.chosen_branch, Branch.RIGHT)
+        self.assertEqual(task.state, JunctionState.COMPLETED)
 class CoordinatorHarnessTests(unittest.TestCase):
     """把模块塞进**真正的** TaskCoordinator 跑一遍（协调器只调 ``step(frame, now)``）。
 
@@ -1532,23 +1806,27 @@ class CoordinatorHarnessTests(unittest.TestCase):
         harness = TaskHarness(task=task)
         harness.start_line(now=1.0)
         now = 1.05
-        for _ in range(60):
+        car_yaw = 0.0
+        travel = 0.0
+        for _ in range(160):
             now += 0.05
-            decision = harness.feed_image(now, approach_frame())
+            frame = fork_scene(car_yaw, travel=travel, chosen=Branch.RIGHT)
+            decision = harness.feed_image(now, frame)
+            command = getattr(decision, "command", None)
+            if harness.owner == "external" and command is not None:
+                car_yaw += float(command.yaw) * 0.05
+                travel += float(command.forward) * 0.05
             if task.finished and decision.owner == "line":
                 break
         self.assertTrue(
             any(row.task_name == "green_junction" for row in harness.traces),
-            "模块在真正的协调器里没有接管",
+            "模块必须通过协调器接管",
         )
         self.assertEqual(task.state, JunctionState.COMPLETED)
         self.assertEqual(harness.owner, "line", "完成后必须把控制权交回巡线")
-        # 转向请求必须落在骨架的护栏里（0.30 m/s、90 deg/s）。
         moved = harness.chassis.motion_calls
         self.assertTrue(moved)
         self.assertLessEqual(max(abs(item["z"]) for item in moved), 90.0)
-
-
 class ConstantContractTests(unittest.TestCase):
     def test_stop_is_zero_motion(self):
         self.assertEqual(STOP, MotionCommand(0.0, 0.0, 0.0))
@@ -1567,7 +1845,7 @@ class OfflineDemoTests(unittest.TestCase):
                 "owner:external",
                 "task:running",
                 "branch:right",
-                "motion:yaw=16.3",
+                "motion:yaw=18.0",
                 "task:completed",
                 "owner:line",
                 "line:TRACKING",
