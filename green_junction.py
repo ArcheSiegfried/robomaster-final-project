@@ -697,6 +697,9 @@ class JunctionConfig:
     #: 转向时车头已经对准选中分支的角度门槛：岔路口上线回中央可能一直不成立
     #: （2026-09-16 实测：yaw 收敛到 0 了却因为看不到单条居中的线而转向超时）。
     branch_align_deg: float = 6.0
+    #: 转向时「带着巡线一起转」的增益（A27）：近处带子偏差 → yaw 的修正
+    #: （deg/s 每单位归一化偏差）。开环转向会让车一离开带子就再也回不来。
+    line_hold_gain: float = 60.0
     #: 单次转向的**转角封顶**（度，0 = 不封顶）。带子接近水平时 tilt 会量到
     #: 80°+，实测直接照它转会转过头（2026-09-17 22:47/22:52：转过 60~100°、
     #: 带子被转出画面 → line did not return）。现场用 --turn-max-deg 调。
@@ -1638,6 +1641,8 @@ class GreenJunctionTask:
         self._fork_visible = True
         #: 最近一次**有效**的岔路检测（车开过去之后仍能报出选中的分支）。
         self._last_valid_detection: Optional[JunctionDetection] = None
+        #: 最近一帧近处带子的归一化偏差（A27：转向时的巡线反馈项）。
+        self._near_error: Optional[float] = None
         self._rearm_ready_at: Optional[float] = None
 
     # -- 对外状态 ---------------------------------------------------------
@@ -1671,6 +1676,22 @@ class GreenJunctionTask:
             return None
         branch = detection.branch(self.chosen_branch)
         return None if branch is None else branch.tilt_deg
+
+    def _with_line_hold(self, yaw: float) -> float:
+        """A27：转向时**带着巡线一起转**（近处带子偏差也参与 yaw）。
+
+        开环地按岔路方向转过去，车一离开带子就再也没有线可以跟 —— 2026-09-18 实测：
+        主路到岔路之前本来就有个左弯，车体已经偏左，模块一转整车出线，之后
+        「线回中央」永远不成立 → 卡住/失败。这里把**近处带子的偏差**也加进 yaw：
+        带子偏右（``error > 0``）就往右修一点，于是车是**沿着带子拐过去**的，
+        而不是绕着原地转。
+        """
+        gain = float(getattr(self.settings, "line_hold_gain", 0.0) or 0.0)
+        error = self._near_error
+        if error is None or gain <= 0.0:
+            return yaw
+        limit = abs(self.settings.max_turn_yaw)
+        return max(-limit, min(limit, yaw + gain * float(error)))
 
     def _aligned_now(self) -> Tuple[bool, str]:
         """车头是否已经和选中的分支平行（走得了这条分支）。
@@ -1876,6 +1897,7 @@ class GreenJunctionTask:
                     else 0.0
                 )
                 return MotionCommand(forward=forward, lateral=0.0, yaw=0.0)
+            yaw = self._with_line_hold(yaw)
             ratio = 0.0 if limit <= 0.0 else min(1.0, abs(yaw) / limit)
             return MotionCommand(
                 forward=settings.forward_speed * ratio, lateral=0.0, yaw=yaw
@@ -1901,7 +1923,7 @@ class GreenJunctionTask:
             scale = max(_TURN_EASE_FLOOR, min(1.0, remaining / abs(target)))
         else:
             scale = 0.0
-        yaw = gain_yaw * scale
+        yaw = self._with_line_hold(gain_yaw * scale)
         # 积分：dt 只在同一段 TURN 里有效，并且夹住异常大的间隔（调试断点/卡帧）。
         if self._turn_last_at is not None:
             dt = now - self._turn_last_at
@@ -2250,6 +2272,7 @@ class GreenJunctionTask:
         centered, line_source = self._line_centered(frame, now)
         self._line_is_centered = bool(centered)
         self._fork_visible = bool(detection.valid)
+        self._near_error = near_field_line(_frame_image(frame), settings)[0]
         # A23 自标定收尾（场地无关）：不认"转了多少度"，只认"选中的那条带子
         # 是不是已经在车正前方"：
         #   1) aligned  —— 岔路形态还看得见：那条分支的带子已经在画面里竖直
@@ -2305,6 +2328,7 @@ class GreenJunctionTask:
         centered, line_source = self._line_centered(frame, now)
         self._line_is_centered = bool(centered)
         self._fork_visible = bool(detection.valid)
+        self._near_error = near_field_line(_frame_image(frame), settings)[0]
         # A21b：岔路口上"线回中央"这个判据**根本不可能成立** —— 路口处整条 Y 形
         # 是**一个**连通块（离线对照：`junction_frame` 的 conf=1.00 就是整块 Y），
         # 近处窄带里也常是劈开的两条，所以 2026-09-17 22:20 那次 settle 整整
