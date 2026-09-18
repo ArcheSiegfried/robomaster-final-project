@@ -211,7 +211,7 @@ class EvidenceWritingTests(unittest.TestCase):
         self.assertTrue(images[0].stat().st_size > 0)
 
     def test_keyframes_are_capped(self):
-        """关键帧只是调试记录，必须封顶；不然交作业时图多到发不完。"""
+        """关键帧可以封顶；默认不封（记录就在本地，可直接读，不必为发送牺牲证据）。"""
         recorder = EvidenceRecorder(
             directory=self.tmp, snapshot_interval=0.0, max_keyframes=3
         )
@@ -221,6 +221,17 @@ class EvidenceWritingTests(unittest.TestCase):
         images = sorted(recorder.run_directory.glob("frame_*.jpg"))
         self.assertEqual(len(images), 3, "关键帧必须停在 max_keyframes 张：%s" % images)
         self.assertEqual(recorder.snapshots, 3)
+
+    def test_keyframes_are_unlimited_by_default(self):
+        """默认 max_keyframes=0 → 不限制，60 帧间隔 0 秒就该存 60 张。"""
+        recorder = EvidenceRecorder(directory=self.tmp, snapshot_interval=0.0)
+        self._recorders.append(recorder)
+        self.assertEqual(recorder.max_keyframes, 0)
+        self._feed(recorder, 60)
+        recorder.close()
+        images = sorted(recorder.run_directory.glob("frame_*.jpg"))
+        self.assertEqual(len(images), 60,
+                         "默认不该封顶，实际只存了 %d 张" % len(images))
 
     def test_the_cap_does_not_touch_scoring_screenshots(self):
         """得分截图不能受关键帧上限影响 —— 老师按它们的张数算分。"""
@@ -276,7 +287,7 @@ class EvidenceWritingTests(unittest.TestCase):
         )
         self.assertEqual(summary["console_log"], "console.log")
         self.assertEqual(summary["scoring_directory"], "scoring")
-        self.assertEqual(summary["max_keyframes"], 20)
+        self.assertEqual(summary["max_keyframes"], 0, "默认不限制关键帧")
 
     def test_snapshot_survives_a_non_ascii_directory(self):
         """目录名里有中文时截图也必须成功。
@@ -593,6 +604,38 @@ class RunReportTests(unittest.TestCase):
         self.assertTrue((recorder.run_directory / "log.csv").exists())
         self.assertTrue(recorder.console_log_path.exists())
         self.assertTrue(recorder.scoring_directory.is_dir())
+
+    def test_log_csv_notes_the_task_event_on_its_frame(self):
+        """`log.csv` 的 note 列要能在**那一帧**上回答"谁接管了、结果如何"。
+
+        2026-09-18 排查"标识被当红灯"时，只有 brightness 曲线是不够的：
+        必须能把 console.log 的 `[27.0s] traffic_light 接管` 落到具体帧号。
+        """
+        recorder = EvidenceRecorder(directory=self.directory)
+        self.addCleanup(recorder.close)
+        for index in range(3):
+            now = 1.0 + index * 0.05
+            recorder.observe(FramePacket(line_frame(320), 100 + index, now), now)
+        # 第 3 帧发生了状态变化：某模块接管
+        recorder.record_decision(
+            self._decision("TASK_ACTIVE", "traffic_light", "RUNNING",
+                           "task took over"),
+            1.1,
+        )
+        recorder.close()
+
+        with recorder.log_path.open(encoding="utf-8-sig") as handle:
+            rows = list(csv.DictReader(handle))
+        self.assertEqual(len(rows), 3)
+        notes = [row["note"] for row in rows]
+        self.assertTrue(
+            any("traffic_light" in note and "RUNNING" in note for note in notes),
+            f"接管事件没写进 log.csv 的 note 列：{notes}",
+        )
+        # 而且必须落在**最后一帧**那一行上（record_decision 紧跟 observe）
+        self.assertIn("traffic_light", rows[-1]["note"],
+                      f"事件应该落在触发它那一帧：{rows[-1]}")
+        self.assertEqual(rows[0]["note"], "", "没变化的帧不该被写花")
 
     def test_run_record_keeps_the_module_own_failure_reason(self):
         """协调器只说"task failed"，模块自己给的原因也必须进记录。

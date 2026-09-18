@@ -29,7 +29,9 @@
         console.log    终端上打过的那些状态行（`[  12.3s] …`）的副本，带时间戳。
                        由 `main.py` 把 ConsoleStatus 的输出同时引到这里（见
                        `main._TeeStream`）。关掉窗口或程序崩了之后还能查发生了什么。
-        frame_000123_0006.15s.jpg   每隔一段时间存一张关键帧（运行记录/调试用）
+        frame_000123_0006.15s.jpg   每隔一段时间存一张关键帧（运行记录/调试用）。
+                       默认**不封顶**（`max_keyframes=0`）；设正数可以防止
+                       无人看管时刷爆磁盘。得分截图不受这个上限影响。
         scoring/        **得分截图专用目录**：老师按这个目录里的张数算分，
                        交作业只交它，调试关键帧不会混进去。
         scoring/task_2_000123_0006.15s.jpg  得分截图（带检测框 + 居中说明文字）
@@ -107,10 +109,15 @@ DEFAULT_FLUSH_INTERVAL = 0.50
 #: 最多每隔这么多秒存一张关键帧（秒）。不是每帧都存图。
 DEFAULT_SNAPSHOT_INTERVAL = 2.0
 
-#: 关键帧总数上限。关键帧只是**调试/运行记录**，不是算分的图，所以封顶；
-#: 得分截图（`scoring/`）**不封顶** —— 老师按那个目录里的张数算分，封顶就是丢分。
-#: 一次运行 20 张够复盘了，而且交付时"一次限发 20 张"也放得下。
-DEFAULT_MAX_KEYFRAMES = 20
+#: 关键帧总数上限。**默认 0 = 不限制。**
+#:
+#: 2026-09-18 调整：原先默认 20，理由是"一次限发 20 张"。但记录就在本地
+#: `captures/` 里、可以直接读，不需要为了"发送"而牺牲证据，所以放开默认值。
+#: 关键帧只是**调试/运行记录**，不是算分的图；设一个正数可以在无人看管时
+#: 防止刷爆磁盘，设 0 表示全留。
+#: **得分截图（`scoring/`）永远不经过这条路径、不受它影响** ——
+#: 老师按那个目录里的张数算分，封顶就是丢分。
+DEFAULT_MAX_KEYFRAMES = 0
 
 #: 得分截图专用子目录名。把算分的图和一个调试用的关键帧分开：
 #: 交作业只交这个目录，不会把调试帧混进去。
@@ -396,6 +403,9 @@ class EvidenceRecorder:
         self._last_event_key = None
         self._last_errors: tuple = ()
         self._last_frame_at: Optional[float] = None
+        #: 本帧刚入队的 CSV 行。`record_decision()` 紧跟 `observe()` 调用，
+        #: 就把状态变化写回这一行的 note 列（见 `_annotate_current_frame`）。
+        self._current_row: Optional[dict] = None
 
         self.run_directory: Optional[Path] = None
         self.log_path: Optional[Path] = None
@@ -456,18 +466,19 @@ class EvidenceRecorder:
             except Exception:
                 mean_v = ""
 
-        self.pending.append(
-            {
-                "sequence": sequence,
-                "captured_at": round(float(getattr(frame, "captured_at", now)), 4),
-                "loop_time": round(float(now), 4),
-                "elapsed_s": round(elapsed, 3),
-                "width": width,
-                "height": height,
-                "mean_v": mean_v,
-                "note": "",
-            }
-        )
+        row = {
+            "sequence": sequence,
+            "captured_at": round(float(getattr(frame, "captured_at", now)), 4),
+            "loop_time": round(float(now), 4),
+            "elapsed_s": round(elapsed, 3),
+            "width": width,
+            "height": height,
+            "mean_v": mean_v,
+            "note": "",
+        }
+        self.pending.append(row)
+        #: 记住本帧那一行，供 record_decision() 回写 note（它紧跟本方法调用）。
+        self._current_row = row
 
         due_snapshot = (
             self.last_snapshot is None
@@ -640,6 +651,36 @@ class EvidenceRecorder:
                 "errors": errors,
             }
         )
+        self._annotate_current_frame(key[2], key[3], message)
+
+    def _annotate_current_frame(self, task, status, message) -> None:
+        """把这次状态变化写回**当前帧那一行**的 ``note`` 列。
+
+        `record_decision()` 在主循环里紧跟在 `observe()` 之后调用，所以
+        `_current_row` 就是本帧那一行。这样 `log.csv` 不再只是亮度曲线：
+        它能直接按帧回答"谁在哪一帧接管了、怎么结束的、为什么"。
+
+        只在状态**变化**时才有内容（`record_decision` 本身就只记变化），
+        所以不会把每行都写花。绝不抛异常。
+        """
+        row = self._current_row
+        if row is None or self._closed:
+            return
+        try:
+            parts = []
+            if task:
+                parts.append(str(task))
+            if status:
+                parts.append(str(status))
+            if message:
+                parts.append(str(message))
+            text = " | ".join(parts)
+            if not text:
+                return
+            existing = str(row.get("note") or "")
+            row["note"] = ("%s; %s" % (existing, text)) if existing else text
+        except Exception:
+            pass
 
     def record_diagnostics(self, title: str, values: dict) -> None:
         """记一段本次运行的诊断信息，结束时作为独立小节写进 report.md。
@@ -843,6 +884,8 @@ class EvidenceRecorder:
                 self.last_flush = now
             return
         rows, self.pending = self.pending, []
+        # 这些行已经落盘，不能再被 record_decision() 回写。
+        self._current_row = None
         try:
             for row in rows:
                 self._writer.writerow(row)

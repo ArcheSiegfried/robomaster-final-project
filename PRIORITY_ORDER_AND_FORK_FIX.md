@@ -187,8 +187,10 @@ fork_light_competition: bool = False   # 退回旧的"红优先"
 ```text
 captures/run_YYYYmmdd_HHMMSS/
 ├── console.log      终端上打过的状态行副本（[  12.3s] …），main 用 tee 同时写终端和这里
-├── log.csv          每帧一行：帧号/采集时刻/循环时刻/已运行秒数/尺寸/亮度
-├── frame_*.jpg      关键帧，**上限 20 张**（DEFAULT_MAX_KEYFRAMES），调试用
+├── log.csv          每帧一行：帧号/采集时刻/循环时刻/已运行秒数/尺寸/亮度/**note**
+│                    note 列在状态变化的那一帧写上"谁接管/什么状态/为什么"，
+│                    可用来把 console.log 的 [27.0s] 精确落到帧号
+├── frame_*.jpg      关键帧，**默认不封顶**（max_keyframes=0），调试用
 ├── scoring/         **得分截图专用目录**：交作业只交它
 │   └── task_<标签>_<帧号>_<秒>s.jpg
 ├── summary.json     含 console_log / scoring_directory / max_keyframes 字段
@@ -197,10 +199,12 @@ captures/run_YYYYmmdd_HHMMSS/
 
 三条边界（都有测试钉住）：
 
-1. **关键帧封顶 20 张**（`DEFAULT_MAX_KEYFRAMES`，构造参数 `max_keyframes`，
-   `<=0` 表示不限制）。超了就不再存，`snapshots` 停在 20。
-2. **得分截图不封顶**：老师按 `scoring/` 里的张数算分，封顶就是丢分。
-   上限只作用于关键帧，两者走不同代码路径。
+1. **关键帧默认不封顶**（`DEFAULT_MAX_KEYFRAMES = 0`；构造参数 `max_keyframes`，
+   正数表示封顶）。2026-09-18 调整：原先默认 20，理由是"一次限发 20 张"，
+   但记录就在本地 `captures/` 里、可以直接读，不需要为"发送"牺牲证据。
+   想防止无人看管时刷爆磁盘就设一个正数。
+2. **得分截图永不封顶**：老师按 `scoring/` 里的张数算分，封顶就是丢分。
+   它走 `save_task_evidence`，与关键帧完全不同的代码路径。
 3. **关键帧不许进 `scoring/`**，得分截图也不会掉到根目录（目录建不出来时才退回根，
    宁可路径难看也不能"存不上分")。
 
