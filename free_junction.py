@@ -2095,6 +2095,50 @@ class FreeJunctionTask:
                 return branch
         return None
 
+    # -- 预约通道（coordinator.RESERVATION_HOOK）---------------------------
+
+    def wants_control(self, frame: FramePacket, now: float) -> bool:
+        """**只读**：这一帧是不是"岔路口 + 某条分支被堵"，值得从别人手里接过运动权？
+
+        为什么需要它（2026-09-18 实车，captures/run_20260918_191329）：
+        `obstacle` 排在注册表第 2 位、本模块第 3 位，而**它没有岔路概念**
+        （搜遍 obstacle.py 没有 fork/junction/branch）。于是第二个岔路口上
+        停着一辆小车时：
+
+            [63.3s] >>> 模块开始运行：obstacle
+            [63.3s]     优先级截断：排在它后面、这一帧没被问到的模块 → free_junction, ...
+            得分截图: Team 10 detects obstacle » the left side
+
+        `obstacle` 把"分支上停着的车"当成路中间的障碍去**往旁边让**，
+        结果**拐进了被堵的那条分支**；而正确做法是**选另一条路**（任务 5）。
+        两个模块都会对这种画面触发，但只有本模块会"选路"。
+
+        所以本模块走预约通道：**只要确认了岔路、且读到某条分支有车**，就声明
+        想要控制权，协调器会让它从 `obstacle` 手里接管（见
+        `coordinator._find_reserved_takeover`）。
+
+        惰性保证（用户要求"跑完全程为先"）：
+        * 没看到岔路 → False，完全不干预巡线也不影响 obstacle；
+        * 看到岔路但两条分支都没车 → False（交给巡线 / 别的模块）；
+        * 只在"岔路 + 有车"同时成立才出手，这正是任务 5 的场景。
+
+        **必须只读**：协调器每帧都会调用它。这里只调检测器，不改状态机。
+        """
+        try:
+            analysis = self.detector.analyze(frame.image)
+        except Exception:
+            return False
+        if not analysis or len(analysis) < 4:
+            return False
+        fork, _roi, _line, rect = analysis[:4]
+        if fork is None or not fork.valid or rect is None:
+            return False
+        try:
+            reading = self._read_blockage(fork, frame.image, rect, now)
+        except Exception:
+            return False
+        return bool(reading is not None and reading.blocked)
+
     # -- IDLE -------------------------------------------------------------
 
     def _step_idle(
