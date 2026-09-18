@@ -383,8 +383,9 @@ class NumberMarkerTask:
         self._target_id: Optional[str] = None
         self._locked_target_width_ratio: Optional[float] = None
         self._tracking_below_trigger = False
-        self._recent_observations = deque(maxlen=32)
+        self._recent_observations = deque(maxlen=40)
         self._diagnostic_events = deque(maxlen=64)
+        self._diagnostic_centered: Optional[bool] = None
         self._last_raw_target: Optional[MarkerCandidate] = None
         self._started_at: Optional[float] = None
         self._lost_since: Optional[float] = None
@@ -541,55 +542,116 @@ class NumberMarkerTask:
     def _note_observation(
         self, event: str, frame: FramePacket, now: float,
         candidate: Optional[MarkerCandidate], *, emit: bool = False,
-        include_recent: bool = False,
+        include_recent: bool = False, phase: Optional[str] = None,
+        yaw_command: Optional[float] = None, reset_reason: Optional[str] = None,
     ) -> None:
-        """Keep a short pre-failure trace and print only significant transitions."""
+        """Record bounded observations; diagnostic errors cannot alter task control."""
 
-        width = frame.image.shape[1]
-        observed_at = None if candidate is None else _finite(candidate.observed_at)
-        age = None if observed_at is None else now - observed_at
-        current_width = None if candidate is None else _finite(candidate.width)
-        ratio = None if current_width is None or width <= 0 else current_width / width
         try:
+            height, width = frame.image.shape[:2]
+            observed_at = None if candidate is None else _finite(candidate.observed_at)
+            age = None if observed_at is None else now - observed_at
+            current_width = None if candidate is None else _finite(candidate.width)
+            ratio = None if current_width is None or width <= 0 else current_width / width
             x = None if candidate is None else _finite(candidate.center[0])
             y = None if candidate is None else _finite(candidate.center[1])
-        except (TypeError, IndexError):
-            x = y = None
-        try:
-            source_sequence = (
-                None if candidate is None or candidate.source_sequence is None
-                else int(candidate.source_sequence)
+            try:
+                source_sequence = (
+                    None if candidate is None or candidate.source_sequence is None
+                    else int(candidate.source_sequence)
+                )
+            except (TypeError, ValueError):
+                source_sequence = None
+            error_x = None if x is None else x - width / 2.0
+            error_y = None if y is None else y - height / 2.0
+            centered_x = (
+                None if error_x is None or candidate is None
+                else abs(error_x) <= candidate.width * self.settings.center_zone_width_fraction / 2.0
             )
-        except (TypeError, ValueError):
-            source_sequence = None
-        entry = {
-            "event": event,
-            "timestamp_monotonic_s": round(now, 6),
-            "frame_sequence": frame.sequence,
-            "locked_target_id": self._target_id,
-            "locked_target_width_ratio": self._locked_target_width_ratio,
-            "candidate_id": None if candidate is None else str(candidate.target_id),
-            "candidate_source_sequence": source_sequence,
-            "current_target_width_ratio": ratio,
-            "x_px": x,
-            "y_px": y,
-            "observation_age": age,
-            "target_lost_age": None if self._lost_since is None else now - self._lost_since,
-        }
-        if self._target_id is not None:
-            self._recent_observations.append(entry)
-        if not emit:
-            return
-        if include_recent:
-            entry = dict(entry, recent_observations=[
-                item for item in self._recent_observations
-                if now - item["timestamp_monotonic_s"] <= 0.5
-            ])
-        self._diagnostic_events.append(entry)
-        try:
+            centered_y = (
+                None if error_y is None or candidate is None
+                else abs(error_y) <= candidate.height * self.settings.center_zone_height_fraction / 2.0
+            )
+            entry = {
+                "event": event,
+                "timestamp_monotonic_s": round(now, 6),
+                "frame_sequence": frame.sequence,
+                "target_id": self._target_id,
+                "locked_target_id": self._target_id,
+                "locked_target_width_ratio": self._locked_target_width_ratio,
+                "candidate_id": None if candidate is None else str(candidate.target_id),
+                "candidate_source_sequence": source_sequence,
+                "current_target_width_ratio": ratio,
+                "x_px": x,
+                "y_px": y,
+                "target_center_x": x,
+                "target_center_y": y,
+                "frame_center_x": width / 2.0,
+                "frame_center_y": height / 2.0,
+                "frame_center_x_px": width / 2.0,
+                "frame_center_y_px": height / 2.0,
+                "x_error_px": error_x,
+                "y_error_px": error_y,
+                "centered_x": centered_x,
+                "centered_y": centered_y,
+                "centered": None if centered_x is None or centered_y is None else centered_x and centered_y,
+                "stable_frames": self._stable_frames,
+                "observation_age": age,
+                "target_lost_age": None if self._lost_since is None else now - self._lost_since,
+                "tracking_below_trigger": self._tracking_below_trigger,
+                "task_state": self.state.value,
+                "task_phase": phase,
+                "phase": phase,
+                "yaw_command": yaw_command,
+                "pitch_target": self._target_pitch,
+                "task_elapsed_s": None if self._started_at is None else now - self._started_at,
+                "task_timeout_remaining_s": (
+                    None if self._started_at is None
+                    else self.settings.max_task_seconds - (now - self._started_at)
+                ),
+            }
+            if reset_reason is not None:
+                entry["reset_reason"] = reset_reason
+            if yaw_command is None and phase == "AIMING:TRACKING_BELOW_TRIGGER":
+                entry["yaw_command"] = (
+                    0.0 if entry["centered"] else self.last_aim_intent.yaw_rate
+                )
+            if self._target_id is not None:
+                if self._recent_observations and self._recent_observations[-1]["frame_sequence"] == frame.sequence:
+                    self._recent_observations[-1] = entry
+                else:
+                    self._recent_observations.append(entry)
+            if not emit:
+                return
+            if include_recent:
+                horizon = 1.5 if event == "TASK_TIMEOUT" else 0.5
+                recent = [item for item in self._recent_observations
+                          if now - item["timestamp_monotonic_s"] <= horizon]
+                entry = dict(entry, recent_observations=recent)
+                if event == "TASK_TIMEOUT":
+                    entry["recent_trace"] = recent
+                    entry["last_observation"] = recent[-2] if len(recent) > 1 else None
+            self._diagnostic_events.append(entry)
             sys.stderr.write("NUMBER_MARKER_DIAG " + json.dumps(entry, sort_keys=True) + "\n")
-        except (OSError, TypeError, ValueError):
+        except Exception:
             pass  # Diagnostics must never interrupt motion safety.
+
+    def _note_center_transition(
+        self, frame: FramePacket, now: float, candidate: MarkerCandidate,
+    ) -> None:
+        """Emit center changes only; this has no role in the aiming decision."""
+
+        try:
+            height, width = frame.image.shape[:2]
+            centered = is_marker_centered(candidate, width, height, self.settings)
+            if self._diagnostic_centered is not None and centered != self._diagnostic_centered:
+                self._note_observation(
+                    "CENTER_ENTER" if centered else "CENTER_EXIT",
+                    frame, now, candidate, emit=True,
+                )
+            self._diagnostic_centered = centered
+        except Exception:
+            pass
 
     def _clamp_pitch(self, pitch: float) -> float:
         return max(self._pitch_min, min(float(pitch), self._pitch_max))
@@ -648,6 +710,11 @@ class NumberMarkerTask:
 
         if self._started_at is not None and now - self._started_at > self.settings.max_task_seconds:
             self.state = MarkerState.FAILED
+            self._note_observation(
+                "TASK_TIMEOUT", frame, now, self._last_raw_target,
+                emit=True, include_recent=True, phase="FAILED:TASK_TIMEOUT",
+                yaw_command=0.0,
+            )
             self._clear_terminal_transients()
             return TaskUpdate(
                 TaskStatus.FAILED,
@@ -657,7 +724,12 @@ class NumberMarkerTask:
             )
 
         if self.state is MarkerState.EVIDENCE_PENDING:
-            return self._step_evidence_pending()
+            update = self._step_evidence_pending()
+            self._note_observation(
+                "FRAME_TRACE", frame, now, None,
+                phase=update.message, yaw_command=0.0,
+            )
+            return update
 
         try:
             selection = self.detect(frame, now, self._target_id)
@@ -687,7 +759,6 @@ class NumberMarkerTask:
         if self._target_id is not None:
             if ratio < self.settings.tracking_min_marker_width_ratio:
                 return self._step_target_lost(frame, now, candidate)
-            self._note_observation("TARGET_TRACKING", frame, now, candidate)
             if ratio > self.settings.min_marker_width_ratio and self._tracking_below_trigger:
                 self._tracking_below_trigger = False
                 self._note_observation("TRACKING_RECOVERED", frame, now, candidate, emit=True)
@@ -707,13 +778,22 @@ class NumberMarkerTask:
             self._target_id = candidate.target_id
             self._locked_target_width_ratio = ratio
             self._tracking_below_trigger = False
-            self._recent_observations.clear()
+            try:
+                self._recent_observations.clear()
+                self._diagnostic_centered = is_marker_centered(
+                    candidate, width, height, self.settings,
+                )
+            except Exception:
+                pass
             self._started_at = now
             self._stable_frames = 0
             self._lost_since = None
             self._begin_pitch_tracking(now)
             self.state = MarkerState.STOPPING
-            self._note_observation("TARGET_LOCKED", frame, now, candidate, emit=True)
+            self._note_observation(
+                "TARGET_LOCKED", frame, now, candidate, emit=True,
+                phase="STOPPING:TARGET_FOUND",
+            )
             return TaskUpdate(
                 TaskStatus.RUNNING,
                 motion=None,
@@ -726,13 +806,25 @@ class NumberMarkerTask:
         intent = compute_aim_intent(candidate, width, height, self.settings)
         self.last_aim_intent = intent
         gimbal = self._integrate_pitch(intent, now)
+        self._note_center_transition(frame, now, candidate)
 
         if ratio <= self.settings.min_marker_width_ratio:
+            previous_stable_frames = self._stable_frames
             self._stable_frames = 0
             self._last_centered_sequence = None
+            if previous_stable_frames:
+                self._note_observation(
+                    "STABLE_FRAMES_RESET", frame, now, candidate, emit=True,
+                    reset_reason="WIDTH_BELOW_EVIDENCE_GATE",
+                    phase="AIMING:TRACKING_BELOW_TRIGGER",
+                )
             if not self._tracking_below_trigger:
                 self._tracking_below_trigger = True
                 self._note_observation("TRACKING_BELOW_TRIGGER", frame, now, candidate, emit=True)
+            self._note_observation(
+                "FRAME_TRACE", frame, now, candidate,
+                phase="AIMING:TRACKING_BELOW_TRIGGER",
+            )
             return TaskUpdate(
                 TaskStatus.RUNNING,
                 motion=MotionCommand(
@@ -745,8 +837,19 @@ class NumberMarkerTask:
             )
 
         if not is_marker_centered(candidate, width, height, self.settings):
+            previous_stable_frames = self._stable_frames
             self._stable_frames = 0
             self._last_centered_sequence = None
+            if previous_stable_frames:
+                self._note_observation(
+                    "STABLE_FRAMES_RESET", frame, now, candidate, emit=True,
+                    reset_reason="CENTER_LOST", phase="AIMING",
+                    yaw_command=intent.yaw_rate,
+                )
+            self._note_observation(
+                "FRAME_TRACE", frame, now, candidate,
+                phase="AIMING", yaw_command=intent.yaw_rate,
+            )
             return TaskUpdate(
                 TaskStatus.RUNNING,
                 motion=MotionCommand(yaw=intent.yaw_rate),
@@ -758,7 +861,19 @@ class NumberMarkerTask:
         if self._last_centered_sequence != frame.sequence:
             self._stable_frames += 1
             self._last_centered_sequence = frame.sequence
+            self._note_observation(
+                "STABLE_FRAME_INCREMENT", frame, now, candidate, emit=True,
+                phase="AIMING:STABLE_{}/{}".format(
+                    self._stable_frames, self.settings.aim_stable_frames,
+                ), yaw_command=0.0,
+            )
         if self._stable_frames < self.settings.aim_stable_frames:
+            self._note_observation(
+                "FRAME_TRACE", frame, now, candidate,
+                phase="AIMING:STABLE_{}/{}".format(
+                    self._stable_frames, self.settings.aim_stable_frames,
+                ), yaw_command=0.0,
+            )
             return TaskUpdate(
                 TaskStatus.RUNNING,
                 motion=MotionCommand(),
@@ -770,6 +885,10 @@ class NumberMarkerTask:
             )
 
         self.state = MarkerState.AIM_LOCKED
+        self._note_observation(
+            "EVIDENCE_READY", frame, now, candidate, emit=True,
+            phase="AIM_LOCKED", yaw_command=0.0,
+        )
         self.aimed_ids.add(candidate.target_id)
         if not self.settings.team_number:
             self.state = MarkerState.FAILED
@@ -786,6 +905,14 @@ class NumberMarkerTask:
             self._queued_evidence = request
             self._evidence_outcome = None
         self.state = MarkerState.EVIDENCE_PENDING
+        self._note_observation(
+            "EVIDENCE_REQUESTED", frame, now, candidate, emit=True,
+            phase="AIM_LOCKED:EVIDENCE_PENDING", yaw_command=0.0,
+        )
+        self._note_observation(
+            "FRAME_TRACE", frame, now, candidate,
+            phase="AIM_LOCKED:EVIDENCE_PENDING", yaw_command=0.0,
+        )
         return TaskUpdate(
             TaskStatus.RUNNING,
             motion=MotionCommand(),
@@ -807,9 +934,16 @@ class NumberMarkerTask:
         candidate: Optional[MarkerCandidate] = None,
     ) -> TaskUpdate:
         self.state = MarkerState.LOST
+        previous_stable_frames = self._stable_frames
         self._stable_frames = 0
         self._last_centered_sequence = None
         self._tracking_below_trigger = True
+        if previous_stable_frames:
+            self._note_observation(
+                "STABLE_FRAMES_RESET", frame, now, candidate, emit=True,
+                reset_reason="TARGET_LOST", phase="TARGET_LOST:HOLD",
+                yaw_command=0.0,
+            )
         # Keep the last absolute target for a brief reacquisition, but move the
         # integration clock forward so lost time can never become pitch motion.
         if self._last_step_at is not None:
@@ -820,6 +954,11 @@ class NumberMarkerTask:
         self._note_observation(
             "TARGET_LOST_GRACE" if first_miss else "TARGET_LOST_HOLD",
             frame, now, candidate, emit=first_miss,
+            phase="TARGET_LOST:HOLD", yaw_command=0.0,
+        )
+        self._note_observation(
+            "FRAME_TRACE", frame, now, candidate,
+            phase="TARGET_LOST:HOLD", yaw_command=0.0,
         )
         if now - self._lost_since > self.settings.target_lost_timeout:
             self._note_observation(
@@ -934,7 +1073,11 @@ class NumberMarkerTask:
         self._locked_target_width_ratio = None
         self._tracking_below_trigger = False
         self._last_raw_target = None
-        self._recent_observations.clear()
+        try:
+            self._recent_observations.clear()
+            self._diagnostic_centered = None
+        except Exception:
+            pass
         self._started_at = None
         self._lost_since = None
         self._stable_frames = 0
