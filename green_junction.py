@@ -2251,7 +2251,14 @@ class GreenJunctionTask:
         # 单独"近处带子居中"**不算数** —— 还没转的时候，那条居中带子就是车自己上来的
         # 主带（22:28 那次就是这么误判成"进了分支"、结果拐上另一条路的）。
         aligned, aligned_why = self._aligned_now()
-        past_fork = bool(centered) and not detection.valid
+        # 口子已在车后：要么岔路形态彻底消失，要么它的下沿已经压到 ROI 底部
+        # （`drove_past_fork_row_ratio`，模块本来就用这条判"车头顶到口子上"）。
+        # 只要求"岔路消失"太严：这个场地的岔路（一条主带弯出去 + 一条贴的短段）
+        # 在画面里会一直存在，2026-09-18 11:41 实测就卡死在这一步。
+        past_fork = bool(centered) and (
+            not detection.valid
+            or detection.band_bottom_ratio >= settings.drove_past_fork_row_ratio
+        )
         rotated = not self._turn_still_needed()
         settled = (
             self._turn_elapsed(now) >= settings.turn_min_duration
@@ -2300,7 +2307,14 @@ class GreenJunctionTask:
         # 于是模块会在口子还在车头前面时就交回巡线，巡线转头挑了另一条带子
         # （2026-09-18 实测：选 left 的车走左边、选 right 的车**也**走左边）。
         aligned, aligned_why = self._aligned_now()
-        past_fork = bool(centered) and not detection.valid
+        # 口子已在车后：要么岔路形态彻底消失，要么它的下沿已经压到 ROI 底部
+        # （`drove_past_fork_row_ratio`，模块本来就用这条判"车头顶到口子上"）。
+        # 只要求"岔路消失"太严：这个场地的岔路（一条主带弯出去 + 一条贴的短段）
+        # 在画面里会一直存在，2026-09-18 11:41 实测就卡死在这一步。
+        past_fork = bool(centered) and (
+            not detection.valid
+            or detection.band_bottom_ratio >= settings.drove_past_fork_row_ratio
+        )
         stable = (
             past_fork
             and self._turn_elapsed(now) >= settings.turn_min_duration
