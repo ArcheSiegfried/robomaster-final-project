@@ -4,6 +4,7 @@
 你只要替换上面的实现即可，不需要改 main.py。
 """
 
+import dataclasses
 import pathlib
 import sys
 import unittest
@@ -102,9 +103,14 @@ def draw_car(image, box):
     cv2.rectangle(image, (x1 - 14, y0 + 2), (x1 - 2, y1 - 2), CAR_ARMOR_GREEN, -1)    # 右装甲
 
 
-def fork_frame(car_left=False, car_right=False, stem_top=300, tips=(200, 440), x=320):
-    """合成岔路帧：主干 + 两条向上张开的分支，可选在某一侧停一辆车。"""
-    image = np.full((360, 640, 3), FLOOR, np.uint8)
+def fork_frame(car_left=False, car_right=False, stem_top=300, tips=(200, 440), x=320,
+               floor=None):
+    """合成岔路帧：主干 + 两条向上张开的分支，可选在某一侧停一辆车。
+
+    `floor` 可以换地面灰度（默认 `FLOOR`）—— 用来验证判据**与场地无关**：
+    考试场地是浅灰地面，练习场地是深色水磨石，两者都要成立。
+    """
+    image = np.full((360, 640, 3), FLOOR if floor is None else floor, np.uint8)
     cv2.rectangle(image, (x - 12, stem_top), (x + 12, 350), BLUE, -1)
     cv2.line(image, (x, stem_top), (tips[0], 190), BLUE, 18)
     cv2.line(image, (x, stem_top), (tips[1], 190), BLUE, 18)
@@ -113,6 +119,313 @@ def fork_frame(car_left=False, car_right=False, stem_top=300, tips=(200, 440), x
     if car_right:
         draw_car(image, CAR_RIGHT_BOX)
     return image
+
+
+#: **没有彩色装甲**的深色车（2026-09-18 新场地那辆车的合成版）。框压在支路胶带上，
+#: 而且底边别太靠下（太靠下会被当成我们自己的车头/影子）。
+DARK_CAR_LEFT_BOX = (185, 185, 275, 245)
+DARK_CAR_RIGHT_BOX = (355, 185, 445, 245)
+#: 一块"没有胶带通向它"的深色块（模拟墙裙/家具）：位置远离那条支路的胶带。
+DARK_BLOB_NO_TAPE_BOX = (30, 185, 120, 245)
+
+
+def draw_dark_car(image, box):
+    """画一辆**只有深色车体、没有任何高饱和彩色**的车。
+
+    这正是 2026-09-18 新场地实车的样子：车框内 S>=100 只占 **0.004**（旧场地那辆
+    是 0.162），于是"深色 + 彩色"的 S1/EP 判据整车找不到 → 不接管 → 巡线自己把车
+    开进那条堵着的支路。这里用它来锁住新的"不看颜色"的兜底判据。
+    """
+    x0, y0, x1, y1 = box
+    cv2.rectangle(image, (x0, y0), (x1, y1), CAR_BODY, -1)
+
+
+class ExamObstacleTests(unittest.TestCase):
+    """**考试摆法**回归：关机/只剩底盘的 EP 停在岔路蓝线上、离岔路口约 1 米。
+
+    用户 2026-09-18 更正：不是"车身上有蓝线"，而是**车停在蓝线上**；
+    而且障碍车**不一定开机、不一定有视觉标签**，甚至可能只剩底盘（云台顶缺失）。
+    所以官方 SDK 可能一次都认不出来（练习场地 `robots_in_snapshot 0` 就是这么回事），
+    判据必须能只靠"一个压在蓝线上的深色物体"成立 —— 这一组用例锁住这件事，
+    并且**不许**依赖练习场地量出来的固定亮度/颜色。
+    """
+
+    def reading(self, image, settings=None):
+        task = FreeJunctionTask(settings) if settings is not None else FreeJunctionTask()
+        fork, _roi, _line, rect = task.detector.analyze(image)
+        self.assertTrue(fork.valid, "这一帧应该能判出岔路")
+        return task._read_blockage(fork, image, rect, 1.0)
+
+    def test_powered_off_chassis_on_the_tape_is_seen_on_any_floor(self):
+        """同一个障碍物、三种地面亮度（很亮的浅灰 / 浅灰 / 深色）都必须认出来。"""
+        for floor in (235, 210, 120):
+            image = fork_frame(floor=floor)
+            draw_powered_off_obstacle(image, EXAM_OBSTACLE_LEFT)
+            reading = self.reading(image)
+            self.assertEqual(reading.reading, BLOCKAGE_LEFT,
+                             "地面亮度 %d 时漏检：%s" % (floor, reading.describe()))
+            self.assertIsNotNone(reading.left_box)
+
+    def test_a_bare_chassis_without_visible_tracks_is_still_seen(self):
+        """连履带都不明显、只有一块深色底盘 → 也要认（顶部缺失/低视角的情形）。"""
+        image = fork_frame(floor=235)
+        draw_powered_off_obstacle(image, EXAM_OBSTACLE_LEFT, wheels=False)
+        self.assertEqual(self.reading(image).reading, BLOCKAGE_LEFT)
+
+    def test_the_obstacle_is_seen_across_the_exam_distance_range(self):
+        """考试距离 0.9~1.1 米，判据的有效范围实测到约 1.3 米（更远就超出设计范围）。"""
+        for label, box in (
+            ("约 1.0 米", (190, 188, 280, 233)),
+            ("约 1.1 米", (195, 190, 275, 230)),
+            ("约 1.3 米", EXAM_OBSTACLE_FAR_LEFT),
+        ):
+            image = fork_frame(floor=235)
+            draw_powered_off_obstacle(image, box)
+            self.assertEqual(self.reading(image).reading, BLOCKAGE_LEFT,
+                             "%s 的车漏检了" % label)
+
+    def test_the_side_is_reported_correctly_and_empty_junctions_are_quiet(self):
+        right = fork_frame(floor=235)
+        draw_powered_off_obstacle(right, EXAM_OBSTACLE_RIGHT)
+        self.assertEqual(self.reading(right).reading, BLOCKAGE_RIGHT)
+        empty = fork_frame(floor=235)
+        self.assertEqual(self.reading(empty).reading, BLOCKAGE_NONE,
+                         "空岔路不该报拥堵")
+
+    def test_the_official_sdk_reading_still_wins_when_it_exists(self):
+        """障碍车万一被官方识别认出来（开机/带视觉标签），官方读数优先、且不看尺寸。"""
+        task = FreeJunctionTask()
+        image = fork_frame(floor=235)
+        task.update_robot_observations([(0.22, 0.45, 0.10, 0.06)], observed_at=1.0)
+        fork, _roi, _line, rect = task.detector.analyze(image)
+        reading = task._read_blockage(fork, image, rect, 1.0)
+        self.assertEqual(reading.reading, BLOCKAGE_LEFT)
+        self.assertEqual(reading.source, "sdk")
+
+
+class ColorlessCarTests(unittest.TestCase):
+    """2026-09-18 新场地：停着的车**完全没有彩色装甲**，只能靠"深色块挡在胶带前"认出来。
+
+    那两次实车（112922 / 113011）都是：岔路判出来了（`valid=True`），但"深色 + 彩色"
+    的 S1/EP 判据整车找不到（掩码 0 像素）→ `reading=none` → 不接管 → 巡线自己把车
+    开进左边那条堵着的支路。这里的合成帧就按那个样子造。
+    """
+
+    def reading(self, image, settings=None):
+        task = FreeJunctionTask(settings) if settings is not None else FreeJunctionTask()
+        fork, _roi, _line, rect = task.detector.analyze(image)
+        self.assertTrue(fork.valid, "这一帧应该能判出岔路")
+        return task._read_blockage(fork, image, rect, 1.0)
+
+    def test_a_colorless_car_on_the_left_branch_is_seen(self):
+        image = fork_frame()
+        draw_dark_car(image, DARK_CAR_LEFT_BOX)
+        reading = self.reading(image)
+        self.assertEqual(reading.reading, BLOCKAGE_LEFT,
+                         "没有彩色装甲的车也必须认出来：%s" % reading.describe())
+        self.assertIsNotNone(reading.left_box, "要给出车的框（得分快照要画它）")
+        self.assertGreater(reading.left_evidence, 0.0)
+
+    def test_a_colorless_car_on_the_right_branch_is_seen(self):
+        image = fork_frame()
+        draw_dark_car(image, DARK_CAR_RIGHT_BOX)
+        reading = self.reading(image)
+        self.assertEqual(reading.reading, BLOCKAGE_RIGHT, reading.describe())
+        self.assertIsNotNone(reading.right_box)
+
+    def test_a_dark_blob_without_tape_under_it_is_not_a_car(self):
+        """没有胶带通向它 → 不是"堵在支路上的车"（墙裙、家具那类深色块）。"""
+        image = fork_frame()
+        draw_dark_car(image, DARK_BLOB_NO_TAPE_BOX)
+        reading = self.reading(image)
+        self.assertEqual(reading.reading, BLOCKAGE_NONE,
+                         "离胶带很远的深色块不该算拥堵：%s" % reading.describe())
+
+    def test_our_own_dark_body_at_the_bottom_is_not_a_car(self):
+        """判据带最下沿那一块是我们自己的车头/影子（2026-09-18 实测就是这么误报的）。"""
+        image = fork_frame()
+        cv2.rectangle(image, (200, 265), (290, 305), CAR_BODY, -1)
+        reading = self.reading(image)
+        self.assertEqual(reading.reading, BLOCKAGE_NONE, reading.describe())
+
+    def test_a_one_frame_criterion_flicker_does_not_kill_the_decision(self):
+        """判据闪断一两帧不能把整个岔路判死（2026-09-18 run_121100 的教训）。
+
+        那次接管后 0.2~0.3 s 读数从"有车"闪成"没车"，旧版 0.25 s 超时立刻 FAILED，
+        整条岔路白跑；现在 `decide_hold_seconds` 内还能用最近一条可用读数继续判。
+        """
+        task = FreeJunctionTask()
+        good = fork_frame()
+        draw_dark_car(good, DARK_CAR_LEFT_BOX)
+        blank = fork_frame()
+        now = 1.0
+        for index in range(8):                       # 先让判据成立、接管
+            task.step(FramePacket(good, index + 1, now), now)
+            now += 0.05
+        self.assertTrue(task.active, "应该已经接管")
+        # 闪断：两帧读不到车，然后恢复
+        for index, image in enumerate([blank, blank, good, blank, good]):
+            update = task.step(FramePacket(image, 100 + index, now), now)
+            now += 0.05
+            self.assertIsNot(update.status, TaskStatus.FAILED,
+                             "闪断不该判失败：%s" % update.message)
+        # 继续走完（APPROACH/TURN/EXIT 需要时间）
+        for index in range(120):
+            update = task.step(FramePacket(good, 200 + index, now), now)
+            now += 0.05
+            if update.status in (TaskStatus.COMPLETED, TaskStatus.FAILED):
+                break
+        self.assertIs(update.status, TaskStatus.COMPLETED,
+                      "闪断之后应该照常完成：%s" % update.message)
+        self.assertIs(task.chosen_branch, Branch.RIGHT)
+
+    def test_a_vanishing_criterion_does_not_fail_the_task(self):
+        """接管后判据立刻消失：**不能 FAILED**，要用刚才那条可用读数继续走。
+
+        这就是 run_121100 的现场：接管后 0.2~0.3 s 读数从"有车"闪成"没车"，
+        旧版 0.25 s 超时立刻 FAILED（报告里 `criterion unavailable: no vehicle on
+        either branch`），整个岔路白跑。现在 `decide_hold_seconds` 内的可用读数
+        会直接把决策推进到 APPROACH，所以任务继续往下走。
+        """
+        task = FreeJunctionTask()
+        good = fork_frame()
+        draw_dark_car(good, DARK_CAR_LEFT_BOX)
+        blank = fork_frame()
+        now = 1.0
+        for index in range(8):
+            task.step(FramePacket(good, index + 1, now), now)
+            now += 0.05
+        self.assertTrue(task.active, "应该已经接管")
+        for index in range(12):                      # 判据一直读不到
+            update = task.step(FramePacket(blank, 100 + index, now), now)
+            now += 0.05
+            self.assertIsNot(update.status, TaskStatus.FAILED,
+                             "判据闪断不该判失败：%s" % update.message)
+        self.assertIsNot(task.state, JunctionState.FAILED)
+        # 软失败的兜底（判据在窗口内始终读不到才走）也要留着：冷却比硬失败短
+        settings = FreeJunctionConfig()
+        self.assertLess(settings.soft_rearm_cooldown, settings.rearm_cooldown)
+
+    def test_the_colorless_path_can_be_switched_off(self):
+        """`occluder_enabled=False` 时行为回到"只认颜色"（旧场地口径，便于对比）。"""
+        settings = dataclasses.replace(FreeJunctionConfig(), occluder_enabled=False)
+        image = fork_frame()
+        draw_dark_car(image, DARK_CAR_LEFT_BOX)
+        self.assertEqual(self.reading(image, settings).reading, BLOCKAGE_NONE)
+        # 有彩色装甲的车照旧认得出（颜色判据没被动过）
+        colored = fork_frame(car_left=True)
+        self.assertEqual(self.reading(colored, settings).reading, BLOCKAGE_LEFT)
+
+    def test_the_criterion_does_not_depend_on_the_venue(self):
+        """**换场地也要成立**：浅灰地面 + 光照偏亮时车身不再是"绝对深色"。
+
+        用户明确：考试场地地面是浅灰、和练习场地不一样；障碍车是 EP 小车、
+        停在岔路上、车下方有蓝线、离岔路口约 0.9~1.1 米。
+        所以判据不能靠"练习场地量出来的固定亮度 90"：
+        这里地面用 235（很亮的浅灰），车身用 135（光照下的中灰），
+        固定阈值（V<=90）会**整辆漏掉**，而"比自己邻域暗"的自适应取块照样认得出。
+        """
+        box = (175, 170, 265, 242)          # 约 1 米外的车，压在左支胶带上
+        image = fork_frame(floor=235)
+        cv2.rectangle(image, (box[0], box[1]), (box[2], box[3]), (135, 135, 135), -1)
+        # 1) 默认（自适应局部阈值）→ 必须认出来
+        reading = self.reading(image)
+        self.assertEqual(reading.reading, BLOCKAGE_LEFT,
+                         "浅灰地面上的车必须认出来：%s" % reading.describe())
+        # 2) 对照：切回"固定亮度 90"的旧口径 → 这一帧必然漏（说明自适应那条真的在起作用）
+        fixed = dataclasses.replace(FreeJunctionConfig(), occluder_mask_mode="fixed",
+                                    occluder_dark_mode="fixed")
+        self.assertEqual(self.reading(image, fixed).reading, BLOCKAGE_NONE,
+                         "固定阈值口径在这一帧应该漏掉（这正是换场地会失败的原因）")
+
+    def test_a_car_one_metre_away_on_a_light_floor_is_seen(self):
+        """**考试规范的距离**：车停在岔路口外约 1 米（画面里只有近处那辆的一半大）。
+
+        合成帧的地面是浅灰（V=210），和用户说的考试场地（浅灰地面）同量级 ——
+        固定亮度阈值（V<=90）在浅灰地面上比在深色地面上更稳，因为车比地面暗得多。
+        """
+        image = fork_frame()
+        draw_far_car(image, FAR_CAR_LEFT_BOX)
+        reading = self.reading(image)
+        self.assertEqual(reading.reading, BLOCKAGE_LEFT,
+                         "1 米外的车也必须认出来：%s" % reading.describe())
+        self.assertIsNotNone(reading.left_box)
+
+    def test_the_official_reading_is_independent_of_distance(self):
+        """官方 SDK 读数**不看尺寸**：1 米外的车框很小也照样算数（`sdk_or_vision` 默认）。"""
+        task = FreeJunctionTask()
+        image = fork_frame()
+        # 归一化坐标：中心 (0.22, 0.45)，宽高只有 0.10 x 0.06 —— 相当于远处的小车
+        task.update_robot_observations([(0.22, 0.45, 0.10, 0.06)], observed_at=1.0)
+        fork, _roi, _line, rect = task.detector.analyze(image)
+        reading = task._read_blockage(fork, image, rect, 1.0)
+        self.assertEqual(reading.reading, BLOCKAGE_LEFT,
+                         "官方说左边有车，框小也必须采信：%s" % reading.describe())
+        self.assertEqual(reading.source, "sdk")
+
+    def test_the_darkness_rule_and_its_measured_boundary(self):
+        """亮度口径的**实测结论**锁在这里（换场地时照这条改）。
+
+        * 绝对阈值 `V<=90`（``occluder_dark_mode="fixed"``）是 126 帧 A/B 里唯一
+          三条目标帧都不误判空侧的口径 —— 浅灰地面（考试场地）下车比地面暗得多，
+          固定阈值反而最稳；
+        * 试过的两种"自适应/相对"口径都**更差**：相对口径（块内亮度 vs 判据带 p60）
+          因为判据带里暗背景多、p60 被拉低，车和背景连片 → 三条目标帧**全漏**；
+          自适应口径（p60 - 40）在深色地面上会误判空侧。
+        """
+        settings = FreeJunctionConfig()
+        self.assertEqual(settings.occluder_dark_mode, "fixed",
+                         "相对/自适应口径实测更差，默认保持固定阈值")
+        self.assertEqual(settings.blockage_source, "sdk_or_vision",
+                         "默认必须官方优先 —— 换场地时靠它兜底")
+        self.assertTrue(settings.occluder_enabled)
+        # 1 米外实测深色占比 0.349，门槛不能高过它（否则 1 米外的车整辆被挡掉）
+        self.assertGreaterEqual(settings.occluder_dark_min_ratio, 0.25)
+        self.assertLessEqual(settings.occluder_dark_min_ratio, 0.40)
+        # 连拍两帧一样的读数才算数（压住单帧误报；A/B 里那 1 帧危险就靠它兜）
+        self.assertGreaterEqual(settings.blockage_confirm_frames, 2)
+        # 判据一时读不到 → 软失败 + 短冷却，别把整个岔路错过
+        self.assertLess(settings.soft_rearm_cooldown, settings.rearm_cooldown)
+        self.assertGreater(settings.decide_hold_seconds, 0.0)
+
+
+#: **1 米以外**的车（考试规范：障碍车停在岔路口外约 1 米）。按几何推算，
+#: 1 米外 EP 车约 90x72 像素；合成帧地面是浅灰（V=210，和考试场地的浅灰地面同量级）。
+FAR_CAR_LEFT_BOX = (175, 170, 265, 242)
+FAR_CAR_RIGHT_BOX = (375, 170, 465, 242)
+
+
+def draw_far_car(image, box):
+    """画一辆"停在约 1 米外、没有彩色装甲"的车（比近处那辆小一半左右）。"""
+    x0, y0, x1, y1 = box
+    cv2.rectangle(image, (x0, y0), (x1, y1), CAR_BODY, -1)
+
+
+#: 考试摆法（用户 2026-09-18 明确）：障碍物是 RoboMaster EP，**关机也可能**、
+#: 甚至**只剩底盘**（云台顶缺失），**停在岔路的蓝线上**、离岔路口 **0.9~1.1 米**。
+#: 尺寸按 1 米外 EP 底盘（约 30cm 宽）折算：约 90x45 像素。
+EXAM_OBSTACLE_LEFT = (190, 188, 280, 233)
+EXAM_OBSTACLE_RIGHT = (360, 188, 450, 233)
+#: 更远一点的同一辆车（约 1.3 米）—— 用来记录判据的有效距离范围。
+EXAM_OBSTACLE_FAR_LEFT = (200, 192, 270, 227)
+
+
+def draw_powered_off_obstacle(image, box, wheels=True):
+    """画一辆**关机、没有灯、没有云台顶**的 EP：只有深灰底盘（+ 两条更黑的履带）。
+
+    这就是考试现场可能的样子：没有高饱和彩色装甲（灯没亮）、顶部缺失、可能没通电。
+    所以判据只能靠"**一个压在蓝线上的深色物体**"这个与外观无关的特征。
+    """
+    x0, y0, x1, y1 = box
+    cv2.rectangle(image, (x0, y0), (x1, y1), (72, 72, 72), -1)          # 深灰底盘
+    height = y1 - y0
+    width = x1 - x0
+    if wheels:
+        wheel_w = max(4, width // 6)
+        cv2.rectangle(image, (x0 + 2, y0 + height // 2), (x0 + 2 + wheel_w, y1 - 2),
+                      (28, 28, 28), -1)
+        cv2.rectangle(image, (x1 - 2 - wheel_w, y0 + height // 2), (x1 - 2, y1 - 2),
+                      (28, 28, 28), -1)
 
 
 def noise_split_frame():
@@ -783,11 +1096,14 @@ class OfficialSdkCriterionTests(unittest.TestCase):
         records = self._replay(task, fork_frame(), stale, start=now, frames=200)
         self.assertIs(records[-1][1].status, TaskStatus.COMPLETED)
 
-    def test_reading_outside_the_corridor_band_is_ignored(self):
-        """带外（画面最下方的自家车头 / 最上方的背景 / ROI 之外）的读数不算数。"""
+    def test_readings_below_the_band_or_outside_the_roi_are_ignored(self):
+        """**比判据带更近**（画面最下方的自家车头）与**横向在岔路 ROI 之外**的读数不算数。
+
+        （2026-09-18 用户要求"官方 SDK 判据优先级高一点"之后，**比判据带更远**
+        的上方读数改成"够宽就采信"——那条在下面单独的用例里。）
+        """
         outside = [
             (0.20, 0.95, 0.18, 0.10),     # 太靠下：自家车头那一带
-            (0.20, 0.02, 0.18, 0.06),     # 太靠上：背景
             (0.01, 0.40, 0.02, 0.10),     # 落在岔路 ROI 横向范围之外
         ]
         for sighting in outside:
@@ -795,8 +1111,41 @@ class OfficialSdkCriterionTests(unittest.TestCase):
             records = self._replay(task, fork_frame(), [sighting], frames=40)
             self.assertIs(
                 records[-1][1].status, TaskStatus.NOT_TRIGGERED,
-                "带外的读数不该成为判据: %s" % (sighting,),
+                "带外/带下的读数不该成为判据: %s" % (sighting,),
             )
+
+    def test_a_far_sighting_above_the_band_counts_when_it_is_wide_enough(self):
+        """**比判据带更远**（画面上方）的官方读数：够宽就采信，太窄（场外远景机器人）不算。
+
+        车停到 1 米之外时，官方识别报出的框可能落在判据带上沿以上；以前一律丢掉，
+        等于白白放弃最可靠的官方判据。
+        """
+        wide = (0.20, 0.02, 0.18, 0.06)       # 上方，宽 18% —— 1~2 米外的车
+        narrow = (0.20, 0.02, 0.02, 0.03)     # 上方，宽 2% —— 远景里的小东西
+        task = self._task()
+        records = self._replay(task, fork_frame(floor=235), [wide])
+        self.assertIs(records[-1][1].status, TaskStatus.COMPLETED,
+                      "够宽的上方读数应该被采信")
+        self.assertIs(task.chosen_branch, Branch.RIGHT)
+        task = self._task()
+        records = self._replay(task, fork_frame(), [narrow], frames=40)
+        self.assertIs(records[-1][1].status, TaskStatus.NOT_TRIGGERED,
+                      "太窄的上方读数不该采信")
+
+    def test_the_official_reading_overrides_a_conflicting_picture(self):
+        """官方与画面**冲突**时以官方为准（这是"官方优先"的硬要求）。
+
+        画面在这一帧会把车认在右边（合成帧右侧放一辆无彩色车），而官方说左边有车
+        → 必须走右支（左支被堵），且读数来源标 `sdk`。
+        """
+        task = self._task()
+        image = fork_frame()
+        draw_dark_car(image, DARK_CAR_RIGHT_BOX)
+        records = self._replay(task, image, [(0.22, 0.45, 0.18, 0.10)])
+        self.assertIs(records[-1][1].status, TaskStatus.COMPLETED)
+        self.assertIs(task.chosen_branch, Branch.RIGHT,
+                      "官方说左边有车 → 必须走右支，不能被画面判据带偏")
+        self.assertEqual(task.last_blockage.source, "sdk")
 
     def test_readings_on_both_sides_fail_instead_of_guessing(self):
         task = self._task()
@@ -1048,8 +1397,12 @@ class JunctionEvidenceTests(unittest.TestCase):
         retry = task.take_evidence_request()
         self.assertIsNotNone(retry, "写盘失败应该按 max_evidence_attempts 重试一次")
         self.assertEqual(retry.attempt, 2)
-        # `request_id` 是**派生属性**（label:frame:attempt），重试只是 attempt 加一
-        self.assertEqual(retry.request_id, "free_junction:frame:2:attempt:2")
+        # `request_id` 是**派生属性**（label:frame:attempt），重试只是 attempt 加一。
+        # 帧号**不写死**：判据节奏参数（`blockage_confirm_frames` / `decide_hold_seconds`）
+        # 一变，排队那一帧就跟着变，但"同一张图重试、attempt 加一"这件事不变。
+        self.assertEqual(retry.request_id.rsplit(":attempt:", 1)[0],
+                         request.request_id.rsplit(":attempt:", 1)[0])
+        self.assertTrue(retry.request_id.endswith(":attempt:2"))
         self.assertNotEqual(retry.request_id, request.request_id)
         self.assertEqual(retry.annotation, request.annotation)
         self.assertIsNotNone(retry.image)

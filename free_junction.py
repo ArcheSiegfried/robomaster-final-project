@@ -361,7 +361,7 @@ class FreeJunctionConfig:
     min_fork_rows: int = 2               # 最少要有几行满足分叉形态（更早触发）
     min_divergence_ratio: float = 0.25   # 最上面一行间距要比分叉行大这么多（A3）
     confirm_frames: int = 2              # 连续几帧看到岔路才算数（求快：4 -> 2）
-    blockage_confirm_frames: int = 1     # 同一个拥堵读数连续几帧才算数（求快：2 -> 1）
+    blockage_confirm_frames: int = 2     # 同一个拥堵读数连续几帧才算数（1 → 2：滤掉单帧误报）
     decide_confirm_frames: int = 1       # 接管后再稳定几帧就落子
     rearm_clear_frames: int = 8          # 岔路消失几帧后才允许再次触发
 
@@ -380,6 +380,18 @@ class FreeJunctionConfig:
     #: 并在 message 里写明 `official robot detection unavailable`，一眼能看出用的是哪套。
     #: ``"sdk"`` = 只用官方读数（没订阅就永远不接管 —— 只用于确认订阅是否通了）；
     #: ``"vision"`` = 只用画面判据（旧行为）。
+    #: ---- 官方 SDK"机器人识别"（判据里**优先级最高**的那条）----
+    #: 2026-09-18 用户明确：障碍物还是完整 EP 小车的可能性很大，**官方判据优先级要高**。
+    #: 官方的优点是与场地/距离/光照/车是否开机无关（只要它认得出），所以：
+    #:   * 判据带内的官方读数 → 直接用（不看尺寸、颜色、形状）；
+    #:   * **比判据带更远**（画面上方）的官方读数 → 只要框够宽（`sdk_min_width_ratio`）
+    #:     也采信（车在 1 米外时框常落在带上沿以上）；
+    #:   * **比判据带更近**（画面最下沿的是我们自己的车身）→ 绝不采信；
+    #:   * 官方与画面判据**冲突**时以官方为准（`_read_blockage` 里先返回官方结果）。
+    #: 官方一条读数都没有时，才退回画面判据兜底（关机/只剩底盘的车就属于这种）。
+    sdk_min_width_ratio: float = 0.05
+    #: "比判据带更远"允许多远：判据带上沿往上占整帧高度的比例。
+    sdk_far_margin_ratio: float = 0.20
     blockage_source: str = "sdk_or_vision"
     #: 官方读数的保鲜窗口（秒）：回调比这还旧就当作"这一帧没看到"。
     #: 宁可退回"没有判据"（不接管），也不拿一条过期读数决定往哪边拐。
@@ -431,6 +443,104 @@ class FreeJunctionConfig:
     #: 光看深色会把背景一起圈进来；而彩色只有小车和胶带有（空地和墙是 0.000）。
     robot_accent_grow_px: int = 9
     robot_close_px: int = 5               # 深色块的闭运算（别太大，免得又粘背景）
+
+    # ---- 兜底判据：**"这条支路上有个车大小的深色块挡道"**（完全不看颜色）----
+    #: 2026-09-18 新场地实车：停着的那辆车**整体深灰、没有任何高饱和装甲/灯**
+    #: （车框内 S>=100 只占 **0.004**，旧场地那辆是 0.162），于是上面"深色 + 彩色"
+    #: 的 S1/EP 判据**整车都找不到**（掩码 0 像素）→ `reading=none` → 不接管
+    #: → 巡线自己把车开进左边那条堵着的支路（两次实车都这样，接管记录里全是
+    #: `LINE_FOLLOWING`、终端写着"不想 -> free_junction"）。
+    #: 官方 SDK 那条路在这种场地上也帮不上：报告里 `robots_in_snapshot 0`、
+    #: 292 次回调**全是空的**（EP 的机器人识别看不到它）。
+    #: 所以再加一条**不看颜色**的判据，只问四件事，四条都成立才算"这条支路被堵"：
+    #:   1) 支路走廊里有个**车大小**的深色块（面积/长宽比/深色占比过闸门）；
+    #:   2) 它**立在地面上**：框正下方是地面（不是又一块深色），且底边不在判据带最下沿
+    #:      （最下沿那是我们自己的车头/影子）；
+    #:   3) **那条支路的胶带从下方通向它**（胶带像素够多）—— "车压在胶带上"的特征；
+    #:   4) 顶到判据带上沿没关系（现场那辆车正好和上方暗背景连成一片），
+    #:      所以这一条**不设**：靠 2)、3) 两条把墙裙/门框/远处暗带挡在外面。
+    #: 全部语料回放（新场地 2 帧 + 旧场地 122 个有岔路的帧）：新场地两帧都判对
+    #: （`left`），旧场地 **right/both 误报 0 次**（安全指标：空的那侧绝不能被误判）。
+    occluder_enabled: bool = True
+    #: 深色阈值怎么定（**默认 fixed**，见下面的实测对比）：
+    #:   * ``"fixed"``（**默认**）—— 用 `occluder_dark_v_max`（90）。
+    #:   * ``"relative"`` —— 块内中位亮度 vs 判据带地面参考（p60 × 比例）。
+    #:     **实测当前不可用**：判据带里暗背景（墙/家具/人）很多，p60 被拉低，
+    #:     "找块"阈值随之放宽、车和背景连成一片 → 126 帧 A/B 里三条目标帧**全漏**。
+    #:     留作选项，将来把"地面参考"换成只统计下半幅地面再启用。
+    #:   * ``"adaptive"`` —— 只管阈值不判相对，实测会误判空侧，不要用。
+    occluder_dark_mode: str = "fixed"
+    #: 相对判据的比例：块内中位亮度 <= 地面参考 × 这个值。
+    #: 0.75 的余量：浅灰地面（V≈235）下多数车身像素落在 100~150 也能过；
+    #: 老水磨石（V≈130）下 90 以下也算。
+    occluder_relative_ratio: float = 0.75
+    #: "找块"用的宽松阈值 = 地面参考 × 这个值（再夹到 floor~ceil）。
+    #: 找块要宽松（否则亮地面上的车根本连不成块），"算不算车"再靠上面的相对判据。
+    occluder_mask_ratio: float = 0.90
+    occluder_mask_floor: int = 45
+    occluder_mask_ceil: int = 150
+    #: **取块方式**（决定"哪块像素算车体"）：
+    #:   * ``"adaptive_local"``（**默认**）—— `cv2.adaptiveThreshold`：像素比自己**邻域**
+    #:     的均值暗 `occluder_local_margin` 就算车体。**与场地无关**：浅灰地面、深色地面、
+    #:     光照强弱都成立；而且远处那片"整体都暗"的背景**不会被连进来**（它邻域也是暗的）。
+    #:     这正是 2026-09-18 用"整条带的 p60 当参考"失败的原因（背景把参考拉低、车和背景连片）。
+    #:   * ``"fixed"`` —— 全局阈值 `occluder_dark_v_max`（练习场地口径，留作对照）。
+    occluder_mask_mode: str = "adaptive_local"
+    #: 自适应阈值的邻域大小（work 像素，会按缩放换算；实际取奇数、>=3）。
+    occluder_local_block_px: int = 31
+    #: "比自己邻域暗多少"才算车体（灰度级）。25 左右对深色车体足够，
+    #: 又不会把胶带的边缘、地面颗粒算进来。
+    occluder_local_margin: int = 25
+    occluder_dark_v_max: int = 90            # mode="fixed" 时的阈值
+    occluder_adaptive_margin: int = 40       # mode="adaptive" 时：地面亮度 - 这个值
+    occluder_adaptive_floor: int = 45        # 自适应阈值下限（别低到分不开车）
+    #: 自适应阈值上限。**别调高**：调到 130 时旧语料立刻出现 3 帧把空侧误判
+    #: （深色地面 + 放宽阈值 = 地面本身也被算成深色）。浅灰地面（考试场地）下
+    #: "地面 200-40=160" 会被夹到 105，而深色车体（V 40~110）照样过。
+    occluder_adaptive_ceil: int = 105
+    #: 框内（抠掉胶带后）深色像素占比下限。
+    #: 0.45 → **0.30**：2026-09-18 实测"车在 1 米外"时这个比例只有 **0.349**
+    #: （近距离那辆是 0.59~0.60），0.45 会把 1 米外的车整辆挡掉 —— 实车 run_121100
+    #: 就是这么"接管了 0.2 秒又判成没车"失败掉的。放宽到 0.30 之后靠
+    #: "落在地面上 + 在支路走廊里/胶带通向它 + 尺寸形状"这几条继续防误报。
+    occluder_dark_min_ratio: float = 0.30
+    #: 面积门槛按"**车在岔路口外约 1 米**"标定（考试规范的距离）：
+    #: 实测那一帧里车占判据带 **8.7%~11.9%**（练习场地车离得更近）；按几何推算
+    #: 1 米外约 **4.2%**、1.5 米约 1.9% —— 所以 0.030 这条线覆盖到约 1.2~1.3 米。
+    #: 曾经为了"1 米"把它降到 0.015，结果旧语料立刻出现 3 帧把空侧误判 → 回退。
+    occluder_min_area_ratio: float = 0.030
+    occluder_max_area_ratio: float = 0.55
+    #: 最小**高度/宽度**占比：挡住又扁又碎的小块（面积和长宽比都过得去的那种）。
+    #: 1 米外的 EP 车高约 72 像素 = 判据带的 26%，所以 0.12 既挡碎块又留足余量。
+    occluder_min_height_ratio: float = 0.12
+    occluder_min_width_ratio: float = 0.05
+    occluder_min_aspect: float = 0.5         # 外接框 宽/高
+    occluder_max_aspect: float = 3.0
+    occluder_max_bottom_ratio: float = 0.80  # 底边低于判据带这个比例 = 太近，算我方车头/影子
+    occluder_floor_band_px: int = 5          # 框正下方查多高（work 像素）
+    occluder_floor_max_dark_ratio: float = 0.45   # 那一条里深色占比要低于这个（下面得是地面）
+    occluder_tape_window_px: int = 45        # 框下方查胶带的高度（work 像素）
+    occluder_tape_min_pixels: int = 150      # 胶带像素下限，按**整帧等效像素**算（真车 924，误报 32）
+    #: **支路走廊**判据（代替"胶带必须在框正下方"这一条的唯一性）：
+    #: 走廊 = 从分叉点指向该分支顶端的那条方向线。框中心必须落在走廊的横向范围内，
+    #: **或者**框正下方有本侧胶带通向它（两条满足其一即可）。
+    #: 为什么必须允许"走廊内但胶带不在正下方"：考试摆法是"障碍车跨在蓝线上、
+    #: 离岔路口约 1 米"，而现场实测还有"车整辆落在蓝线尽头之外、但在支路延长线上"
+    #: 的摆法 —— 那一次（run_121100）就是因为"正下方没有胶带"被判成没车而失败。
+    #: 走廊的横向容差随距离放大（近处窄、远处宽），符合透视。
+    occluder_corridor_min_px: int = 18
+    occluder_corridor_ratio: float = 0.45
+    #: 走廊判据是"**必须**"还是"**可选**"（与"胶带通向它"怎么组合）：
+    #:   * ``False``（**默认**）→ 满足其一即可。考试摆法是"障碍车跨在蓝线上"，
+    #:     "胶带通向它"这条就成立；而支路是**弯的**，用"分叉点→分支顶端"的直线
+    #:     做走廊会跟车对不上（112922 那帧就是这么被漏掉的）。
+    #:   * ``True`` → 两条都要，最保守：126 帧 A/B 里空侧误报 0，但会漏掉
+    #:     "支路弯、走廊直线对不上"的目标帧。
+    #: 实测（126 帧 A/B，`fixed` + 占比 0.30）：``False`` 三条目标帧全中、新增危险 1 帧
+    #: （靠 `blockage_confirm_frames=2`"连续两帧才算"压住）；``True`` 危险 0 但漏 2 帧。
+    occluder_corridor_required: bool = False
+    occluder_tape_grow_px: int = 3           # 算深色块时把胶带撑开这么多（保住"车+穿过它的远处胶带"整块）
+    occluder_min_pixels: int = 40            # 框内有效像素太少就不算（work 像素）
     #: **判据的运算尺度**：<1 = 先把检测带缩小再算（`1.0` = 不缩放）。
     #: 两个比例（深色占比、彩色占比）都是**尺度无关**的，离线实测把整幅画面缩到
     #: 0.45 倍仍然判对，所以缩放几乎不损失判据能力，却把这一步的耗时按面积降下来
@@ -493,7 +603,16 @@ class FreeJunctionConfig:
     # 要求 3：判完哪条堵之后**只做微调** —— 微微转、微微前进，一路看着胶带，
     # 直到岔路标志离开视野、且视野里重新有可用的蓝线，再交回巡线。
     # 所以下面所有速度/角速度都比骨架限幅小一个量级。
-    decide_timeout: float = 0.25      # 原地稳定判据的最长时间（求快：0.6 -> 0.25）
+    decide_timeout: float = 0.60      # 原地稳定判据的最长时间（0.25 → 0.60，见 decide_hold_seconds）
+    #: DECIDE 阶段"读数闪断"的容忍窗口：本帧读不到车时，只要**最近一条可用读数**
+    #: 还在这个窗口内，就继续等（不判失败）。2026-09-18 run_121100：
+    #: 接管后 0.2~0.3 s 内读数从"有车"闪成"没车"，旧的 0.25 s 超时立刻 FAILED，
+    #: 于是整个岔路白跑一次。窗口内继续等就不会因为一帧抖动丢掉路口。
+    decide_hold_seconds: float = 0.50
+    #: **软失败**（判据一时读不到）之后隔多久允许重新接管。
+    #: 硬失败（超时/丢线）仍用 `rearm_cooldown=2.0`；软失败用这个短冷却，
+    #: 车还在往岔路口走，下一帧判据回来就能再接管一次。
+    soft_rearm_cooldown: float = 0.30
     approach_forward: float = 0.08
     #: 对准阶段的增益与限幅。**2026-09-17 12:13~12:18 四次实车全部"转过头再拉回"**
     #: （对准 2 s 一直被 18 deg/s 打满 → 转过头 → 后面靠脚下那条线拉回来，
@@ -1198,6 +1317,217 @@ class VehicleDetector:
             int(x), int(y), int(x + box_width), int(y + box_height)
         )
 
+    def dark_limit(self, value: np.ndarray) -> int:
+        """这一帧"找深色块"用多暗的阈值（`occluder_dark_mode`）。
+
+        * ``"relative"``（默认）：地面参考（带内亮度 **p60**）× `occluder_mask_ratio`，
+          夹到 `[mask_floor, mask_ceil]`。**找块要宽松**：亮地面上车身像素会被抬高，
+          阈值太严就根本连不成块；"到底算不算车"交给 `relative_reference()` 的
+          相对判据（块内中位亮度 <= 参考 × `occluder_relative_ratio`）。
+        * ``"adaptive"``：参考 - `occluder_adaptive_margin`（实测会误判空侧，别用）。
+        * ``"fixed"``：直接用 `occluder_dark_v_max`。
+        """
+        settings = self.settings
+        mode = str(getattr(settings, "occluder_dark_mode", "fixed")).strip().lower()
+        fixed = int(settings.occluder_dark_v_max)
+        reference = self.floor_reference(value)
+        if reference is None or mode == "fixed":
+            return fixed
+        if mode == "relative":
+            limit = reference * float(settings.occluder_mask_ratio)
+            low = float(settings.occluder_mask_floor)
+            high = float(settings.occluder_mask_ceil)
+        else:
+            limit = reference - float(settings.occluder_adaptive_margin)
+            low = float(settings.occluder_adaptive_floor)
+            high = float(settings.occluder_adaptive_ceil)
+        limit = max(low, min(high, limit))
+        return int(round(limit))
+
+    def floor_reference(self, value: np.ndarray) -> Optional[float]:
+        """这条判据带里"地面有多亮"的参考值（p60）。算不出来返回 None。"""
+        if str(getattr(self.settings, "occluder_dark_mode", "")).strip().lower() == "fixed":
+            return None
+        if value is None or getattr(value, "size", 0) == 0:
+            return None
+        try:
+            reference = float(np.percentile(value, 60))
+        except Exception:
+            return None
+        return reference if math.isfinite(reference) else None
+
+    def dark_is_relative(self) -> bool:
+        mode = str(getattr(self.settings, "occluder_dark_mode", "fixed")).strip().lower()
+        return mode == "relative"
+
+    def local_threshold_mode(self) -> bool:
+        """取块是否用"比自己邻域暗"的自适应阈值（`occluder_mask_mode`）。"""
+        mode = str(getattr(self.settings, "occluder_mask_mode", "")).strip().lower()
+        return mode == "adaptive_local"
+
+    def pick_occluder(
+        self,
+        region: np.ndarray,
+        line: Optional[np.ndarray] = None,
+        scale: float = 1.0,
+        corridor: Optional[Tuple[float, float, float, float]] = None,
+    ) -> Tuple[bool, float, Optional[Tuple[int, int, int, int]]]:
+        """**不看颜色**的兜底判据：这条支路上有没有"车大小的深色块挡在胶带前面"。
+
+        背景（为什么需要它）见 :attr:`FreeJunctionConfig.occluder_enabled`：
+        2026-09-18 新场地那辆车**没有彩色装甲**，靠颜色认车的判据整车失效。
+
+        判据（四条都成立才算"被堵"）：
+          1. 深色连通块有车那么大（面积 / 宽高比 / 长宽比过闸门）—— 用**宽松**的
+             "找块"阈值（`dark_limit`），亮地面上车身被抬高也连得成块；
+          2. 它**真的比地面暗**：`occluder_dark_mode="relative"` 时要求块内（抠掉胶带）
+             掩码像素的**中位亮度 <= 地面参考 × `occluder_relative_ratio`** ——
+             换场地（浅灰/深色地面、光照强弱）不用重标定；
+             同时块内占比 >= `occluder_dark_min_ratio`（1 米外实测 0.349，所以是 0.30）；
+          3. 它立在地面上：框正下方那一条不是深色，且底边不在判据带最下沿
+             （最下沿是我们自己的车头/影子，实测就是这么误报的）；
+          4. 它确实"堵在这条支路上"：**落在支路走廊里**（分叉点 → 分支顶端那条方向线，
+             容差随距离放大），**或者**框正下方有本侧胶带通向它。
+             两者取"或"：考试摆法"车跨在蓝线上"两条都成立；现场还有"车整辆在蓝线
+             尽头之外、但在支路延长线上"的摆法（run_121100），那只能靠走廊这条。
+
+        注意第 1 步的连通块用的是**未抠胶带**的深色掩码：现场那辆车常和"穿过去
+        的远处胶带/暗背景"连成一片，先抠胶带会把车体切碎（2026-09-18 踩过）。
+        """
+        settings = self.settings
+        if not bool(getattr(settings, "occluder_enabled", True)):
+            return False, 0.0, None
+        if region is None or region.size == 0:
+            return False, 0.0, None
+        height, width = region.shape[:2]
+        if height < 8 or width < 8:
+            return False, 0.0, None
+        if line is None:
+            line = _blue_mask(region, settings)
+        hsv = cv2.cvtColor(region, cv2.COLOR_BGR2HSV)
+        value = hsv[:, :, 2]
+        reference = self.floor_reference(value)
+        limit = self.dark_limit(value)
+        if self.local_threshold_mode():
+            # **与场地无关的取块**：比自己邻域暗 `occluder_local_margin` 才算车体。
+            # 浅灰地面（考试场地）和深色水磨石（练习场地）用同一套参数；
+            # 远处"整体都暗"的背景不会被连进来（它自己的邻域也暗）。
+            block = max(3, _scaled_px(settings.occluder_local_block_px, scale))
+            if block % 2 == 0:
+                block += 1
+            raw = cv2.adaptiveThreshold(
+                value, 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY_INV,
+                block, int(settings.occluder_local_margin),
+            )
+            # 再并上"绝对很暗"的像素：闪一下、反光等局部对比弱的地方也保住。
+            raw = cv2.bitwise_or(raw, (value <= limit).astype(np.uint8) * 255)
+            raw = (raw > 0).astype(np.uint8)
+        else:
+            raw = (value <= limit).astype(np.uint8)
+        tape = np.zeros(raw.shape, np.uint8)
+        if line is not None and bool(np.any(line)):
+            tape[line] = 255
+            grow = _scaled_px(settings.occluder_tape_grow_px, scale)
+            if grow >= 3:
+                tape = cv2.dilate(tape, _odd_kernel(grow))
+        tape_here = tape > 0
+        if not bool(np.any(raw)):
+            return False, 0.0, None
+        floor_band = max(1, _scaled_px(settings.occluder_floor_band_px, scale))
+        tape_window = max(1, _scaled_px(settings.occluder_tape_window_px, scale))
+        area = float(max(1, height * width))
+        tape_floor = float(max(1, settings.occluder_tape_min_pixels)) * max(1e-6, scale * scale)
+        relative_limit = None
+        if self.dark_is_relative() and reference is not None:
+            relative_limit = reference * float(settings.occluder_relative_ratio)
+        best: Optional[Tuple[float, Tuple[int, int, int, int]]] = None
+        contours, _ = cv2.findContours(raw, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        for contour in contours:
+            x, y, box_width, box_height = cv2.boundingRect(contour)
+            if box_width <= 0 or box_height <= 0:
+                continue
+            area_ratio = (box_width * box_height) / area
+            if not (settings.occluder_min_area_ratio <= area_ratio
+                    <= settings.occluder_max_area_ratio):
+                continue
+            if box_width < settings.occluder_min_width_ratio * width:
+                continue
+            if box_height < settings.occluder_min_height_ratio * height:
+                continue
+            aspect = box_width / float(box_height)
+            if not (settings.occluder_min_aspect <= aspect <= settings.occluder_max_aspect):
+                continue
+            if (y + box_height) / float(height) > settings.occluder_max_bottom_ratio:
+                continue                                    # 太靠下 = 我方车头/影子
+            patch = raw[y:y + box_height, x:x + box_width].astype(bool)
+            patch_tape = tape_here[y:y + box_height, x:x + box_width]
+            free = np.logical_not(patch_tape)
+            total = int(np.count_nonzero(free))
+            if total < int(settings.occluder_min_pixels):
+                continue
+            inside = np.logical_and(patch, free)
+            density = float(np.count_nonzero(inside)) / float(total)
+            if density < settings.occluder_dark_min_ratio:
+                continue
+            if relative_limit is not None:
+                # **相对判据**：这块到底比地面暗多少（中位亮度），而不是绝对亮度。
+                values = value[y:y + box_height, x:x + box_width][inside]
+                if values.size == 0:
+                    continue
+                if float(np.median(values)) > relative_limit:
+                    continue
+            below = raw[y + box_height:y + box_height + floor_band, x:x + box_width]
+            if below.size:
+                below_dark = float(np.count_nonzero(below)) / float(below.size)
+                if below_dark > settings.occluder_floor_max_dark_ratio:
+                    continue                                # 下面还是深色 → 不是地面上的东西
+            box = (x, y, x + box_width, y + box_height)
+            window = tape[y + box_height:min(height, y + box_height + tape_window),
+                          max(0, x - 10):min(width, x + box_width + 10)]
+            # 换算成"整帧等效像素"再比阈值，缩放才不会改变判据强弱。
+            tape_hits = float(np.count_nonzero(window)) if window.size else 0.0
+            on_tape = tape_hits >= tape_floor
+            on_corridor = self._in_corridor(box, corridor)
+            if bool(getattr(settings, "occluder_corridor_required", True)):
+                qualifies = on_tape and on_corridor
+            else:
+                qualifies = on_tape or on_corridor
+            if not qualifies:
+                continue
+            if best is None or density > best[0]:
+                best = (density, box)
+        if best is None:
+            return False, 0.0, None
+        return True, round(float(best[0]), 3), best[1]
+
+    def _in_corridor(
+        self, box: Tuple[int, int, int, int], corridor: Optional[Tuple[float, float, float, float]]
+    ) -> bool:
+        """框中心是否落在"分叉点 → 分支顶端"这条走廊的横向范围内。
+
+        `corridor` = ``(分叉点x, 分叉点y, 分支顶端x, 分支顶端y)``，坐标都是判据带的
+        （可能已缩放的）像素。容差 = ``max(下限, 比例 × 离分叉点的横向距离)``，
+        再加上半个框宽 —— 近处窄、远处宽，符合透视；车稍微偏出中线也算。
+        """
+        if corridor is None:
+            return False
+        split_x, split_y, tip_x, tip_y = (float(v) for v in corridor)
+        x0, y0, x1, y1 = box
+        center_x = (x0 + x1) / 2.0
+        center_y = (y0 + y1) / 2.0
+        span = tip_y - split_y
+        if abs(span) < 1e-6:
+            return False
+        t = (center_y - split_y) / span
+        if t < 0.05 or t > 1.35:            # 允许略超出分支顶端（车停在支路更远处）
+            return False
+        corridor_x = split_x + (tip_x - split_x) * t
+        tolerance = max(
+            float(self.settings.occluder_corridor_min_px),
+            float(self.settings.occluder_corridor_ratio) * abs(corridor_x - split_x),
+        )
+        return abs(center_x - corridor_x) <= tolerance + (x1 - x0) / 2.0
+
     def detect(
         self, region: Optional[np.ndarray], line: Optional[np.ndarray] = None
     ) -> Tuple[bool, float, Optional[Tuple[int, int, int, int]]]:
@@ -1374,6 +1704,14 @@ class FreeJunctionTask:
         #: 一直是 0 就说明集成层还没订阅 robot 识别（那时用的是画面判据兜底）——
         #: 主循环的 message 会直接写出来，实车上一眼可见。
         self.official_sightings = 0
+        #: 官方读数里"落在判据带之外"的条数（最新一帧）。>0 时主循环 message 会说明：
+        #: 官方确实看到了车，只是位置不在带内 —— 这种读数现在也采信（见
+        #: `_read_sdk_blockage`），所以这句话主要是给实车排查用的。
+        self.sdk_outside_band = 0
+        #: 官方读数被丢掉的条数（比判据带更近 = 我们自己的车身 / 太窄 = 场外远景）。
+        #: message 里会写出来，实车上一眼能看出"官方看到了但被过滤掉了"。
+        self.sdk_rejected_near = 0
+        self.sdk_rejected_narrow = 0
         self.last_blockage = BlockageReading(BLOCKAGE_NONE)
         self.last_visual = VisualDetection.no_result(KIND)
         self.chosen_branch: Optional[Branch] = None
@@ -1401,6 +1739,10 @@ class FreeJunctionTask:
         self._blockage_key = BLOCKAGE_NONE
         self._blockage_count = 0
         self._decide_count = 0
+        #: DECIDE 阶段最近一条**可用**读数与它的时刻（`decide_hold_seconds` 内可复用，
+        #: 避免"读数闪断一帧就把整个岔路判死"；2026-09-18 run_121100 的教训）。
+        self._decide_reading: Optional[BlockageReading] = None
+        self._decide_reading_at: Optional[float] = None
         self._clear_count = 0
         self._lost_count = 0
         self._center_count = 0
@@ -1449,6 +1791,8 @@ class FreeJunctionTask:
         self.last_message = "reset"
         self.last_outcome = None
         self._decide_count = 0
+        self._decide_reading = None
+        self._decide_reading_at = None
         self._center_count = 0
         self._handback_count = 0
         self._last_line_mask = None
@@ -1705,15 +2049,24 @@ class FreeJunctionTask:
 
     # -- 官方 SDK 观测（集成层推来的纯数据）--------------------------------
 
-    def update_robot_observations(self, candidates: Iterable, now: Optional[float] = None) -> None:
+    def update_robot_observations(
+        self,
+        candidates: Iterable = (),
+        observed_at: Optional[float] = None,
+        now: Optional[float] = None,
+    ) -> None:
         """主循环推来的**官方 SDK 机器人识别**观测快照（与 5 号 `obstacle.py` 同一套接口）。
 
         接这条通路**不需要改 `main.py` / `task_registry.py`**：`main.py` 的
         `feed_robot_observations()` 每帧对任何实现了本方法的名字调一次
-        （``push(rows, observed_at)``，喂在 `coordinator.step()` 之前）。
+        （``push(rows, observed_at)`` —— **位置参数**，喂在 `coordinator.step()` 之前）。
 
         ⚠️ **不要**改成 `update_candidates`：那个名字属于 `number_marker` 的
         **视觉标签(marker)** 通道（`feed_marker_observations()`），标签不是车。
+
+        时间戳参数**两个名字都收**（``observed_at`` 和 ``now``，位置传入也行）：
+        集成层按位置传值，而本项目其它模块的写法两种都有 —— 2026-09-18 就因为
+        只收 ``now`` 让一处调用炸了 `TypeError`，没必要再踩第二次。
 
         本模块只**存快照**：不订阅、不碰 SDK、不做判定 —— 判定在
         `_read_blockage()` 里，而且只在 `blockage_source` 选了官方读数时才用。
@@ -1722,21 +2075,31 @@ class FreeJunctionTask:
             （``center``/``width``/``height``/``observed_at``），也可以是 SDK 原始行
             ``(x, y, w, h)``（机器人识别）或 ``(x, y, w, h, 标签)``（视觉标签）。
             坐标是归一化还是像素都能认（见 `sighting_from_observation`）。
-        :param now: 给"没有自带时间戳的原始行"打的时间戳（默认取单调钟；
-            离线测试可以传真时钟，这样判定完全可复现）。
+        :param observed_at: 官方回调的**接收时刻**（集成层就是这么传的）。
+        :param now: 同上（兼容旧写法）；两个都不给就用单调钟。
         """
-        try:
-            snapshot = tuple(candidates) if candidates is not None else ()
-        except TypeError:
-            snapshot = ()
-        stamp = time.monotonic() if now is None else now
-        try:
-            stamp = float(stamp)
-        except (TypeError, ValueError):
-            stamp = None
+        snapshot = self._as_row_tuple(candidates)
+        stamp = self._as_stamp(observed_at if observed_at is not None else now)
         with self._sdk_lock:
             self._sdk_rows = snapshot
             self._sdk_pushed_at = stamp
+
+    @staticmethod
+    def _as_row_tuple(rows: Iterable) -> Tuple:
+        try:
+            return tuple(rows) if rows is not None else ()
+        except TypeError:
+            return ()
+
+    @staticmethod
+    def _as_stamp(value: Optional[float]) -> Optional[float]:
+        if value is None:
+            return time.monotonic()
+        try:
+            stamp = float(value)
+        except (TypeError, ValueError):
+            return None
+        return stamp if math.isfinite(stamp) else None
 
     def _sdk_sightings(
         self, frame_width: int, frame_height: int, now: float
@@ -1858,6 +2221,26 @@ class FreeJunctionTask:
         right_blocked, right_score, right_box = self.vehicle.pick(
             mask[:, divider:], right_region, line_region[:, divider:]
         )
+        # 颜色判据没认出来的那一侧，再走一遍**不看颜色**的兜底判据：
+        # 现场（2026-09-18）那辆停着的车没有彩色装甲，只靠颜色整车都找不到。
+        # 走廊 = 分叉点 → 该分支顶端的方向线；坐标换算到 `pick_occluder` 拿到的
+        # 那块 work 图（= 判据带 × factor）里，右侧还要减去它自己的横向偏移 divider。
+        fork_tip_row = max(1, int(_clamp(settings.roi_top, 0.0, 1.0) * height) - top)
+        split_row_work = (int(fork.split_row) - top) * factor
+        left_tip_work = (int(fork.left_x) - left_edge) * factor
+        right_tip_work = (int(fork.right_x) - left_edge) * factor
+        left_corridor = (float(divider), split_row_work, left_tip_work, fork_tip_row * factor)
+        right_corridor = (
+            0.0, split_row_work, right_tip_work - divider, fork_tip_row * factor,
+        )
+        if not left_blocked:
+            left_blocked, left_score, left_box = self.vehicle.pick_occluder(
+                left_region, line_region[:, :divider], factor, left_corridor
+            )
+        if not right_blocked:
+            right_blocked, right_score, right_box = self.vehicle.pick_occluder(
+                right_region, line_region[:, divider:], factor, right_corridor
+            )
 
         if left_blocked and right_blocked:
             reading = BLOCKAGE_BOTH
@@ -1904,6 +2287,12 @@ class FreeJunctionTask:
         if source not in ("sdk", "sdk_or_vision"):
             return ""
         if self.official_sightings > 0:
+            if self.sdk_outside_band:
+                return ("official robot detected (%d far sighting(s) used); "
+                        % self.sdk_outside_band)
+            if self.sdk_rejected_near or self.sdk_rejected_narrow:
+                return ("official robot detection rejected (%d near = own body, %d too narrow); "
+                        % (self.sdk_rejected_near, self.sdk_rejected_narrow))
             return ""
         return "official robot detection unavailable (0 sightings so far; picture criterion); "
 
@@ -1934,13 +2323,29 @@ class FreeJunctionTask:
         sightings = self._sdk_sightings(width, height, now)
         if sightings:
             self.official_sightings += len(sightings)
+        in_band = []
+        far = []
         for sighting in sightings:
             center_x, center_y = sighting.center
-            # 只看"岔路口那条带"和岔路 ROI 的横向范围：和画面判据同一块地方。
-            if center_y < top or center_y > bottom:
-                continue
-            if center_x < left_edge or center_x > right_edge:
-                continue
+            ratio = sighting.width_ratio(width)
+            if left_edge <= center_x <= right_edge and top <= center_y <= bottom:
+                in_band.append(sighting)
+            elif (center_y < top
+                  and center_y >= top - settings.sdk_far_margin_ratio * height
+                  and left_edge <= center_x <= right_edge
+                  and ratio >= settings.sdk_min_width_ratio):
+                # **比判据带更远**（画面上方）的官方读数：车停到 1 米之外时框可能落在
+                # 带上沿以上；以前一律丢掉等于白白放弃最可靠的官方判据。
+                # 但要**够宽**（`sdk_min_width_ratio`）——场外远景里的机器人不该抢戏。
+                far.append(sighting)
+            elif center_y >= top:
+                # 比判据带更近（画面最下沿）= 我们自己的车身，绝不采信。
+                self.sdk_rejected_near += 1
+            else:
+                self.sdk_rejected_narrow += 1
+        self.sdk_outside_band = len(far)
+        for sighting in (in_band or far):
+            center_x, _center_y = sighting.center
             ratio = sighting.width_ratio(width)
             if center_x < split:
                 if left_box is None or ratio > left_score:
@@ -2081,6 +2486,8 @@ class FreeJunctionTask:
         self._enter(JunctionState.DECIDE, now)
         self._run_started_at = now
         self._decide_count = 0
+        self._decide_reading = None
+        self._decide_reading_at = None
         # 判据不成立（两条都有车且没配兜底边）时不排照片：这一帧没有"我们选了哪条路"
         # 可以写，而且车马上就会 FAILED 停下（见 _step_active）。
         if self.chosen_branch is not None:
@@ -2142,8 +2549,25 @@ class FreeJunctionTask:
 
         if self.state is JunctionState.DECIDE:
             branch, reason = self._choose_branch(reading)
+            if branch is not None:
+                # 这一帧读到了可用判据 → 记住它（后面几帧即使闪断也还能用）。
+                self._decide_reading = reading
+                self._decide_reading_at = now
+                self._decide_count += 1
+            else:
+                # 本帧读不到（读数闪断/车被遮住）：`decide_hold_seconds` 之内还可以
+                # 拿最近一条可用读数继续判 —— 2026-09-18 run_121100 就是"接管后
+                # 0.2~0.3 s 读数闪成没车"被旧版 0.25 s 超时判死后白跑一趟岔路。
+                held = None
+                if (self._decide_reading is not None and self._decide_reading_at is not None
+                        and now - self._decide_reading_at <= float(settings.decide_hold_seconds)):
+                    held = self._decide_reading
+                if held is not None:
+                    branch, reason = self._choose_branch(held)
+                    self._decide_count += 1
+                else:
+                    self._decide_count = 0
             self.last_reason = reason
-            self._decide_count += 1
             if (branch is not None
                     and self._decide_count >= max(1, int(settings.decide_confirm_frames))):
                 self.chosen_branch = branch
@@ -2156,7 +2580,10 @@ class FreeJunctionTask:
                        branch.value, reason, reading.describe())
                 )
             if self._elapsed(now) >= settings.decide_timeout:
-                return self._fail(
+                # **软失败**：判据一时读不到，不是"任务做错了"。用短冷却重新拉闸，
+                # 车还在往岔路口走，判据一回来就能再接管一次（旧的 2 s 冷却会让
+                # 整个路口白白错过）。
+                return self._fail_soft(
                     now, "criterion unavailable: %s (%s)" % (reason, reading.describe())
                 )
             return self._running(
@@ -2512,10 +2939,16 @@ class FreeJunctionTask:
         """
         return self._rearm_ready_at is not None and float(now) < self._rearm_ready_at
 
-    def _arm_rearm(self) -> None:
-        """拉起封锁闸门（A9 / A10）：冷却时间 + 等岔路从画面里消失。"""
+    def _arm_rearm(self, cooldown: Optional[float] = None) -> None:
+        """拉起封锁闸门（A9 / A10）：冷却时间 + 等岔路从画面里消失。
+
+        `cooldown` 传值就覆盖 `rearm_cooldown` —— **软失败**（判据一时读不到）
+        用 `soft_rearm_cooldown`（约 0.3 s），好让判据一回来就能再接管；
+        硬失败（超时、丢线）仍走 2 s。
+        """
         base = self._last_now if self._last_now is not None else 0.0
-        self._rearm_ready_at = base + float(self.settings.rearm_cooldown)
+        wait = float(self.settings.rearm_cooldown) if cooldown is None else float(cooldown)
+        self._rearm_ready_at = base + wait
         self._clear_count = 0
         self._confirm_count = 0
         self._blockage_count = 0
@@ -2567,7 +3000,22 @@ class FreeJunctionTask:
     def _fail(self, now: float, message: str) -> TaskUpdate:
         return self._settle(now, TaskStatus.FAILED, message)
 
-    def _settle(self, now: float, status: TaskStatus, message: str) -> TaskUpdate:
+    def _fail_soft(self, now: float, message: str) -> TaskUpdate:
+        """**软失败**：任务本身没做错（判据一时读不到），用短冷却重新拉闸。
+
+        差别只在封锁闸门的冷却时长：硬失败 2 s，软失败 `soft_rearm_cooldown`（0.3 s）。
+        车还在往岔路口走，判据一回来就能再接管一次 —— 2026-09-18 run_121100 那次
+        "接管 0.2 s 就 FAILED"之后，旧的 2 s 冷却把整个路口都错过了。
+        """
+        return self._settle(
+            now, TaskStatus.FAILED, message,
+            cooldown=float(self.settings.soft_rearm_cooldown),
+        )
+
+    def _settle(
+        self, now: float, status: TaskStatus, message: str,
+        cooldown: Optional[float] = None,
+    ) -> TaskUpdate:
         """收尾：零速度、回到 IDLE，并拉起封锁闸门（A9）。"""
         self.state = JunctionState.IDLE
         self.last_outcome = status
@@ -2575,7 +3023,7 @@ class FreeJunctionTask:
         # 故意不覆盖 last_reason：选边的理由要留着当证据（PR / 复盘要用）。
         self._state_since = None
         self._run_started_at = None
-        self._arm_rearm()
+        self._arm_rearm(cooldown)
         return TaskUpdate(
             status,
             motion=STOP,
