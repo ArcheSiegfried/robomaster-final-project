@@ -86,7 +86,7 @@ A5            **"拥堵"= 那条分支的走廊里停着一辆大疆 RoboMaster 
                 空地/暗墙彩色 **0.000**），所以车远到 1~2 米也认得出。
                 胶带连同边缘先抹掉，免得"胶带+影子"被凑成一辆车。
               * `"sdk"`：**只用官方 SDK 的识别结果**（机器人识别 / 视觉标签），
-                由集成层订阅、`main.py` 每帧推给本模块（见 `update_candidates()`）。
+                由集成层订阅、`main.py` 每帧推给本模块（见 `update_robot_observations()`）。
                 这条路上本模块**不看长宽高、不看颜色、不看形状**，只信官方读数。
               * `"sdk_or_vision"`：有新鲜官方读数就用它，没有就退回画面判据。
 
@@ -159,9 +159,15 @@ class SdkSighting:
     任务模块**不许碰 SDK**（红线 8；`tests/task_harness.py` 的
     `FORBIDDEN_PATTERNS` 里有 ``\\brobomaster\\b``，`scripts/check_module.py`
     会把它查出来）。所以官方读数由**集成层**订阅，再由 `main.py` 的
-    `feed_marker_observations()` 每帧推给实现了 `update_candidates()` 的任务
-    —— 和 6 号 `number_marker` 走的是同一条通路，
-    **不需要改 `main.py` / `task_registry.py`**。本模块只消费这个纯数据。
+    `feed_robot_observations()` 每帧推给实现了 `update_robot_observations()` 的任务
+    —— 和 5 号 `obstacle.py` 走的是同一条通路（`robot_source.py` 订阅 SDK 的
+    **机器人识别**，`name="robot"`），**不需要改 `main.py` / `task_registry.py`**。
+    本模块只消费这个纯数据。
+
+    ⚠️ 这条通路**必须**用 `update_robot_observations` 这个名字：`main.py` 的
+    `feed_marker_observations()` 推的是 SDK 的**视觉标签(marker)**，而"墙上的标签"
+    和"岔路上停着一辆车"是两回事 —— 用 `update_candidates` 接会把标签当成车
+    （2026-09-17 的接口适配就是为此改的名）。
     """
 
     center: Tuple[float, float]
@@ -363,7 +369,7 @@ class FreeJunctionConfig:
     # ---- 拥堵判据的**来源**（A5）----
     #: **默认 `"sdk_or_vision"`：官方 SDK 的机器人识别说了算**（大疆 SDK 里
     #: `vision.sub_detect_info(name="robot")` 就是"识别同款 RoboMaster 小车"的接口）。
-    #: 只要主循环把官方读数推给本模块（见 `update_candidates()`），判据就**只**看它：
+    #: 只要主循环把官方读数推给本模块（见 `update_robot_observations()`），判据就**只**看它：
     #: 不看颜色、不看长宽高、不看形状。
     #: 官方读数这一帧没到（例如集成层还没订阅 robot 识别）→ 退回画面判据兜底，
     #: 并在 message 里写明 `official robot detection unavailable`，一眼能看出用的是哪套。
@@ -420,6 +426,38 @@ class FreeJunctionConfig:
     #: 光看深色会把背景一起圈进来；而彩色只有小车和胶带有（空地和墙是 0.000）。
     robot_accent_grow_px: int = 9
     robot_close_px: int = 5               # 深色块的闭运算（别太大，免得又粘背景）
+
+    # ---- 兜底判据：**"这条支路上有个车大小的深色块挡道"**（完全不看颜色）----
+    #: 2026-09-18 新场地实车：停着的那辆车**整体深灰、没有任何高饱和装甲/灯**
+    #: （车框内 S>=100 只占 **0.004**，旧场地那辆是 0.162），于是上面"深色 + 彩色"
+    #: 的 S1/EP 判据**整车都找不到**（掩码 0 像素）→ `reading=none` → 不接管
+    #: → 巡线自己把车开进左边那条堵着的支路（两次实车都这样，接管记录里全是
+    #: `LINE_FOLLOWING`、终端写着"不想 -> free_junction"）。
+    #: 官方 SDK 那条路在这种场地上也帮不上：报告里 `robots_in_snapshot 0`、
+    #: 292 次回调**全是空的**（EP 的机器人识别看不到它）。
+    #: 所以再加一条**不看颜色**的判据，只问四件事，四条都成立才算"这条支路被堵"：
+    #:   1) 支路走廊里有个**车大小**的深色块（面积/长宽比/深色占比过闸门）；
+    #:   2) 它**立在地面上**：框正下方是地面（不是又一块深色），且底边不在判据带最下沿
+    #:      （最下沿那是我们自己的车头/影子）；
+    #:   3) **那条支路的胶带从下方通向它**（胶带像素够多）—— "车压在胶带上"的特征；
+    #:   4) 顶到判据带上沿没关系（现场那辆车正好和上方暗背景连成一片），
+    #:      所以这一条**不设**：靠 2)、3) 两条把墙裙/门框/远处暗带挡在外面。
+    #: 全部语料回放（新场地 2 帧 + 旧场地 122 个有岔路的帧）：新场地两帧都判对
+    #: （`left`），旧场地 **right/both 误报 0 次**（安全指标：空的那侧绝不能被误判）。
+    occluder_enabled: bool = True
+    occluder_dark_v_max: int = 90            # 与 `robot_dark_v_max` 同口径（新场地车体 V 中位 49~113）
+    occluder_dark_min_ratio: float = 0.45    # 框内（抠掉胶带后）深色像素占比（实测车 0.59~0.60）
+    occluder_min_area_ratio: float = 0.030   # 相对判据带面积（新场地那辆车 0.087~0.119）
+    occluder_max_area_ratio: float = 0.55    # 占满画面的大暗块（墙/暗带）不算
+    occluder_min_aspect: float = 0.5         # 外接框 宽/高
+    occluder_max_aspect: float = 3.0
+    occluder_max_bottom_ratio: float = 0.80  # 底边低于判据带这个比例 = 太近，算我方车头/影子
+    occluder_floor_band_px: int = 5          # 框正下方查多高（work 像素）
+    occluder_floor_max_dark_ratio: float = 0.45   # 那一条里深色占比要低于这个（下面得是地面）
+    occluder_tape_window_px: int = 45        # 框下方查胶带的高度（work 像素）
+    occluder_tape_min_pixels: int = 150      # 胶带像素下限，按**整帧等效像素**算（真车 924，误报 32）
+    occluder_tape_grow_px: int = 3           # 算深色块时把胶带撑开这么多（保住"车+穿过它的远处胶带"整块）
+    occluder_min_pixels: int = 40            # 框内有效像素太少就不算（work 像素）
     #: **判据的运算尺度**：<1 = 先把检测带缩小再算（`1.0` = 不缩放）。
     #: 两个比例（深色占比、彩色占比）都是**尺度无关**的，离线实测把整幅画面缩到
     #: 0.45 倍仍然判对，所以缩放几乎不损失判据能力，却把这一步的耗时按面积降下来
@@ -1178,6 +1216,92 @@ class VehicleDetector:
             int(x), int(y), int(x + box_width), int(y + box_height)
         )
 
+    def pick_occluder(
+        self, region: np.ndarray, line: Optional[np.ndarray] = None, scale: float = 1.0
+    ) -> Tuple[bool, float, Optional[Tuple[int, int, int, int]]]:
+        """**不看颜色**的兜底判据：这条支路上有没有"车大小的深色块挡在胶带前面"。
+
+        背景（为什么需要它）见 :attr:`FreeJunctionConfig.occluder_enabled`：
+        2026-09-18 新场地那辆车**没有彩色装甲**，靠颜色认车的判据整车失效。
+
+        这条判据只问四件事，四条都成立才算"被堵"：
+          1. 深色块（V <= `occluder_dark_v_max`）的**连通块**有车那么大（面积/长宽比过闸门）；
+          2. 框内（**抠掉胶带像素**后）深色占比够高（`occluder_dark_min_ratio`）；
+          3. 它立在地面上：框**正下方**那一条不是深色，且底边不在判据带最下沿
+             （最下沿是我们自己的车头/影子，实测就是这么误报的）；
+          4. 框**正下方能看到本侧胶带**且像素够多 —— "车压在胶带上"的几何特征
+             （实测：真车下方 924 帧像素，误报只有 32）。
+
+        注意第 1 步的连通块用的是**未抠胶带**的深色掩码：现场那辆车常和"穿过去
+        的远处胶带/暗背景"连成一片，先抠胶带会把车体切碎（2026-09-18 踩过）。
+        """
+        settings = self.settings
+        if not bool(getattr(settings, "occluder_enabled", True)):
+            return False, 0.0, None
+        if region is None or region.size == 0:
+            return False, 0.0, None
+        height, width = region.shape[:2]
+        if height < 8 or width < 8:
+            return False, 0.0, None
+        if line is None:
+            line = _blue_mask(region, settings)
+        hsv = cv2.cvtColor(region, cv2.COLOR_BGR2HSV)
+        raw = (hsv[:, :, 2] <= int(settings.occluder_dark_v_max)).astype(np.uint8)
+        tape = np.zeros(raw.shape, np.uint8)
+        if line is not None and bool(np.any(line)):
+            tape[line] = 255
+            grow = _scaled_px(settings.occluder_tape_grow_px, scale)
+            if grow >= 3:
+                tape = cv2.dilate(tape, _odd_kernel(grow))
+        tape_here = tape > 0
+        if not bool(np.any(raw)):
+            return False, 0.0, None
+        floor_band = max(1, _scaled_px(settings.occluder_floor_band_px, scale))
+        tape_window = max(1, _scaled_px(settings.occluder_tape_window_px, scale))
+        area = float(max(1, height * width))
+        tape_floor = float(max(1, settings.occluder_tape_min_pixels)) * max(1e-6, scale * scale)
+        best: Optional[Tuple[float, Tuple[int, int, int, int]]] = None
+        contours, _ = cv2.findContours(raw, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        for contour in contours:
+            x, y, box_width, box_height = cv2.boundingRect(contour)
+            if box_width <= 0 or box_height <= 0:
+                continue
+            area_ratio = (box_width * box_height) / area
+            if not (settings.occluder_min_area_ratio <= area_ratio
+                    <= settings.occluder_max_area_ratio):
+                continue
+            aspect = box_width / float(box_height)
+            if not (settings.occluder_min_aspect <= aspect <= settings.occluder_max_aspect):
+                continue
+            if (y + box_height) / float(height) > settings.occluder_max_bottom_ratio:
+                continue                                    # 太靠下 = 我方车头/影子
+            patch = raw[y:y + box_height, x:x + box_width].astype(bool)
+            patch_tape = tape_here[y:y + box_height, x:x + box_width]
+            free = np.logical_not(patch_tape)
+            total = int(np.count_nonzero(free))
+            if total < int(settings.occluder_min_pixels):
+                continue
+            density = float(np.count_nonzero(np.logical_and(patch, free))) / float(total)
+            if density < settings.occluder_dark_min_ratio:
+                continue
+            below = raw[y + box_height:y + box_height + floor_band, x:x + box_width]
+            if below.size:
+                below_dark = float(np.count_nonzero(below)) / float(below.size)
+                if below_dark > settings.occluder_floor_max_dark_ratio:
+                    continue                                # 下面还是深色 → 不是地面上的东西
+            window = tape[y + box_height:min(height, y + box_height + tape_window),
+                          max(0, x - 10):min(width, x + box_width + 10)]
+            if window.size == 0:
+                continue
+            # 换算成"整帧等效像素"再比阈值，缩放才不会改变判据强弱。
+            if float(np.count_nonzero(window)) < tape_floor:
+                continue                                    # 胶带没通向它 → 不是堵在支路上的车
+            if best is None or density > best[0]:
+                best = (density, (x, y, x + box_width, y + box_height))
+        if best is None:
+            return False, 0.0, None
+        return True, round(float(best[0]), 3), best[1]
+
     def detect(
         self, region: Optional[np.ndarray], line: Optional[np.ndarray] = None
     ) -> Tuple[bool, float, Optional[Tuple[int, int, int, int]]]:
@@ -1343,7 +1467,7 @@ class FreeJunctionTask:
         )
         self.state = JunctionState.IDLE
         self.last_detection: Optional[ForkDetection] = None
-        #: 官方 SDK 观测的快照（由 `main.py` 每帧推送，见 `update_candidates()`）。
+        #: 官方 SDK 观测的快照（由 `main.py` 每帧推送，见 `update_robot_observations()`）。
         #: 回调可能来自 SDK 自己的线程，所以读写都要过这把锁。
         self._sdk_lock = threading.Lock()
         self._sdk_rows: Tuple = ()
@@ -1477,12 +1601,15 @@ class FreeJunctionTask:
 
     # -- 官方 SDK 观测（集成层推来的纯数据）--------------------------------
 
-    def update_candidates(self, candidates: Iterable, now: Optional[float] = None) -> None:
-        """主循环推来的**官方 SDK 观测快照**（与 6 号 `number_marker` 同一套接口）。
+    def update_robot_observations(self, candidates: Iterable, now: Optional[float] = None) -> None:
+        """主循环推来的**官方 SDK 机器人识别**观测快照（与 5 号 `obstacle.py` 同一套接口）。
 
         接这条通路**不需要改 `main.py` / `task_registry.py`**：`main.py` 的
-        `feed_marker_observations()` 每帧对任何实现了本方法的名字调一次
-        （``push(candidates)``，喂在 `coordinator.step()` 之前）。
+        `feed_robot_observations()` 每帧对任何实现了本方法的名字调一次
+        （``push(rows, observed_at)``，喂在 `coordinator.step()` 之前）。
+
+        ⚠️ **不要**改成 `update_candidates`：那个名字属于 `number_marker` 的
+        **视觉标签(marker)** 通道（`feed_marker_observations()`），标签不是车。
 
         本模块只**存快照**：不订阅、不碰 SDK、不做判定 —— 判定在
         `_read_blockage()` 里，而且只在 `blockage_source` 选了官方读数时才用。
@@ -1627,6 +1754,16 @@ class FreeJunctionTask:
         right_blocked, right_score, right_box = self.vehicle.pick(
             mask[:, divider:], right_region, line_region[:, divider:]
         )
+        # 颜色判据没认出来的那一侧，再走一遍**不看颜色**的兜底判据：
+        # 现场（2026-09-18）那辆停着的车没有彩色装甲，只靠颜色整车都找不到。
+        if not left_blocked:
+            left_blocked, left_score, left_box = self.vehicle.pick_occluder(
+                left_region, line_region[:, :divider], factor
+            )
+        if not right_blocked:
+            right_blocked, right_score, right_box = self.vehicle.pick_occluder(
+                right_region, line_region[:, divider:], factor
+            )
 
         if left_blocked and right_blocked:
             reading = BLOCKAGE_BOTH

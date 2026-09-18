@@ -4,6 +4,7 @@
 你只要替换上面的实现即可，不需要改 main.py。
 """
 
+import dataclasses
 import pathlib
 import sys
 import unittest
@@ -112,6 +113,81 @@ def fork_frame(car_left=False, car_right=False, stem_top=300, tips=(200, 440), x
     if car_right:
         draw_car(image, CAR_RIGHT_BOX)
     return image
+
+
+#: **没有彩色装甲**的深色车（2026-09-18 新场地那辆车的合成版）。框压在支路胶带上，
+#: 而且底边别太靠下（太靠下会被当成我们自己的车头/影子）。
+DARK_CAR_LEFT_BOX = (185, 185, 275, 245)
+DARK_CAR_RIGHT_BOX = (355, 185, 445, 245)
+#: 一块"没有胶带通向它"的深色块（模拟墙裙/家具）：位置远离那条支路的胶带。
+DARK_BLOB_NO_TAPE_BOX = (30, 185, 120, 245)
+
+
+def draw_dark_car(image, box):
+    """画一辆**只有深色车体、没有任何高饱和彩色**的车。
+
+    这正是 2026-09-18 新场地实车的样子：车框内 S>=100 只占 **0.004**（旧场地那辆
+    是 0.162），于是"深色 + 彩色"的 S1/EP 判据整车找不到 → 不接管 → 巡线自己把车
+    开进那条堵着的支路。这里用它来锁住新的"不看颜色"的兜底判据。
+    """
+    x0, y0, x1, y1 = box
+    cv2.rectangle(image, (x0, y0), (x1, y1), CAR_BODY, -1)
+
+
+class ColorlessCarTests(unittest.TestCase):
+    """2026-09-18 新场地：停着的车**完全没有彩色装甲**，只能靠"深色块挡在胶带前"认出来。
+
+    那两次实车（112922 / 113011）都是：岔路判出来了（`valid=True`），但"深色 + 彩色"
+    的 S1/EP 判据整车找不到（掩码 0 像素）→ `reading=none` → 不接管 → 巡线自己把车
+    开进左边那条堵着的支路。这里的合成帧就按那个样子造。
+    """
+
+    def reading(self, image, settings=None):
+        task = FreeJunctionTask(settings) if settings is not None else FreeJunctionTask()
+        fork, _roi, _line, rect = task.detector.analyze(image)
+        self.assertTrue(fork.valid, "这一帧应该能判出岔路")
+        return task._read_blockage(fork, image, rect, 1.0)
+
+    def test_a_colorless_car_on_the_left_branch_is_seen(self):
+        image = fork_frame()
+        draw_dark_car(image, DARK_CAR_LEFT_BOX)
+        reading = self.reading(image)
+        self.assertEqual(reading.reading, BLOCKAGE_LEFT,
+                         "没有彩色装甲的车也必须认出来：%s" % reading.describe())
+        self.assertIsNotNone(reading.left_box, "要给出车的框（得分快照要画它）")
+        self.assertGreater(reading.left_evidence, 0.0)
+
+    def test_a_colorless_car_on_the_right_branch_is_seen(self):
+        image = fork_frame()
+        draw_dark_car(image, DARK_CAR_RIGHT_BOX)
+        reading = self.reading(image)
+        self.assertEqual(reading.reading, BLOCKAGE_RIGHT, reading.describe())
+        self.assertIsNotNone(reading.right_box)
+
+    def test_a_dark_blob_without_tape_under_it_is_not_a_car(self):
+        """没有胶带通向它 → 不是"堵在支路上的车"（墙裙、家具那类深色块）。"""
+        image = fork_frame()
+        draw_dark_car(image, DARK_BLOB_NO_TAPE_BOX)
+        reading = self.reading(image)
+        self.assertEqual(reading.reading, BLOCKAGE_NONE,
+                         "离胶带很远的深色块不该算拥堵：%s" % reading.describe())
+
+    def test_our_own_dark_body_at_the_bottom_is_not_a_car(self):
+        """判据带最下沿那一块是我们自己的车头/影子（2026-09-18 实测就是这么误报的）。"""
+        image = fork_frame()
+        cv2.rectangle(image, (200, 265), (290, 305), CAR_BODY, -1)
+        reading = self.reading(image)
+        self.assertEqual(reading.reading, BLOCKAGE_NONE, reading.describe())
+
+    def test_the_colorless_path_can_be_switched_off(self):
+        """`occluder_enabled=False` 时行为回到"只认颜色"（旧场地口径，便于对比）。"""
+        settings = dataclasses.replace(FreeJunctionConfig(), occluder_enabled=False)
+        image = fork_frame()
+        draw_dark_car(image, DARK_CAR_LEFT_BOX)
+        self.assertEqual(self.reading(image, settings).reading, BLOCKAGE_NONE)
+        # 有彩色装甲的车照旧认得出（颜色判据没被动过）
+        colored = fork_frame(car_left=True)
+        self.assertEqual(self.reading(colored, settings).reading, BLOCKAGE_LEFT)
 
 
 def noise_split_frame():
@@ -677,9 +753,13 @@ class _FakeCandidate(object):
 class OfficialSdkCriterionTests(unittest.TestCase):
     """**官方 SDK 识别结果当判据**（`blockage_source="sdk"`）。
 
-    官方读数走的是 `main.py` 的 `feed_marker_observations()` → 任务上的
-    `update_candidates()`（和 6 号 `number_marker` 同一条通路），
+    官方读数走的是 `main.py` 的 `feed_robot_observations()`（`robot_source.py` 订阅
+    SDK 的**机器人识别**）→ 任务上的 `update_robot_observations()`
+    （和 5 号 `obstacle.py` 同一条通路），
     本模块只消费纯数据、不碰 SDK。所以这里全部用假读数离线验证。
+
+    ⚠️ 别把这条通路接回 `update_robot_observations()`：那是 `number_marker` 的**视觉标签**
+    通道，标签不是车（接线回归在 `tests/test_free_junction_observation_wiring.py`）。
 
     重点证明一件事：**这条路上判据只有官方读数** ——
     画面里没有车（`fork_frame()`）也能判对，画面里画了车也不作数。
@@ -694,7 +774,7 @@ class OfficialSdkCriterionTests(unittest.TestCase):
         records = []
         now = start
         for index in range(frames):
-            task.update_candidates(sightings, now=now)
+            task.update_robot_observations(sightings, now=now)
             update = task.step(FramePacket(image, index + 1, now), now)
             records.append((task.state, update, now))
             now += dt
@@ -736,7 +816,7 @@ class OfficialSdkCriterionTests(unittest.TestCase):
         now = 1.0
         stale = [(0.20, 0.40, 0.18, 0.26)]
         for index in range(40):
-            task.update_candidates(stale, now=now - 1.0)      # 时间戳整整旧了 1 秒
+            task.update_robot_observations(stale, now=now - 1.0)      # 时间戳整整旧了 1 秒
             update = task.step(FramePacket(fork_frame(), index + 1, now), now)
             self.assertIs(update.status, TaskStatus.NOT_TRIGGERED)
             now += 0.05
@@ -861,15 +941,15 @@ class OfficialSdkCriterionTests(unittest.TestCase):
         """快照是"整体替换"：官方改口说"什么也没看到"，读数就得跟着变。"""
         task = self._task()
         image = fork_frame()
-        task.update_candidates([(0.20, 0.40, 0.18, 0.26)], now=1.0)
+        task.update_robot_observations([(0.20, 0.40, 0.18, 0.26)], now=1.0)
         task.step(FramePacket(image, 1, 1.0), 1.0)
         self.assertEqual(task.last_blockage.reading, BLOCKAGE_LEFT)
 
-        task.update_candidates([], now=1.05)          # 官方这一帧什么也没看到
+        task.update_robot_observations([], now=1.05)          # 官方这一帧什么也没看到
         task.step(FramePacket(image, 2, 1.05), 1.05)
         self.assertEqual(task.last_blockage.reading, BLOCKAGE_NONE)
 
-        task.update_candidates([(0.80, 0.40, 0.18, 0.26)], now=1.10)   # 换成右边
+        task.update_robot_observations([(0.80, 0.40, 0.18, 0.26)], now=1.10)   # 换成右边
         task.step(FramePacket(image, 3, 1.10), 1.10)
         self.assertEqual(task.last_blockage.reading, BLOCKAGE_RIGHT)
 
