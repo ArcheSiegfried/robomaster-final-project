@@ -59,21 +59,12 @@ class MainStartupTests(unittest.TestCase):
         robot_instance = _FakeRobot()
         previous = sys.modules.get("robomaster")
         _install_fake_sdk(robot_instance)
-        # 让网络预检通过，这样才会真的走到 SDK 的 initialize（本测试的意图是
-        # "提示打在碰硬件之前"，不是测网络）。真实机器上连不上时预检会先给诊断，
-        # 那条路径由 ConnectPreflightTests 单独覆盖。
-        original_local = main._local_ap_address
-        original_probe = main._robot_reachable
-        main._local_ap_address = lambda *a, **k: "192.168.2.23"
-        main._robot_reachable = lambda *a, **k: True
         buffer = io.StringIO()
         try:
             with contextlib.redirect_stdout(buffer):
                 with self.assertRaises(RuntimeError):
                     main.main()
         finally:
-            main._local_ap_address = original_local
-            main._robot_reachable = original_probe
             if previous is not None:
                 sys.modules["robomaster"] = previous
             else:
@@ -177,150 +168,6 @@ class RuntimeDiagnosticsTests(unittest.TestCase):
         text = self._report(recorder)
         self.assertIn("数字标识", text)
         self.assertIn("没有建立", text)
-
-
-class ConnectPreflightTests(unittest.TestCase):
-    """连不上车时必须给**能照着做的**诊断，而不是 SDK 内部的 traceback。
-
-    2026-09-18 现场被误导过一次：真正原因是没连上车的热点，屏幕上却只有
-    `Exception ignored in: <function Client.__del__ ...>
-     AttributeError: 'NoneType' object has no attribute 'is_alive'`
-    —— 那条来自 SDK 的 `Client.__del__ → stop()`（建连接失败时 `_thread` 仍是
-    None），它会**盖住真正的原因**。所以现在在调 SDK 之前先探一次。
-
-    ⚠️ 另一条教训：探针**必须走 UDP 20020**。我第一版探 TCP 80/20001，
-    结果"已经连上车了也报连不上"—— 车的控制通道是 UDP，TCP 必然超时。
-    `test_the_probe_uses_udp_not_tcp` 就是钉住这一点的。
-    """
-
-    def _patch(self, local="192.168.2.23", reachable=True):
-        import main
-
-        original_local = main._local_ap_address
-        original_probe = main._robot_reachable
-        main._local_ap_address = lambda *a, **k: local
-        main._robot_reachable = lambda *a, **k: reachable
-        self.addCleanup(setattr, main, "_local_ap_address", original_local)
-        self.addCleanup(setattr, main, "_robot_reachable", original_probe)
-
-    def test_unreachable_robot_does_not_block_but_warns(self):
-        """**回归（我自己的错）**：探测探不通**不许拦住连接**。
-
-        我第一版把探测做成了硬闸门（探不通就 SystemExit）。结果探针自己写错三次
-        （先探 TCP、再写死绑 .23、又用错 send_self），每次都把"网络本来是好的"
-        报成"连不上"，白白让现场去查网络。教训：**诊断不能有能力阻止一次
-        本来能成功的连接**。所以现在探不通也要继续往下走，让 SDK 自己判。
-        """
-        import main
-
-        self._patch(local="192.168.2.24", reachable=False)
-        built = object()
-        module = types.SimpleNamespace(Robot=lambda: built)
-
-        printed = io.StringIO()
-        with contextlib.redirect_stdout(printed):
-            robot = main._connect_robot(module)
-
-        self.assertIs(robot, built, "探测失败也必须继续建立机器人对象")
-        text = printed.getvalue()
-        self.assertIn("192.168.2.24", text, "要把本机实际地址打出来")
-        self.assertIn("没有应答", text, "要如实说明探测没收到应答")
-
-    def test_missing_local_ap_address_warns_but_still_connects(self):
-        """本机没有 192.168.2.x 时也只提示、不拦路。"""
-        import main
-
-        self._patch(local=None, reachable=False)
-        built = object()
-        module = types.SimpleNamespace(Robot=lambda: built)
-
-        printed = io.StringIO()
-        with contextlib.redirect_stdout(printed):
-            robot = main._connect_robot(module)
-
-        self.assertIs(robot, built)
-        text = printed.getvalue()
-        self.assertIn("没有 192.168.2.x", text)
-        self.assertIn("仍然继续尝试连接", text)
-
-    def test_reachable_robot_builds_the_object(self):
-        import main
-
-        self._patch(local="192.168.2.23", reachable=True)
-        built = object()
-        module = types.SimpleNamespace(Robot=lambda: built)
-        self.assertIs(main._connect_robot(module), built)
-
-    def test_the_probe_never_raises(self):
-        """探测本身绝不能抛异常（没网、SDK 不在、绑不上端口都只该返回 False）。"""
-        import main
-
-        self.assertIn(main._robot_reachable(timeout=0.05), (True, False))
-        self.assertIsInstance(main._local_ap_address(), (str, type(None)))
-
-    def test_the_probe_uses_udp_not_tcp(self):
-        """**回归**：探针必须走 UDP 20020，不能退回 TCP。
-
-        我第一版用的是 `socket.create_connection`（TCP 80/20001），实车"已经
-        连上热点"也报连不上。车的控制通道是 UDP，这条钉住不再犯。
-
-        **只看代码，不看注释/docstring** —— 函数说明里正当地解释了
-        "为什么不能用 send_self"，用整段源码做断言会把自己讲过的坑当成违规。
-        """
-        import ast
-        import inspect
-        import re
-
-        import main
-
-        source = inspect.getsource(main._robot_reachable)
-        # 去掉 docstring 与注释再看代码：函数说明里正当地写了
-        # "为什么不能用 send_self"，用整段源码断言会把自己讲过的坑当成违规。
-        code = re.sub(r'"""(?:.|\n)*?"""', "", source)
-        code = re.sub(r"'''(?:.|\n)*?'''", "", code)
-        code = "\n".join(line.split("#", 1)[0] for line in code.splitlines())
-        self.assertIn("udp", code.lower(), "探针必须显式用 UDP")
-        self.assertNotIn("create_connection", code,
-                         "create_connection 是 TCP —— 会误报连不上车")
-        self.assertNotIn("send_self", code,
-                         "send_self 发给本机自己，机器人收不到")
-        self.assertEqual(main.ROBOT_AP_PORT, 20020)
-
-    def test_alignment_fixes_the_hardcoded_local_address(self):
-        """**回归**：SDK 把本机地址写死成 192.168.2.23，实际是别的值时连不上。
-
-        现场是 `.24`：`Connection.create()` 的 `bind(('192.168.2.23', 10100))`
-        直接抛 OSError → `_conn=None` → 连不上，最后只剩一条
-        `AttributeError: 'NoneType' object has no attribute 'is_alive'`。
-        这里验证会把它对齐到实际地址。
-        """
-        import main
-        import robomaster.config as sdk_config
-
-        original_setting = sdk_config.LOCAL_IP_STR
-        original_local = main._local_ap_address
-        main._local_ap_address = lambda *a, **k: "192.168.2.24"
-        sdk_config.LOCAL_IP_STR = None
-        self.addCleanup(setattr, main, "_local_ap_address", original_local)
-        self.addCleanup(setattr, sdk_config, "LOCAL_IP_STR", original_setting)
-
-        self.assertEqual(main._align_local_address(), "192.168.2.24")
-        self.assertEqual(sdk_config.LOCAL_IP_STR, "192.168.2.24")
-
-    def test_alignment_respects_an_explicit_setting(self):
-        """用户显式设过 LOCAL_IP_STR 就不许被覆盖。"""
-        import main
-        import robomaster.config as sdk_config
-
-        original_setting = sdk_config.LOCAL_IP_STR
-        original_local = main._local_ap_address
-        main._local_ap_address = lambda *a, **k: "192.168.2.99"
-        sdk_config.LOCAL_IP_STR = "192.168.2.50"
-        self.addCleanup(setattr, main, "_local_ap_address", original_local)
-        self.addCleanup(setattr, sdk_config, "LOCAL_IP_STR", original_setting)
-
-        self.assertEqual(main._align_local_address(), "192.168.2.50")
-        self.assertEqual(sdk_config.LOCAL_IP_STR, "192.168.2.50")
 
 
 class ConsoleTeeTests(unittest.TestCase):
