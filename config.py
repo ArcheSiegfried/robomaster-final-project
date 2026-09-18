@@ -136,11 +136,21 @@ class RuntimeConfig:
     gimbal_yaw_speed: int = 60
     gimbal_settle_seconds: float = 0.45
     # 数字标识的 SDK marker 订阅（见 marker_source.py）。
-    # marker_color: SDK 的 marker 颜色过滤器只能设一个。留空 = 不设过滤器。
-    #   实车如果一直收不到 marker，依次试 "red" / "green" / "blue"。
-    # marker_coordinate_mode: "auto" 自动判断回调坐标是归一化还是像素；
-    #   实车第一次跑请核对 marker_source.stats() 的判断结果。
-    marker_color: str = ""
+    #
+    # **2026-09-18 改为 `"red"`**：在此之前一直是空（=不设过滤器），而四次实车
+    # run 的 `report.md` 里全都是：
+    #     callbacks 2 / empty_callbacks 2
+    #     markers_in_snapshot 0 / observed_candidates 0
+    #    提醒：还没有收到任何 marker 回调
+    # 也就是 SDK 的 marker 识别**一次都没有报出任何标识**。
+    # `marker_source.py:30` 自己写着"一直收不到就把 color 依次改成
+    # red/green/blue" —— 这条一直没试过。SDK 的 `sub_detect_info(name="marker")`
+    # 内部会调 `_set_color()`，不设过滤器时它只打一条 warning 就跳过，
+    # 所以**很可能必须给一个颜色才能真正工作**。
+    # 现场标识是红底方牌（tests/samples/real_marker_square_red.jpg），先试 "red"。
+    # 若仍为 0，依次试 "green" / "blue"；试完都不行就说明这批牌子不是
+    # DJI 官方 vision marker，SDK 这条路走不通，得改用相机帧自己识别。
+    marker_color: str = "red"
     marker_coordinate_mode: str = "auto"
     # 终端状态反馈（丢线、任务接管、异常、心跳）。False = 完全不打印。
     console_status: bool = True
