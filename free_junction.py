@@ -372,15 +372,27 @@ class FreeJunctionConfig:
     require_blockage_to_trigger: bool = True  # 两条都没车就不接管（A6）
 
     # ---- 拥堵判据的**来源**（A5）----
-    #: **默认 `"sdk_or_vision"`：官方 SDK 的机器人识别说了算**（大疆 SDK 里
-    #: `vision.sub_detect_info(name="robot")` 就是"识别同款 RoboMaster 小车"的接口）。
-    #: 只要主循环把官方读数推给本模块（见 `update_robot_observations()`），判据就**只**看它：
-    #: 不看颜色、不看长宽高、不看形状。
-    #: 官方读数这一帧没到（例如集成层还没订阅 robot 识别）→ 退回画面判据兜底，
-    #: 并在 message 里写明 `official robot detection unavailable`，一眼能看出用的是哪套。
-    #: ``"sdk"`` = 只用官方读数（没订阅就永远不接管 —— 只用于确认订阅是否通了）；
-    #: ``"vision"`` = 只用画面判据（旧行为）。
-    blockage_source: str = "sdk_or_vision"
+    #:
+    #: **2026-09-18 改为 `"vision"`（只用画面判据）**，理由全是实车数据：
+    #:
+    #: 1. 官方机器人识别**从来没给出过读数**：三次 run 的 `report.md` 里
+    #:    `robots_in_snapshot` 恒为 **0**（`observed_boxes` 786~2554 个，
+    #:    只是从没被判成小车）；后来连 `observed_boxes` 也掉到 31 个。
+    #: 2. 所以 `"sdk_or_vision"` 实际上**每次都走画面兜底**，
+    #:    再叠加 `official_health_gate` 就变成**永远不接管**——
+    #:    第二个岔路口上真停着一辆车（任务 5）时本模块也不动，
+    #:    结果被 `obstacle` 抢走并**冲进被堵的那条分支**
+    #:    （见 captures/run_20260918_191329 的得分截图）。
+    #: 3. 画面判据自带**距离闸门** `min_vehicle_width_ratio = 0.20`，
+    #:    是拿真实场地标定过的（注释：车 0.39 / 空 0.15~0.28）：
+    #:    停着的车够大能过，远处椅子那种小目标过不了。
+    #:
+    #: 为什么不是 `"sdk_or_vision"`：那条路会被 `official_health_gate` 拦死
+    #: （订阅成功却没有读数 → 判定"官方在正常工作、画面判据必然是误判"）。
+    #: 既然官方读数根本不可用，就**明确地只用画面判据**，别绕那道闸门。
+    #:
+    #: 想恢复旧行为：改回 `"sdk_or_vision"`。
+    blockage_source: str = "vision"
     #: 官方读数的保鲜窗口（秒）：回调比这还旧就当作"这一帧没看到"。
     #: 宁可退回"没有判据"（不接管），也不拿一条过期读数决定往哪边拐。
     sdk_observation_hold_seconds: float = 0.35

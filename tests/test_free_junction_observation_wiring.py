@@ -25,7 +25,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 import main  # noqa: E402
-from free_junction import FreeJunctionTask  # noqa: E402
+from free_junction import FreeJunctionConfig, FreeJunctionTask  # noqa: E402
 from models import FramePacket, TaskStatus  # noqa: E402
 from number_marker import MarkerCandidate  # noqa: E402
 from tests.test_free_junction import fork_frame  # noqa: E402
@@ -94,7 +94,9 @@ class WiringTests(unittest.TestCase):
         （`main.py` 里 `now = time.monotonic()`），所以这里必须用同一个钟 —— 否则观测会被
         判成"过期"（age < 0）而丢掉，跟真实运行不是一回事。
         """
-        task = FreeJunctionTask()
+        task = FreeJunctionTask(
+            FreeJunctionConfig(blockage_source="sdk_or_vision")
+        )
         coordinator = SimpleNamespace(motion_tasks=(task,))
         source = FakeRobotSource(((0.20, 0.40, 0.18, 0.26),))
         image = fork_frame()

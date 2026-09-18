@@ -836,19 +836,34 @@ class OfficialSdkCriterionTests(unittest.TestCase):
             )
             self.assertIs(task.chosen_branch, Branch.RIGHT, label)
 
-    def test_the_default_source_prefers_the_official_reading(self):
-        """**默认配置下官方 SDK 的读数说了算**（要求：判据用官方机器人识别）。
+    def test_the_official_reading_wins_when_that_source_is_selected(self):
+        """选了 `sdk_or_vision` 时，官方 SDK 的读数说了算。
 
-        画面里"左支有车"、官方读数却说右边有车 —— 默认必须听**官方**的
+        画面里"左支有车"、官方读数却说右边有车 —— 该模式下必须听**官方**的
         （走左边），而且读数来源标成 `sdk`。
+
+        注意：本测试原来断言的是**默认值**就是 `"sdk_or_vision"`。
+        2026-09-18 默认值已改为 `"vision"`（官方读数恒为 0，见
+        `FreeJunctionConfig.blockage_source` 的说明），所以这里改成显式选择。
         """
-        task = FreeJunctionTask()                    # 默认 blockage_source="sdk_or_vision"
-        self.assertEqual(task.settings.blockage_source, "sdk_or_vision")
+        task = FreeJunctionTask(
+            FreeJunctionConfig(blockage_source="sdk_or_vision")
+        )
         records = self._replay(task, fork_frame(car_left=True), [(0.80, 0.40, 0.18, 0.26)])
         self.assertIs(records[-1][1].status, TaskStatus.COMPLETED)
         self.assertIs(task.chosen_branch, Branch.LEFT)
         self.assertEqual(task.last_blockage.source, "sdk")
         self.assertGreater(task.official_sightings, 0)
+
+    def test_the_module_default_is_vision_only(self):
+        """**默认只用画面判据**（2026-09-18 改）。
+
+        理由：官方机器人识别在三次实车 run 里 `robots_in_snapshot` 恒为 0，
+        那条通路等于没有；而 `"sdk_or_vision"` 还会被 `official_health_gate`
+        拦死成"永远不接管"，导致任务 5 的拥堵岔路被 `obstacle` 抢走。
+        这条钉住默认值，改回去必须先看见它变红。
+        """
+        self.assertEqual(FreeJunctionConfig().blockage_source, "vision")
 
     def test_the_default_falls_back_and_says_so_when_the_sdk_is_silent(self):
         """官方读数一直没到（集成层还没订阅 robot 识别）时：退回画面判据，并**写在 message 里**。
@@ -1469,8 +1484,15 @@ class OfficialHealthGateTests(unittest.TestCase):
         return records
 
     def test_no_takeover_when_the_source_runs_but_reports_nothing(self):
-        """订阅成功却没有读数 → 画面里明明画着车，也不许接管。"""
-        task = FreeJunctionTask(FreeJunctionConfig())     # 默认 sdk_or_vision
+        """订阅成功却没有读数 → 画面里明明画着车，也不许接管（`sdk_or_vision` 下）。
+
+        本测试测的是**官方判据那条通路**的闸门，所以显式指定
+        `blockage_source="sdk_or_vision"`：模块默认值已在 2026-09-18 改成
+        `"vision"`（官方读数恒为 0，见 `FreeJunctionConfig.blockage_source`）。
+        """
+        task = FreeJunctionTask(
+            FreeJunctionConfig(blockage_source="sdk_or_vision")
+        )
         records = self._replay(task, fork_frame(car_left=True), healthy=True)
         statuses = {update.status for _state, update, _now in records}
         self.assertNotIn(TaskStatus.RUNNING, statuses,
