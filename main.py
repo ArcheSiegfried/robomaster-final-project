@@ -7,7 +7,8 @@ import cv2
 from camera_source import LatestFrameSource
 from config import CONFIG
 from coordinator import LINE_FOLLOWING, RELEASING, TASK_ACTIVE, TaskCoordinator
-from evidence import DEFAULT_CAPTURE_DIRECTORY
+from evidence import DEFAULT_CAPTURE_DIRECTORY, IntegratedScoreEvidence
+from route_gimbal_output import RouteGimbalOutput
 from gimbal_output import GimbalOutput
 from marker_source import MarkerObservationSource
 from motion_output import MotionOutput
@@ -569,11 +570,17 @@ def main(
         output = MotionOutput(ep_robot.chassis, CONFIG)
         _align_camera(ep_robot, output, robot)
         print("[main] 云台就位，正在打开视频流 ...", flush=True)
-        gimbal_output = (
-            GimbalOutput(ep_robot.gimbal, CONFIG)
-            if gimbal_output_factory is None
-            else gimbal_output_factory(ep_robot, CONFIG, robot)
-        )
+        if gimbal_output_factory is not None:
+            gimbal_output = gimbal_output_factory(ep_robot, CONFIG, robot)
+        elif motion_tasks_override is None and (
+            motion_task_names is None or "route" in motion_task_names
+        ):
+            # The integrated route task uses a one-time side-looking yaw;
+            # ordinary GimbalOutput clamps that request to +/-30 degrees and
+            # never enters the required FREE mode.
+            gimbal_output = RouteGimbalOutput(ep_robot, CONFIG, robot)
+        else:
+            gimbal_output = GimbalOutput(ep_robot.gimbal, CONFIG)
         coordinator = build_coordinator(
             follower,
             output,
@@ -622,6 +629,7 @@ def main(
             task_order=tuple(task.name for task in coordinator.motion_tasks),
         )
         sink = _find_evidence_sink(coordinator)
+        score_evidence = IntegratedScoreEvidence()
         run_directory = getattr(sink, "run_directory", None)
         if run_directory is not None:
             console.note(
@@ -663,6 +671,16 @@ def main(
                 # Final 的得分截图链：任务交出请求 -> 证据层画框写字存盘 ->
                 # 回传真实结果。放在 step() 之后，任务在等回执期间会保持接管。
                 saved = service_task_evidence(coordinator)
+                for task in coordinator.motion_tasks:
+                    if getattr(task, "evidence_failed", False):
+                        console.note("!! 红绿灯得分截图写入失败，已暂停")
+                        console.note(coordinator.human_stop(now))
+                        task.reset()
+                failures_before = len(score_evidence.failures)
+                saved += score_evidence.process(packet, decision, coordinator, sink)
+                for failure in score_evidence.failures[failures_before:]:
+                    console.note("!! 得分截图失败：" + failure)
+                    console.note(coordinator.human_stop(now))
                 # 运行记录：把这一帧的接管/释放/限幅/异常写进本次运行的 report.md。
                 record_run_events(coordinator, decision, now)
                 # 终端反馈：状态变化 + 心跳。丢线、接管、异常都会打出来。

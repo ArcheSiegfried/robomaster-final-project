@@ -68,11 +68,12 @@ import json
 import os
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 from typing import List, Optional
 
 import cv2
 
-from models import FramePacket
+from models import FramePacket, VisualDetection
 
 KIND = "evidence"
 
@@ -134,7 +135,15 @@ def render_task_evidence(request):
     height, width = shown.shape[:2]
 
     box = getattr(getattr(request, "detection", None), "box", None)
-    if box:
+    shape = getattr(request, "shape", None)
+    if shape is None and getattr(getattr(request, "detection", None), "kind", None) == "traffic_light":
+        shape = "circle"
+    if box and shape == "circle":
+        left, top, right, bottom = (int(value) for value in box)
+        center = ((left + right) // 2, (top + bottom) // 2)
+        radius = max(1, (right - left + bottom - top) // 4)
+        cv2.circle(shown, center, radius, (0, 255, 255), 2)
+    elif box:
         left, top, right, bottom = (int(value) for value in box)
         cv2.rectangle(shown, (left, top), (right, bottom), (0, 255, 255), 2)
 
@@ -153,6 +162,120 @@ def render_task_evidence(request):
             shown, str(annotation), (x, y), font, scale, (0, 255, 255), thickness
         )
     return shown
+
+
+class IntegratedScoreEvidence:
+    """Keep one real decision frame until a task actually completes.
+
+    This is integration-side bookkeeping, not another detector or task runner.
+    Marker and red-stop requests retain their existing task-owned write path.
+    """
+
+    def __init__(self) -> None:
+        self._candidate = {}
+        self._saved = set()
+        self.failures = []
+
+    @staticmethod
+    def _request(frame, label, detection, annotation, shape="rectangle"):
+        height, width = frame.image.shape[:2]
+        return SimpleNamespace(
+            request_id="score:{}:frame:{}".format(label, frame.sequence),
+            marker_id=label,
+            frame_sequence=frame.sequence,
+            captured_at=frame.captured_at,
+            detection=detection,
+            annotation=annotation,
+            text_anchor=(width // 2, height // 2),
+            image=frame.image.copy(),
+            shape=shape,
+        )
+
+    def _decision_frame(self, name, task, frame, update):
+        detection = update.detection
+        if name == "obstacle" and getattr(task, "last_side", None):
+            if detection is not None and detection.valid and detection.box:
+                side = task.last_side
+                return self._request(frame, name, detection,
+                    "Team 10 detects an obstacle and chooses the {} side".format(side))
+        if name == "free_junction":
+            branch = getattr(task, "chosen_branch", None)
+            reading = getattr(task, "last_blockage", None)
+            if branch is not None and reading is not None:
+                blocked = str(getattr(reading, "reading", ""))
+                side = "left" if "left" in blocked else "right" if "right" in blocked else None
+                box = getattr(reading, "left_box" if side == "left" else "right_box", None)
+                if side and box:
+                    visual = VisualDetection(True, name, box=box)
+                    return self._request(frame, name, visual,
+                        "Team 10 detects traffic jam on the {} way and chooses {}".format(
+                            side, branch.value))
+        if name == "green_junction":
+            branch = getattr(task, "chosen_branch", None)
+            for reading in getattr(task, "last_readings", ()):
+                if (branch is not None and getattr(reading, "branch", None) == branch
+                    and getattr(getattr(reading, "color", None), "value", None) == "green"
+                    and getattr(reading, "box", None)):
+                    visual = VisualDetection(True, name, box=reading.box)
+                    return self._request(frame, name, visual,
+                        "Team 10 detects a green light on the {} way and chooses {}".format(
+                            branch.value, branch.value), "circle")
+        return None
+
+    def process(self, frame, decision, coordinator, recorder) -> int:
+        """Save only completed scoring events; return actual successful writes."""
+        name = decision.task_name
+        update = decision.task_update
+        if not name or update is None:
+            return 0
+        status = update.status.name
+        task = next((item for item in coordinator.motion_tasks if item.name == name), None)
+        if status == "RUNNING" and task is not None and name not in self._saved:
+            candidate = self._decision_frame(name, task, frame, update)
+            if candidate is not None and name not in self._candidate:
+                self._candidate[name] = candidate
+            return 0
+        if status == "FAILED":
+            self._candidate.pop(name, None)
+            return 0
+        if status != "COMPLETED" or name in self._saved:
+            return 0
+        if name == "traffic_light":
+            # The light task owns both red and green requests so the latter
+            # also works when green releases a vetoed *other* task.
+            return 0
+        request = self._candidate.pop(name, None)
+        if name == "route":
+            # A connected corner or the old line returning is not a scored
+            # long-gap recovery, even though RouteTask also says COMPLETED.
+            if update.message != "base line detector confirmed centered new route":
+                return 0
+            detection = update.detection
+            if detection is None or not detection.valid or not detection.box:
+                try:
+                    line = coordinator.follower.detector.detect(frame.image)
+                    if line.valid and line.contour is not None:
+                        x, y, width, height = cv2.boundingRect(line.contour)
+                        detection = VisualDetection(True, name,
+                            box=(x, y, x + width, y + height))
+                except Exception:
+                    detection = None
+            if detection is not None and detection.valid and detection.box:
+                request = self._request(frame, name, detection,
+                    "Team 10 finds the correct line to follow")
+        if request is None:
+            if name in ("green_junction", "free_junction", "obstacle", "route"):
+                self.failures.append("{} completed without valid scoring image".format(name))
+            return 0
+        try:
+            saved = recorder is not None and bool(recorder.save_task_evidence(request))
+        except Exception:
+            saved = False
+        if not saved:
+            self.failures.append("{} evidence write failed".format(name))
+            return 0
+        self._saved.add(name)
+        return 1
 
 
 def _resolve_directory(directory: str) -> Path:

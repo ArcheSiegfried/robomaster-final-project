@@ -343,7 +343,7 @@ class TaskTests(unittest.TestCase):
         task, updates = self.run_sequence(["red", "red"])
         request = task.take_evidence_request()
         self.assertIsNotNone(request)
-        self.assertIn("Team 03 detects a red light", request.annotation)
+        self.assertIn("Team 10 detects a red light", request.annotation)
         self.assertTrue(request.detection.valid)
         self.assertEqual(request.detection.color, "red")
         self.assertIsNotNone(request.detection.box)
@@ -359,6 +359,25 @@ class TaskTests(unittest.TestCase):
         # Same stop cycle: no second screenshot request.
         task.step(packet(light_frame("red"), 2, 1.10), 1.10)
         self.assertIsNone(task.take_evidence_request())
+
+    def test_green_release_queues_its_own_second_photo(self):
+        task = TrafficLightTask()
+        task.step(packet(light_frame("red"), 0, 1.0), 1.0)
+        task.step(packet(light_frame("red"), 1, 1.05), 1.05)
+        red = task.take_evidence_request()
+        self.assertTrue(task.acknowledge_evidence(red.request_id, True))
+        result = None
+        for sequence in range(2, 10):
+            now = 1.05 + sequence * 0.05
+            result = task.step(packet(light_frame("green"), sequence, now), now)
+            if result.status is TaskStatus.COMPLETED:
+                break
+        self.assertIs(result.status, TaskStatus.COMPLETED)
+        green = task.take_evidence_request()
+        self.assertEqual(green.marker_id, "traffic_light_green")
+        self.assertIn("Team 10 detects a green light and continues", green.annotation)
+        self.assertEqual(green.detection.color, "green")
+        self.assertTrue(task.acknowledge_evidence(green.request_id, True))
 
     def test_evidence_failure_retries_then_gives_up(self):
         task = TrafficLightTask()

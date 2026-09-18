@@ -539,13 +539,20 @@ class StateMachineTests(unittest.TestCase):
     def test_waiting_for_a_rule_keeps_the_car_stopped(self):
         """还没拿到判据时只能保持停车，不能自己往前冲。"""
         settings = JunctionConfig(decision_timeout=5.0, fallback_rule="none")
-        task = GreenJunctionTask(settings=settings, light_probe=green_without_side)
+        state = {"located": True}
+        task = GreenJunctionTask(
+            settings=settings,
+            light_probe=lambda frame, now: (
+                green(Branch.LEFT) if state["located"] else green_without_side()
+            ),
+        )
         now = self._advance_until(task, JunctionState.DECIDE)
+        state["located"] = False
         update = task.step(packet(junction_frame(), 20, now), now, fake_line(error=0.9))
         self.assertEqual(update.status, TaskStatus.RUNNING)
         self.assertEqual(update.motion, STOP)
         self.assertEqual(update.motion.forward, 0.0)
-        self.assertIn("waiting for rule", update.message)
+        self.assertIn("waiting for one located green", update.message)
 
     def test_probe_error_does_not_crash_or_move(self):
         """别人的模块炸了：既不能让车乱走，也不能让本模块崩。"""
@@ -569,7 +576,7 @@ class StateMachineTests(unittest.TestCase):
         def sometimes_broken(frame, now):
             if state["broken"]:
                 raise RuntimeError("灯被挡住了")
-            return green_without_side()
+            return green(Branch.LEFT)
 
         task = GreenJunctionTask(settings=settings, light_probe=sometimes_broken)
         now = self._advance_until(task, JunctionState.DECIDE)
@@ -645,7 +652,7 @@ class StateMachineTests(unittest.TestCase):
         def probe(frame, now):
             if state["red"]:
                 return LightReading(color=LightColor.RED)
-            return green_without_side()
+            return green(Branch.LEFT)
 
         task = GreenJunctionTask(settings=settings, light_probe=probe)
         now = self._advance_until(task, JunctionState.DECIDE)
@@ -653,7 +660,7 @@ class StateMachineTests(unittest.TestCase):
         now += settings.decision_timeout + 0.5
         update = task.step(packet(junction_frame(), 7, now), now, fake_line(error=0.9))
         self.assertEqual(update.status, TaskStatus.FAILED)
-        self.assertIn("red", update.message)
+        self.assertIn("single-green fork lamp", update.message)
         self.assertEqual(update.motion, STOP)
 
     def test_the_fail_safe_path_is_still_available_on_request(self):
@@ -664,10 +671,10 @@ class StateMachineTests(unittest.TestCase):
         now += settings.decision_timeout + 0.5
         update = task.step(packet(junction_frame(), 7, now), now, fake_line(error=0.9))
         self.assertEqual(update.status, TaskStatus.FAILED)
-        self.assertIn("fallback_color", update.message)
+        self.assertIn("single-green fork lamp", update.message)
         self.assertEqual(update.motion, STOP)
 
-    def test_explicit_fallback_color_green_can_complete_without_a_probe(self):
+    def test_explicit_fallback_color_cannot_complete_without_a_lamp(self):
         settings = JunctionConfig(fallback_color="green", fallback_rule="straightest")
         task = GreenJunctionTask(settings=settings)
         statuses = []
@@ -677,8 +684,8 @@ class StateMachineTests(unittest.TestCase):
             line = fake_line(error=0.0 if index >= 10 else 0.9)
             update = task.step(packet(junction_frame(), index + 1, now), now, line)
             statuses.append(update.status)
-        self.assertEqual(task.state, JunctionState.COMPLETED)
-        self.assertIn(TaskStatus.RUNNING, statuses)
+        self.assertNotEqual(task.state, JunctionState.COMPLETED)
+        self.assertNotIn(TaskStatus.COMPLETED, statuses)
 
     def test_turn_timeout_fails_and_stops(self):
         settings = JunctionConfig(turn_min_duration=10.0, turn_timeout=0.4)
@@ -707,7 +714,7 @@ class StateMachineTests(unittest.TestCase):
 
     def test_losing_the_junction_before_a_rule_fails_and_stops(self):
         settings = JunctionConfig(decision_timeout=0.5, fallback_rule="none")
-        task = GreenJunctionTask(settings=settings, light_probe=green_without_side)
+        task = GreenJunctionTask(settings=settings, light_probe=lambda frame, now: green(Branch.LEFT))
         now = self._advance_until(task, JunctionState.DECIDE)
         now += 1.0
         update = task.step(packet(blank_frame(), 5, now), now, fake_line())
@@ -717,8 +724,15 @@ class StateMachineTests(unittest.TestCase):
     def test_driving_past_the_junction_without_a_rule_fails(self):
         """线已经回到中央、岔路形态还在，连续几帧都这样 → 车其实开过了 → 失败停车。"""
         settings = JunctionConfig(decision_timeout=5.0, fallback_rule="none")
-        task = GreenJunctionTask(settings=settings, light_probe=green_without_side)
+        state = {"located": True}
+        task = GreenJunctionTask(
+            settings=settings,
+            light_probe=lambda frame, now: (
+                green(Branch.LEFT) if state["located"] else green_without_side()
+            ),
+        )
         now = self._advance_until(task, JunctionState.DECIDE)
+        state["located"] = False
         for index in range(settings.drove_past_frames):
             now += FRAME_DT
             update = task.step(packet(junction_frame(), 30 + index, now), now, fake_line(error=0.02))
@@ -732,7 +746,7 @@ class StateMachineTests(unittest.TestCase):
         这里连 ``line`` 都不传——就是协调器的真实调用方式。
         """
         settings = JunctionConfig(decision_timeout=5.0, confirm_frames=2, fallback_rule="none")
-        task = GreenJunctionTask(settings=settings, light_probe=green_without_side)
+        task = GreenJunctionTask(settings=settings, light_probe=lambda frame, now: green(Branch.LEFT))
         now = 50.0
         statuses = []
         for index in range(12):
@@ -765,7 +779,7 @@ class StateMachineTests(unittest.TestCase):
     def test_single_contradictory_frame_is_not_enough_to_fail(self):
         """单帧巧合不算：判定"开过了"要连续几帧都矛盾。"""
         settings = JunctionConfig(decision_timeout=5.0, fallback_rule="none")
-        task = GreenJunctionTask(settings=settings, light_probe=green_without_side)
+        task = GreenJunctionTask(settings=settings, light_probe=lambda frame, now: green(Branch.LEFT))
         now = self._advance_until(task, JunctionState.DECIDE)
         now += FRAME_DT
         update = task.step(packet(junction_frame(), 40, now), now, fake_line(error=0.02))
@@ -816,8 +830,8 @@ class StateMachineTests(unittest.TestCase):
 
     def test_rearm_cooldown_blocks_an_immediate_retrigger(self):
         """刚走过一个岔路后，同一个岔路形状不会立刻被处理第二遍（A9）。"""
-        settings = JunctionConfig(fallback_color="green", rearm_cooldown=2.0)
-        task = GreenJunctionTask(settings=settings)
+        settings = JunctionConfig(rearm_cooldown=2.0)
+        task = GreenJunctionTask(settings=settings, light_probe=lambda frame, now: green(Branch.LEFT))
         now = 700.0
         for index in range(30):
             now += FRAME_DT
@@ -844,7 +858,7 @@ class StateMachineTests(unittest.TestCase):
 
     def test_finished_state_keeps_reporting_the_terminal_status(self):
         """完成后重复调用必须继续报 COMPLETED，不能改口。"""
-        task = GreenJunctionTask(settings=JunctionConfig(fallback_color="green"))
+        task = GreenJunctionTask(light_probe=lambda frame, now: green(Branch.LEFT))
         now = 950.0
         update = None
         for index in range(30):
@@ -1238,7 +1252,7 @@ class TwoLampTests(unittest.TestCase):
                 else {"left": "red", "right": "green"},
             )
 
-    def test_no_probe_at_all_drives_the_module_to_the_green_side(self):
+    def test_builtin_single_green_drives_the_module_to_its_side(self):
         """**实车配置**：不注入任何探针，靠内置检测器；绿灯在哪边就走哪边。"""
         for green_on_left, expected in ((True, Branch.LEFT), (False, Branch.RIGHT)):
             task = GreenJunctionTask()  # 没有 light_probe
@@ -1247,7 +1261,10 @@ class TwoLampTests(unittest.TestCase):
             now = 1.05
             for _ in range(60):
                 now += 0.05
-                decision = harness.feed_image(now, two_lamp_frame(green_on_left=green_on_left))
+                lamp_x = 100 if green_on_left else 500
+                decision = harness.feed_image(
+                    now, green_lamp_frame(center=(lamp_x, 100))
+                )
                 if task.finished and decision.owner == "line":
                     break
             self.assertTrue(
@@ -1348,27 +1365,27 @@ class BuiltinLampTests(unittest.TestCase):
         for index in (1, 2):  # 确认岔路（第 2 帧进 DECIDE，还没数灯）
             now += FRAME_DT
             update = task.step(
-                packet(two_lamp_frame(green_on_left=True), index, now), now, fake_line(error=0.9)
+                packet(green_lamp_frame(center=(100, 100)), index, now), now, fake_line(error=0.9)
             )
         self.assertIsNone(task.chosen_branch)
         # 第 3 帧：绿灯在左 → 只数到 1，不许转身
         now += FRAME_DT
         update = task.step(
-            packet(two_lamp_frame(green_on_left=True), 3, now), now, fake_line(error=0.9)
+            packet(green_lamp_frame(center=(100, 100)), 3, now), now, fake_line(error=0.9)
         )
         self.assertIsNone(task.chosen_branch)
         self.assertIn("confirming light side left (1/2", update.message)
         # 第 4 帧：绿灯换到右边 → 计数清零，仍然不许转身
         now += FRAME_DT
         update = task.step(
-            packet(two_lamp_frame(green_on_left=False), 4, now), now, fake_line(error=0.9)
+            packet(green_lamp_frame(center=(500, 100)), 4, now), now, fake_line(error=0.9)
         )
         self.assertIsNone(task.chosen_branch)
         self.assertIn("confirming light side right (1/2", update.message)
         # 第 5 帧：同一侧再来一帧 → 走右边
         now += FRAME_DT
         update = task.step(
-            packet(two_lamp_frame(green_on_left=False), 5, now), now, fake_line(error=0.9)
+            packet(green_lamp_frame(center=(500, 100)), 5, now), now, fake_line(error=0.9)
         )
         self.assertIs(task.chosen_branch, Branch.RIGHT)
         self.assertIn("take right branch", update.message)

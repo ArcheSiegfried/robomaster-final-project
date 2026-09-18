@@ -87,9 +87,9 @@ def advance_to_evidence(task, marker_id="1", start=1.0):
 
 
 class NumberMarkerContractTests(unittest.TestCase):
-    def test_default_team_number_is_03(self):
-        self.assertEqual(NumberMarkerConfig().team_number, "03")
-        self.assertEqual(NumberMarkerTask().settings.team_number, "03")
+    def test_default_team_number_is_10(self):
+        self.assertEqual(NumberMarkerConfig().team_number, "10")
+        self.assertEqual(NumberMarkerTask().settings.team_number, "10")
 
     def test_module_source_obeys_the_safety_rules(self):
         assert_module_source_is_clean(self, "number_marker.py")
@@ -644,7 +644,7 @@ class EvidenceTests(unittest.TestCase):
             request = task.take_evidence_request()
             self.assertEqual(
                 request.annotation,
-                "Team 03 detects a marker with ID of {}".format(marker_id),
+                "Team 10 detects a marker with ID of {}".format(marker_id),
             )
         custom = NumberMarkerTask(
             replace(NumberMarkerConfig(), team_number="17", aim_stable_frames=1)
@@ -675,7 +675,7 @@ class EvidenceTests(unittest.TestCase):
         self.assertEqual(request.captured_at, 1.01)
         self.assertEqual(request.detection.center, (320, 180))
         self.assertEqual(request.detection.box, (240, 130, 400, 230))
-        self.assertEqual(request.annotation, "Team 03 detects a marker with ID of 2")
+        self.assertEqual(request.annotation, "Team 10 detects a marker with ID of 2")
         self.assertEqual(request.image.shape, (HEIGHT, WIDTH, 3))
         self.assertTrue(np.array_equal(request.image, original))
         image[:] = 99
@@ -850,6 +850,36 @@ class CoordinatorIntegrationTests(unittest.TestCase):
         self.assertEqual(released.owner, "line")
         self.assertEqual(released.state, "RELEASING")
         self.assertTrue(released.force_stop)
+
+        # The old check stopped here: it did not prove that the line owner
+        # would actually send another moving command after the photograph.
+        harness.feed_line(1.20)
+        before = len(harness.chassis.motion_calls)
+        harness.feed_line(1.25)
+        self.assertGreater(len(harness.chassis.motion_calls), before)
+        self.assertEqual(harness.coordinator.active_task, None)
+
+    def test_marker_aiming_turn_is_undone_before_release(self):
+        task = NumberMarkerTask(replace(BASE_CONFIG, aim_stable_frames=1))
+        advance_to_evidence(task)
+        task._aimed_yaw_degrees = 35.0
+        request = task.take_evidence_request()
+        self.assertTrue(task.acknowledge_evidence(request.request_id, True))
+        first = task.step(packet(3, 1.10), 1.10)
+        self.assertIs(first.status, TaskStatus.RUNNING)
+        self.assertLess(first.motion.yaw, 0.0)
+        self.assertIs(task.state, MarkerState.RETURNING)
+        terminal = first
+        for sequence in range(4, 25):
+            now = 1.10 + (sequence - 3) * 0.10
+            terminal = task.step(packet(sequence, now), now)
+            if terminal.status is TaskStatus.COMPLETED:
+                break
+        self.assertIs(terminal.status, TaskStatus.COMPLETED)
+        self.assertIn("1", task.saved_ids)
+        set_current(task, 25, 3.40, candidate("1"))
+        self.assertIs(task.step(packet(25, 3.40), 3.40).status,
+                      TaskStatus.NOT_TRIGGERED)
 
 
 if __name__ == "__main__":

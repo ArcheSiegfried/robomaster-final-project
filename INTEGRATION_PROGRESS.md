@@ -1,0 +1,48 @@
+# 整合修复进度
+
+- 目标：在现有拼合版上修复数字任务恢复、补齐取证、完成一种灯光岔路模式，并审查任务交接；不运行实车。
+- 起点：个人仓库 `chore/integration-snapshot-20260918`，`a38293b76a69475f558a06e97636f27d5d4264f1`（团队 `integration` 同一提交）。
+- 工作分支：`fix/integrated-evidence-and-resume`。
+- 工作树起始状态：干净。个人仓库 `main` 和团队仓库均不作为本轮推送目标。
+- 规则依据：项目根目录 `RoboMaster_期末项目规则书.md`（与下载目录原件 SHA256 一致）；已阅读并区分硬规则与工程建议。
+
+## 已知问题
+
+1. 数字标识拍照后实车不继续运动，需追踪证据回执、任务终态、云台归位和巡线显式恢复。
+2. 已拼合版缺少统一的各任务计分照片，且现有数字/红灯文字写的是 `Team 03`，与规则书 `Team 10` 不一致。
+3. 红绿灯岔路需要确定并完成一种场地布置。
+4. 各任务组合的控制权、去重、恢复和视频失效路径尚未整体实车验证。
+
+## 阶段状态
+
+| 阶段 | 状态 | 下一步 |
+| --- | --- | --- |
+| 1 数字拍照后恢复 | 已完成代码检查，待实车 | 本阶段提交后检查其他任务的取证接口 |
+| 2 全任务证据 | 已完成代码检查，待实车 | 核对现场照片内容、触发时刻与写盘失败路径 |
+| 3 一种红绿灯岔路模式 | 已完成代码检查，待实车 | 现场核对单侧绿灯的识别、选边、进入和照片 |
+| 4 拼合状态交接审查 | 已完成代码检查，待实车 | 验证完整入口下的接管顺序和照片失败停车 |
+| 5 有限检查与交付 | 已完成代码与文档检查，待实车 | 提交、推送并提出 PR；小组按联调清单逐级验证 |
+
+## 当前记录
+
+- 已修改文件：`number_marker.py`、`tests/test_number_marker.py`、本进度文件。
+- 已完成检查：确认分支/远端/提交，阅读适用 `AGENTS.md`、规则书、项目说明及已有验证记录；项目内规则书与下载目录原件 SHA256 一致。Python 3.8 与依赖可用；未连接实车。
+- 阶段 1 代码定位：证据请求在 `main.service_task_evidence()` 每帧被写入并回执；成功回执使数字任务下一帧返回 `COMPLETED`，协调器停止并归还 `line` owner。这些环节在代码里原本存在。缺口是数字瞄准使用底盘 yaw 转向标识，而释放流程只恢复云台 pitch；车头可能仍偏离路线，`LineFollower.resume()` 因没有新鲜有效线而超时锁停。现记录瞄准阶段请求过的有限 yaw，在截图成功后有限反转，再走原有云台归位、新帧确认与显式恢复。这个航向估计不是里程计；现场能否回到线上仍未验证，找不到线仍停车。
+- 阶段 1 最小检查：`python -m unittest tests.test_number_marker -q`，74 项通过；新增检查涵盖拍照后巡线再次发运动命令、反转阶段完成和已拍 ID 不重触发。未运行完整测试套件。
+- 阶段 1 提交：`4f3a6bb`，已推送个人仓库工作分支。
+- 阶段 2 修改：`evidence.py` 沿用现有完整画面复制、画框/文字、Windows 中文路径安全写盘及真实写入结果；新增小型 `IntegratedScoreEvidence` 只在任务 `COMPLETED` 时落正式计分图，早期决策帧仅暂存在内存。`main.py` 每帧服务该请求，写盘失败会明确打印并暂停，避免悄悄宣称成功。红灯继续使用原任务请求；绿灯另存圆圈照片；绿灯岔路保留内置认灯器的灯框；拥堵岔路保存堵车机器人框；障碍保存触发时障碍框及绕行方向；断线只在“新路线已居中确认”时保存，不把连通急弯误记为断线成功。数字和普通红灯默认队号由 03 修正为规则书第 10 组。
+- 阶段 2 最小检查：`tests.test_integrated_score_evidence` + `tests.test_evidence` 共 39 项通过；相关文件语法检查通过；`git diff --check` 通过。之前还运行了数字/红灯/绿灯岔路/证据的定向用例 229 项，通过。均非实车验证。
+- 阶段 2 提交：`e4dd669`，已推送个人仓库工作分支。
+- 阶段 3 修改：`green_junction.JunctionConfig.light_layout` 固定为 `single_green`；正常路径仅接受恰好一个有左右位置的绿灯且无红灯，保持现有分叉检测、选边、转弯和回线算法不动。未知/冲突读数在接管前不触发，接管后限时等待或失败，不使用旧的无位置信息 fallback。场地布置及取证时机见 `FORK_MODE.md`。
+- 阶段 3 最小检查：`python -m unittest tests.test_single_green_fork -q`，2 项通过；确认左绿/右绿生成相应符号的 yaw，红绿冲突或侧向不明不选择。语法检查通过。实际识别与入路仍待实车。
+- 阶段 3 提交：`0b05a59`，已推送个人仓库工作分支。
+- 阶段 4 审查：六项任务都在 `task_registry.MOTION_TASK_CLASSES`；协调器每帧只将一个 `RUNNING` 任务设为 `active_task`，完成/失败均硬停、归还 `line` owner、清巡线故障并经 `RELEASING` 等待云台归位和新鲜有效线路。人工停止与视频失效仍在原安全路径；SDK 底盘调用仍只在 `motion_output.py`，生产相机入口只在 `main.py`。长断线仅在基础底座允许的丢线状态后接管。
+- 阶段 4 确认并修复的接线错误：完整 `main.py` 原来注册旧 `RouteTask` 且使用普通 `GimbalOutput`，云台侧视实车专项版只在 `route_only_main.py`；现注册 `GimbalAlignedRouteTask`，完整入口使用它需要的 `RouteGimbalOutput`，保留 route-only 入口。普通绿灯在其他任务持有控制权时只作为红灯否决解除条件，原计分 tracker 看不到该任务完成；现绿灯与红灯一样由 `TrafficLightTask` 自己提出一次性证据请求，主循环每帧服务，避免漏图。红/绿灯最终写盘失败会明确暂停。
+- 阶段 4 最小检查：相关 53 项定向用例通过；安全导入输出六个注册任务，第 4 个为 `GimbalAlignedRouteTask`；静态检查仅发现 `main.py` 建视频源、`motion_output.py` 下发底盘命令。没有运行完整合成赛道或实车。
+- 阶段 4 提交：`4c9e54c`，已推送个人仓库工作分支。
+- 阶段 5 检查：`python -m unittest tests.test_route_gimbal tests.test_gimbal_release_closure tests.test_single_green_fork tests.test_integrated_score_evidence -q`，26 项通过；项目生产 Python 文件 `py_compile` 通过；安全导入 `main` 不加载 `robomaster`；静态检索显示正常底盘调用仅在 `motion_output.py`、唯一生产视频入口在 `main.py`，逐帧任务代码没有新增 `sleep` 或无界循环；`git diff --check` 通过。没有运行完整离线套件、虚拟赛道或实车。
+- 本轮已阅读的规则书原件由用户放在项目根目录；第五阶段将其作为项目依据原样纳入分支。额外创建 `INTEGRATION_TEST_CHECKLIST.md` 作为逐级实车待验证项，不宣称任何实车结果。
+- 阶段 5 文档提交：`4306758`，已推送个人仓库及团队仓库的同名工作分支；规则书原样纳入项目。团队仓库 PR [#74](https://github.com/ArcheSiegfried/robomaster-final-project/pull/74) 已创建，base 为 `integration`，尚未合并。
+- 尚未完成：完整实车联调与 PR 审核/合并。单任务历史实车成功不等于本分支整场验证通过。
+- 下一步准确操作：现场负责人按 `INTEGRATION_TEST_CHECKLIST.md` 逐级验证本分支精确 SHA，上传成功/失败日志及正式照片，重点核对数字回转的真实角度和云台断线模式；确认后再审查、合并 PR。
+- PR 后复核：运行旧 `tests.test_green_junction` 曾出现 13 项失败，原因是该测试仍以“一红一绿”或“无灯 fallback”作为生产岔路布置，与本分支锁定的单侧绿灯相冲突。已将受影响断言改为单绿灯布置或明确验证无灯不能完成，并增加单绿灯画面经协调器完成选边、转弯和归还控制权的检查。`python -m unittest tests.test_green_junction tests.test_single_green_fork -q` 共 93 项通过；未改变生产岔路算法，也未做实车验证。

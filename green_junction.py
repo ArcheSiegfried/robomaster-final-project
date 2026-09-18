@@ -197,6 +197,7 @@ class LightReading:
     color: LightColor = LightColor.UNKNOWN
     branch: Optional[Branch] = None
     confidence: float = 0.0
+    box: Optional[Tuple[int, int, int, int]] = None
 
 
 #: 灯判据的读取接口。3 号/1 号把它的函数注入进来即可，不需要本模块依赖 3 号的文件。
@@ -254,7 +255,10 @@ def _reading_from(
             if width > 0.0:
                 # 注意：``str`` 也有个 ``.center`` 方法，所以上面要先把字符串排掉。
                 branch = Branch.LEFT if float(candidate[0]) < width / 2.0 else Branch.RIGHT
-    return LightReading(color=color, branch=branch, confidence=confidence)
+    return LightReading(
+        color=color, branch=branch, confidence=confidence,
+        box=getattr(value, "box", None),
+    )
 
 
 def _iter_probe_values(value):
@@ -558,6 +562,9 @@ class JunctionConfig:
     # --- 灯（A15/A17；数值沿用 3 号那版在实车上调过的 vision_tasks.py） ---
     #: 没有注入 ``light_probe`` 时，用本模块内置的 :class:`LampSpotter` 认灯。
     builtin_lamp_detection: bool = True
+    # Production layout for this round: exactly one green lamp at the fork.
+    # No red-lamp-only or red+green routing is enabled on the normal path.
+    light_layout: str = "single_green"
     #: 红灯两个 H 区间（OpenCV 的 H 是 0~179）。S/V 比"宽松版"高，少误判。
     lamp_red_hsv: tuple = (((0, 120, 70), (10, 255, 255)), ((170, 120, 70), (179, 255, 255)))
     #: 绿灯区间。窄一点（H 40~85）是为了避开蓝带（H≈120）和偏黄的杂色。
@@ -1268,11 +1275,13 @@ class LampSpotter:
                 )
                 if confidence < settings.lamp_min_confidence:
                     continue
+                box_x, box_y, box_w, box_h = cv2.boundingRect(contour)
                 found.append(
                     LightReading(
                         color=light_colour,
                         branch=Branch.LEFT if center[0] < center_x else Branch.RIGHT,
                         confidence=confidence,
+                        box=(box_x, box_y, box_x + box_w, box_y + box_h),
                     )
                 )
         found.sort(key=lambda item: -item.confidence)
@@ -1412,6 +1421,8 @@ class GreenJunctionTask:
         spotter: Optional[LampSpotter] = None,
     ) -> None:
         self.settings = settings if settings is not None else JunctionConfig()
+        if self.settings.light_layout != "single_green":
+            raise ValueError("only the single_green fork layout is enabled")
         self.detector = detector if detector is not None else JunctionDetector(self.settings)
         self.light_probe = light_probe
         #: 没注入探针时的内置认灯器（A17；`builtin_lamp_detection=False` 可关掉）。
@@ -1638,7 +1649,16 @@ class GreenJunctionTask:
             return True
         readings = self._rule_reading(frame, now)
         self._remember_readings(readings)
-        return any(item.color is LightColor.GREEN for item in readings)
+        return self._single_green_reading(readings) is not None
+
+    @staticmethod
+    def _single_green_reading(readings: List[LightReading]) -> Optional[LightReading]:
+        """Require one located green lamp and no conflicting lamp evidence."""
+        greens = [item for item in readings if item.color is LightColor.GREEN]
+        reds = [item for item in readings if item.color is LightColor.RED]
+        if len(greens) != 1 or reds or greens[0].branch is None:
+            return None
+        return greens[0]
 
     def _remember_readings(self, readings: List[LightReading]) -> None:
         """存下这一帧看到的灯，给日志/evidence 用（A15：可能是左右两盏）。"""
@@ -1814,6 +1834,12 @@ class GreenJunctionTask:
 
         readings = self._read_probe(frame, now)
         self._remember_readings(readings)
+        if self._single_green_reading(readings) is None:
+            self._rule_side = None
+            self._rule_side_count = 0
+            if self._elapsed(now) > settings.decision_timeout:
+                return self._failed("single-green fork lamp missing or ambiguous")
+            return self._running(now, "waiting for one located green fork lamp")
         chosen, reason = evaluate_branches(detection.branches, readings, settings)
         if chosen is None:
             self._rule_side = None

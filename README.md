@@ -12,7 +12,7 @@
 - `controller.py`、`runtime.py`：低速控制、短时漏检、暂停/故障/恢复。
 - `motion_output.py`：唯一正常底盘运动出口。
 - `gimbal_output.py`：唯一动态云台请求出口，逐帧请求去重且不阻塞。
-- `route.py`：长断线走到物理线尾、抬头、有限跨越/扇扫、靠近对齐和稳定重获。
+- `route.py`、`route_gimbal.py`：长断线旧线尾检测与云台侧视恢复；完整入口现注册 `GimbalAlignedRouteTask`，组合实车效果未验证。
 - `route_detector.py`：长断线专用的下方旧线与近全屏单端线段检测，不连接相机。
 - `models.py`：v0.2 公共数据类型。
 - `examples/offline_takeover.py`：不连接机器人的接管与恢复示例。
@@ -58,6 +58,8 @@ python main.py
 - [LEAD_AGENT_GUIDE.md](LEAD_AGENT_GUIDE.md)：负责人日常组织、合并和代码 Agent 使用指令。
 - [DELIVERABLES.md](DELIVERABLES.md)：开发过程应保留的最终交付材料。
 - [VERIFICATION.md](VERIFICATION.md)：实际执行过的离线验证及其边界。
+- [FORK_MODE.md](FORK_MODE.md)：当前只启用“岔路单侧绿灯，选择绿灯侧”的场地布置及安全边界。
+- [INTEGRATION_PROGRESS.md](INTEGRATION_PROGRESS.md)、[INTEGRATION_TEST_CHECKLIST.md](INTEGRATION_TEST_CHECKLIST.md)：本轮实际修改与下一步实车联调项目。
 - [.github/pull_request_template.md](.github/pull_request_template.md)：PR 必填检查项。
 
 协作流固定为：`任务分支 → PR 到 integration → 离线/实车联调 → integration 合入 main → 稳定标签`。普通成员不得直接向 `main` 或 `integration` 推送业务修改。

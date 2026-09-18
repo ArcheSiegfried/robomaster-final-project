@@ -15,7 +15,7 @@ from free_junction import FreeJunctionTask
 from green_junction import GreenJunctionTask
 from number_marker import NumberMarkerTask
 from obstacle import ObstacleTask
-from route import RouteTask
+from route_gimbal import GimbalAlignedRouteTask
 from traffic_light import TrafficLightTask
 
 # 功能模块：一个文件 = 一个名额 = 一个人。顺序即接管优先级。
@@ -37,7 +37,7 @@ MOTION_TASK_CLASSES = (
     TrafficLightTask,  # 1 红绿灯（红灯停、绿灯确认后放行）
     GreenJunctionTask,  # 2 红绿灯岔路
     ObstacleTask,  # 3 障碍物绕行
-    RouteTask,  # 4 短线巡回
+    GimbalAlignedRouteTask,  # 4 实车专项验证过的侧视长断线恢复
     FreeJunctionTask,  # 5 障碍物岔路
     NumberMarkerTask,  # 6 数字识别
 )

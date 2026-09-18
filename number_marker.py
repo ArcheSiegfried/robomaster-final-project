@@ -54,6 +54,7 @@ class MarkerState(str, Enum):
     AIMING = "AIMING"
     AIM_LOCKED = "AIM_LOCKED"
     EVIDENCE_PENDING = "EVIDENCE_PENDING"
+    RETURNING = "RETURNING"
     COMPLETED = "COMPLETED"
     FAILED = "FAILED"
     LOST = "LOST"
@@ -73,7 +74,7 @@ class NumberMarkerConfig:
     max_frame_age: float = 0.15
     max_observation_age: float = 0.15
     target_lost_timeout: float = 0.30
-    max_task_seconds: float = 8.0
+    max_task_seconds: float = 11.0
     yaw_kp: float = 70.0
     pitch_kp: float = 45.0
     max_aim_yaw_rate: float = 45.0
@@ -88,7 +89,10 @@ class NumberMarkerConfig:
     pitch_direction_sign: float = PITCH_FOLLOW_SIGN
     max_pitch_integration_dt: float = MAX_PITCH_INTEGRATION_DT
     max_evidence_attempts: int = 1
-    team_number: Optional[str] = "03"
+    return_yaw_rate: float = 35.0
+    max_return_degrees: float = 75.0
+    max_return_seconds: float = 3.0
+    team_number: Optional[str] = "10"
 
 
 @dataclass(frozen=True)
@@ -395,6 +399,11 @@ class NumberMarkerTask:
         self._active_evidence: Optional[EvidenceRequest] = None
         self._queued_evidence: Optional[EvidenceRequest] = None
         self._evidence_outcome: Optional[bool] = None
+        self._aimed_yaw_degrees = 0.0
+        self._previous_yaw_rate = 0.0
+        self._last_yaw_at: Optional[float] = None
+        self._return_remaining = 0.0
+        self._return_started_at: Optional[float] = None
 
     def _validate_settings(self) -> None:
         if not 0.0 < self.settings.min_marker_width_ratio < 1.0:
@@ -415,6 +424,9 @@ class NumberMarkerTask:
             self.settings.max_aim_yaw_rate,
             self.settings.max_aim_pitch_rate,
             self.settings.max_pitch_integration_dt,
+            self.settings.return_yaw_rate,
+            self.settings.max_return_degrees,
+            self.settings.max_return_seconds,
         )
         if any(not math.isfinite(value) or value <= 0.0 for value in positive):
             raise ValueError("number-marker timing, tolerance, and rates must be positive")
@@ -631,6 +643,11 @@ class NumberMarkerTask:
         """End this task's pitch/evidence state without touching coordinator ownership."""
 
         self._reset_pitch_tracking()
+        self._previous_yaw_rate = 0.0
+        self._last_yaw_at = None
+        self._aimed_yaw_degrees = 0.0
+        self._return_remaining = 0.0
+        self._return_started_at = None
         with self._observation_lock:
             self._active_evidence = None
             self._queued_evidence = None
@@ -641,6 +658,17 @@ class NumberMarkerTask:
 
         if self.state in (MarkerState.COMPLETED, MarkerState.FAILED):
             self._reset_transient()
+
+        # Approximate the chassis yaw requested while facing the marker. The
+        # snapshot path must not hand a sideways-facing chassis straight back
+        # to a downward-looking line follower. Video gaps are capped; this is
+        # not odometry and the final line check remains mandatory.
+        if self._last_yaw_at is not None and self.state is not MarkerState.RETURNING:
+            dt = max(0.0, min(now - self._last_yaw_at, 0.20))
+            self._aimed_yaw_degrees += self._previous_yaw_rate * dt
+        if self.state is not MarkerState.RETURNING:
+            self._last_yaw_at = now
+            self._previous_yaw_rate = 0.0
 
         frame_error = self._frame_error(frame, now)
         if frame_error is not None:
@@ -657,7 +685,9 @@ class NumberMarkerTask:
             )
 
         if self.state is MarkerState.EVIDENCE_PENDING:
-            return self._step_evidence_pending()
+            return self._step_evidence_pending(now)
+        if self.state is MarkerState.RETURNING:
+            return self._step_returning(now)
 
         try:
             selection = self.detect(frame, now, self._target_id)
@@ -712,6 +742,7 @@ class NumberMarkerTask:
             self._stable_frames = 0
             self._lost_since = None
             self._begin_pitch_tracking(now)
+            self._aimed_yaw_degrees = 0.0
             self.state = MarkerState.STOPPING
             self._note_observation("TARGET_LOCKED", frame, now, candidate, emit=True)
             return TaskUpdate(
@@ -733,12 +764,13 @@ class NumberMarkerTask:
             if not self._tracking_below_trigger:
                 self._tracking_below_trigger = True
                 self._note_observation("TRACKING_BELOW_TRIGGER", frame, now, candidate, emit=True)
+            self._previous_yaw_rate = (
+                0.0 if is_marker_centered(candidate, width, height, self.settings)
+                else intent.yaw_rate
+            )
             return TaskUpdate(
                 TaskStatus.RUNNING,
-                motion=MotionCommand(
-                    yaw=0.0 if is_marker_centered(candidate, width, height, self.settings)
-                    else intent.yaw_rate
-                ),
+                motion=MotionCommand(yaw=self._previous_yaw_rate),
                 gimbal=gimbal,
                 detection=detection,
                 message="AIMING:TRACKING_BELOW_TRIGGER",
@@ -747,6 +779,7 @@ class NumberMarkerTask:
         if not is_marker_centered(candidate, width, height, self.settings):
             self._stable_frames = 0
             self._last_centered_sequence = None
+            self._previous_yaw_rate = intent.yaw_rate
             return TaskUpdate(
                 TaskStatus.RUNNING,
                 motion=MotionCommand(yaw=intent.yaw_rate),
@@ -841,10 +874,24 @@ class NumberMarkerTask:
             message="TARGET_LOST:HOLD",
         )
 
-    def _step_evidence_pending(self) -> TaskUpdate:
+    def _step_evidence_pending(self, now: float) -> TaskUpdate:
         with self._observation_lock:
             outcome = self._evidence_outcome
         if outcome is True:
+            if abs(self._aimed_yaw_degrees) > self.settings.max_return_degrees:
+                self.state = MarkerState.FAILED
+                self._clear_terminal_transients()
+                return TaskUpdate(
+                    TaskStatus.FAILED, motion=MotionCommand(),
+                    detection=self.last_detection,
+                    message="FAILED:MARKER_TURN_EXCEEDS_SAFE_RETURN",
+                )
+            if abs(self._aimed_yaw_degrees) >= 2.0:
+                self._return_remaining = -self._aimed_yaw_degrees
+                self._return_started_at = now
+                self._last_yaw_at = now
+                self.state = MarkerState.RETURNING
+                return self._step_returning(now)
             self.state = MarkerState.COMPLETED
             self._clear_terminal_transients()
             return TaskUpdate(
@@ -868,6 +915,41 @@ class NumberMarkerTask:
             detection=self.last_detection,
             message="EVIDENCE_PENDING:HOLD",
         )
+
+    def _step_returning(self, now: float) -> TaskUpdate:
+        """Undo only the bounded aiming turn before normal fresh-line release."""
+        if self._return_started_at is None or self._last_yaw_at is None:
+            self.state = MarkerState.FAILED
+            self._clear_terminal_transients()
+            return TaskUpdate(TaskStatus.FAILED, motion=MotionCommand(),
+                              detection=self.last_detection,
+                              message="FAILED:RETURN_STATE_INVALID")
+        dt = max(0.0, min(now - self._last_yaw_at, 0.20))
+        self._return_remaining -= self._previous_yaw_rate * dt
+        self._last_yaw_at = now
+        if now - self._return_started_at > self.settings.max_return_seconds:
+            self.state = MarkerState.FAILED
+            self._clear_terminal_transients()
+            return TaskUpdate(TaskStatus.FAILED, motion=MotionCommand(),
+                              detection=self.last_detection,
+                              message="FAILED:MARKER_RETURN_TIMEOUT")
+        if abs(self._return_remaining) < 2.0 or (
+            self._previous_yaw_rate and
+            self._return_remaining * self._previous_yaw_rate < 0.0
+        ):
+            self.state = MarkerState.COMPLETED
+            self._clear_terminal_transients()
+            return TaskUpdate(TaskStatus.COMPLETED, motion=MotionCommand(),
+                              detection=self.last_detection,
+                              message="COMPLETED:EVIDENCE_SAVED_RETURNED")
+        rate = math.copysign(
+            min(self.settings.return_yaw_rate, abs(self._return_remaining) / 0.20),
+            self._return_remaining,
+        )
+        self._previous_yaw_rate = rate
+        return TaskUpdate(TaskStatus.RUNNING, motion=MotionCommand(yaw=rate),
+                          detection=self.last_detection,
+                          message="RETURNING:LINE_HEADING")
 
     def _make_evidence_request(
         self, frame: FramePacket, detection: VisualDetection
