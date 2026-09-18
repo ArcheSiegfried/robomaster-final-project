@@ -2,6 +2,9 @@
 
 import unittest
 
+from tests.test_green_junction import green_lamp_frame
+from tests.task_harness import TaskHarness
+
 from green_junction import (
     Branch, BranchGeometry, GreenJunctionTask, JunctionDetection,
     LightColor, LightReading, evaluate_branches,
@@ -41,6 +44,23 @@ class SingleGreenForkTests(unittest.TestCase):
         self.assertIsNone(self.task._single_green_reading([green, green]))
         self.assertIsNone(self.task._single_green_reading(
             [LightReading(LightColor.GREEN, None, 0.9)]))
+
+    def test_single_green_frame_completes_through_coordinator(self):
+        for x, expected in ((100, Branch.LEFT), (500, Branch.RIGHT)):
+            with self.subTest(side=expected):
+                task = GreenJunctionTask()
+                harness = TaskHarness(task=task)
+                harness.start_line(now=1.0)
+                now = 1.05
+                for _ in range(60):
+                    now += 0.05
+                    decision = harness.feed_image(
+                        now, green_lamp_frame(center=(x, 100)))
+                    if task.finished and decision.owner == "line":
+                        break
+                self.assertIs(task.chosen_branch, expected)
+                self.assertTrue(task.finished)
+                self.assertEqual(harness.owner, "line")
 
 
 if __name__ == "__main__":

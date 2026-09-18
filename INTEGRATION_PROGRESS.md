@@ -45,3 +45,4 @@
 - 阶段 5 文档提交：`4306758`，已推送个人仓库及团队仓库的同名工作分支；规则书原样纳入项目。团队仓库 PR [#74](https://github.com/ArcheSiegfried/robomaster-final-project/pull/74) 已创建，base 为 `integration`，尚未合并。
 - 尚未完成：完整实车联调与 PR 审核/合并。单任务历史实车成功不等于本分支整场验证通过。
 - 下一步准确操作：现场负责人按 `INTEGRATION_TEST_CHECKLIST.md` 逐级验证本分支精确 SHA，上传成功/失败日志及正式照片，重点核对数字回转的真实角度和云台断线模式；确认后再审查、合并 PR。
+- PR 后复核：运行旧 `tests.test_green_junction` 曾出现 13 项失败，原因是该测试仍以“一红一绿”或“无灯 fallback”作为生产岔路布置，与本分支锁定的单侧绿灯相冲突。已将受影响断言改为单绿灯布置或明确验证无灯不能完成，并增加单绿灯画面经协调器完成选边、转弯和归还控制权的检查。`python -m unittest tests.test_green_junction tests.test_single_green_fork -q` 共 93 项通过；未改变生产岔路算法，也未做实车验证。
