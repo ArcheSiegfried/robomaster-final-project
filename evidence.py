@@ -66,15 +66,32 @@ Final 原文："The count of the saved images will be the final task score"，
 import csv
 import json
 import os
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import cv2
 
 from models import FramePacket
 
 KIND = "evidence"
+
+#: 我们队的编号。老师给的样例文字是 `Team 10 ...`，那是样例队号；我们按队号写 03。
+TEAM_NUMBER = "03"
+
+#: 老师后来明确的"证据照片"文案模板（2026-09-17 新增，见 `EVIDENCE_PHOTOS.md`）。
+#: **文案属于证据层**：5 个模块各写一套必然口径不一，分数就丢在这上面。
+#: `{side}` = 目标（灯/堵车）在哪条路；`{chosen}` = 我们选哪条路/绕哪边。
+ANNOTATION_TEMPLATES = {
+    "traffic_light:red": "Team {team} detects a red light and the robot stops",
+    "traffic_light:green": "Team {team} detects a green light and continues",
+    "green_junction:green": "Team {team} detects a green light » {side} way and {chosen}",
+    "green_junction:red": "Team {team} detects a red light » {side} way and {chosen}",
+    "free_junction": "Team {team} detects traffic jam » {side} way and {chosen}",
+    "obstacle": "Team {team} detects obstacle » the {side} side",
+    "route": "Team {team} finds correct to follow",
+}
 
 #: 真实运行时默认的输出目录（相对仓库根目录；已在 .gitignore 里排除）。
 DEFAULT_CAPTURE_DIRECTORY = "captures"
@@ -101,6 +118,127 @@ FIELDNAMES = (
     "mean_v",
     "note",
 )
+
+
+def annotation_for(kind: str, team: str = TEAM_NUMBER, **fields) -> str:
+    """按 `kind` 取模板并填参。模板缺失时**大声失败**（宁可当场红，也不要存一张没字的图）。"""
+    template = ANNOTATION_TEMPLATES.get(kind)
+    if template is None:
+        raise KeyError(
+            "unknown evidence kind %r; known: %s"
+            % (kind, ", ".join(sorted(ANNOTATION_TEMPLATES)))
+        )
+    return template.format(team=team, **fields)
+
+
+#: `cv2.putText` 用的是 Hershey 字体，**只支持 ASCII**：非 ASCII 字符会被逐字节
+#: 映射成 `?`，于是图上的 `»` 变成 `??`（字符串本身是对的，只有像素是错的）。
+#: 图是要交作业的东西，所以绘制时把这类字符换成等价的 ASCII 写法；
+#: **记录/日志里仍然保留原字符**（`report.md` 里就是老师的 `»`）。
+DRAWING_FALLBACK = {
+    ord("»"): ">>",
+    ord("«"): "<<",
+    ord("→"): "->",
+    ord("←"): "<-",
+    ord("×"): "x",
+    ord("—"): "-",
+    ord("“"): '"',
+    ord("”"): '"',
+}
+
+
+def drawing_text(text: object) -> str:
+    """把要**画到像素上**的文字转成 ASCII 安全写法（其余字符原样保留）。"""
+    return str(text).translate(DRAWING_FALLBACK)
+
+
+@dataclass(frozen=True)
+class EvidencePhoto:
+    """一条"得分照片"请求。**成员模块在得分那一刻构造它，证据层负责画与存。**
+
+    这是统一层：模块只管"哪一帧、圈哪个目标、写什么字"，画框/画圆/写字/去重/落盘
+    全在证据层，所以 5 个模块的照片口径一定一致。
+
+    字段（与 `render_task_evidence` / `save_task_evidence` 的鸭子类型约定一致）：
+      * ``image``        全帧 BGR 画面
+      * ``detection``    带 ``box`` 的检测结果（矩形用它；圆也可以用它内切）
+      * ``shape``        ``"rect"``（框，例如障碍/堵车/标识）或 ``"circle"``（圈，例如红绿灯）
+      * ``circle``       显式 ``(cx, cy, r)``；不给就用 ``detection.box`` 的内切圆
+      * ``annotation``   图上那行字（默认由 `annotation_for` 生成）
+      * ``label``        文件名/记录里的短标签
+      * ``event_key``    **同一事件只存一张**（老师按张数算分，重复存不算）；
+                         默认取 ``label``
+    """
+
+    kind: str
+    image: object
+    detection: object = None
+    annotation: str = ""
+    shape: str = "rect"
+    circle: Optional[Tuple[float, float, float]] = None
+    text_anchor: Optional[Tuple[int, int]] = None
+    frame_sequence: int = 0
+    captured_at: float = 0.0
+    label: str = ""
+    attempt: int = 1
+    event_key: str = ""
+
+    @property
+    def request_id(self) -> str:
+        return "%s:frame:%d:attempt:%d" % (
+            self.label or self.kind, int(self.frame_sequence), int(self.attempt)
+        )
+
+    @property
+    def marker_id(self) -> str:
+        return self.label or self.kind
+
+
+def make_evidence_photo(
+    kind: str,
+    frame,
+    detection=None,
+    shape: str = "rect",
+    side: Optional[str] = None,
+    chosen: Optional[str] = None,
+    label: Optional[str] = None,
+    team: str = TEAM_NUMBER,
+    circle: Optional[Tuple[float, float, float]] = None,
+    event_key: Optional[str] = None,
+    attempt: int = 1,
+):
+    """模块侧的入口：一行构造出统一格式的得分照片请求。
+
+    用法（成员模块只需在"得分那一刻"调一次，然后照既有回执链交出去）::
+
+        self._queued_evidence = make_evidence_photo(
+            "obstacle", frame, detection=detection, side=self.last_side)
+
+    文案由模板统一生成，模块不需要（也不应该）自己拼字符串。
+    """
+    fields = {}
+    if side is not None:
+        fields["side"] = side
+    if chosen is not None:
+        fields["chosen"] = chosen
+    annotation = annotation_for(kind, team=team, **fields)
+    short = label or kind.replace(":", "_")
+    raw_image = getattr(frame, "image", None)
+    # 拷贝一份：队列里的请求可能过几帧才被证据层处理，而相机缓冲会被复用。
+    image = raw_image.copy() if hasattr(raw_image, "copy") else raw_image
+    return EvidencePhoto(
+        kind=kind,
+        image=image,
+        detection=detection,
+        annotation=annotation,
+        shape=shape,
+        circle=circle,
+        frame_sequence=int(getattr(frame, "sequence", 0) or 0),
+        captured_at=float(getattr(frame, "captured_at", 0.0) or 0.0),
+        label=short,
+        attempt=attempt,
+        event_key=event_key if event_key is not None else short,
+    )
 
 
 def _safe_label(text: object) -> str:
@@ -134,23 +272,51 @@ def render_task_evidence(request):
     height, width = shown.shape[:2]
 
     box = getattr(getattr(request, "detection", None), "box", None)
-    if box:
+    shape = str(getattr(request, "shape", "rect") or "rect").lower()
+    circle = getattr(request, "circle", None)
+    # 文字默认画在**目标框/圆的下方居中**（老师要求"在圈下方写明"）。
+    below = None
+    if shape == "circle":
+        center = None
+        if circle is not None:
+            try:
+                center = (int(circle[0]), int(circle[1]), max(1, int(circle[2])))
+            except (TypeError, ValueError, IndexError):
+                center = None
+        elif box:
+            left, top, right, bottom = (int(value) for value in box)
+            center = (
+                (left + right) // 2,
+                (top + bottom) // 2,
+                max(4, max(right - left, bottom - top) // 2),
+            )
+        if center is not None:
+            cv2.circle(shown, (center[0], center[1]), center[2], (0, 255, 255), 2)
+            below = (center[0], center[1] + center[2] + 24)
+    elif box:
         left, top, right, bottom = (int(value) for value in box)
         cv2.rectangle(shown, (left, top), (right, bottom), (0, 255, 255), 2)
+        below = ((left + right) // 2, bottom + 24)
 
     annotation = getattr(request, "annotation", "")
     if annotation:
-        anchor = getattr(request, "text_anchor", None) or (width // 2, height // 2)
+        anchor = getattr(request, "text_anchor", None)
+        if below is not None:
+            anchor = below
+        elif anchor is None:
+            anchor = (width // 2, height // 2)
         font = cv2.FONT_HERSHEY_SIMPLEX
         scale = 0.55
         thickness = 2
+        # 画上去的是 ASCII 安全写法（`»` -> `>>`）；`report.md` 里仍记原始字符串。
+        text = drawing_text(annotation)
         (text_width, text_height), _ = cv2.getTextSize(
-            str(annotation), font, scale, thickness
+            text, font, scale, thickness
         )
         x = max(0, min(width - text_width, int(anchor[0]) - text_width // 2))
-        y = max(text_height, min(height - 1, int(anchor[1])))
+        y = max(text_height, min(height - 4, int(anchor[1])))
         cv2.putText(
-            shown, str(annotation), (x, y), font, scale, (0, 255, 255), thickness
+            shown, text, (x, y), font, scale, (0, 255, 255), thickness
         )
     return shown
 
@@ -200,6 +366,8 @@ class EvidenceRecorder:
         # 本次运行的记录：得分截图清单 + 任务接管时间线。
         # 结束时写成 report.md，可以直接贴进报告发给别人。
         self.task_evidence: List[dict] = []
+        #: 已经存过照片的"事件键"（同一事件只存一张，见 save_task_evidence）。
+        self.saved_events: set = set()
         self.events: List[dict] = []
         # 接线层的自检结果（例如 SDK marker 订阅状态）。运行结束时作为独立
         # 小节写进 report.md，用来回答"某个模块为什么一次都没动"。
@@ -310,6 +478,12 @@ class EvidenceRecorder:
             return False
 
         request_id = getattr(request, "request_id", "")
+        # 同一事件只存一张：老师按**保存的张数**算分，同一件事存两张不会多加一分，
+        # 只会让报告里的清单变脏。所以这里提前返回 True（= "这件事已经有照片了"），
+        # 让任务照常 COMPLETED，而不是误以为写盘失败。
+        event_key = str(getattr(request, "event_key", "") or "")
+        if event_key and event_key in self.saved_events:
+            return True
         try:
             sequence = int(getattr(request, "frame_sequence", 0) or 0)
         except (TypeError, ValueError):
@@ -349,6 +523,8 @@ class EvidenceRecorder:
             return False
 
         self.task_snapshots += 1
+        if event_key:
+            self.saved_events.add(event_key)
         self.task_evidence.append(
             {
                 "wall_clock": datetime.now().isoformat(timespec="seconds"),

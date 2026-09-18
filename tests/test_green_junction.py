@@ -890,6 +890,152 @@ class StateMachineTests(unittest.TestCase):
         raise AssertionError("module never reached %s" % state.value)
 
 
+class EvidencePhotoTests(unittest.TestCase):
+    """A18：5.3 岔路选择要在"灯在哪一侧 + 我们走哪一侧"定下来那一刻存一张证据照片。
+
+    画圈、写字、去重、写盘都在整合层的 ``evidence.py``（老师按**存下来的张数**算分），
+    本模块只把请求排队交出去：``take_evidence_request()`` 取走、
+    ``acknowledge_evidence()`` 回执。**照片只是得分副作用**：写盘失败绝不允许影响
+    转向和接管 —— "只识别和拍照、没有真的开进正确那条路"不算完成。
+    """
+
+    #: ``two_lamp_frame`` 里两盏灯的坐标（半径 22、y=100）。
+    LAMP_Y = 100.0
+    GREEN_LEFT_X = 100.0
+    GREEN_RIGHT_X = 500.0
+
+    @staticmethod
+    def _drive_to_turn(task, image, limit=20):
+        """用假时钟把状态机推到"分支已经选定、开始转向"那一刻，返回当时的时刻。"""
+        now = 100.0
+        for index in range(limit):
+            now += FRAME_DT
+            task.step(packet(image, index + 1, now), now, fake_line(error=0.9))
+            if task.state is JunctionState.TURN:
+                return now
+        raise AssertionError("module never chose a branch")
+
+    @staticmethod
+    def _drive_to_completion(task, image, now, limit=14):
+        for index in range(limit):
+            now += FRAME_DT
+            task.step(packet(image, 60 + index, now), now, fake_line(error=0.0))
+            if task.state is JunctionState.COMPLETED:
+                return now
+        raise AssertionError("module never completed the junction")
+
+    def test_green_light_on_the_left_queues_one_circled_photo(self):
+        """实车配置（不注入探针，靠内置认灯器）：绿灯在左 → 走左，照片圈那盏绿灯。"""
+        task = GreenJunctionTask()
+        now = self._drive_to_turn(task, two_lamp_frame(green_on_left=True))
+
+        request = task.pending_evidence_request
+        self.assertIsNotNone(request, "选定分支那一刻必须排一张照片")
+        self.assertEqual(
+            request.annotation, "Team 03 detects a green light » left way and left"
+        )
+        self.assertEqual(request.kind, "green_junction:green")
+        self.assertEqual(request.shape, "circle")
+        self.assertIsNotNone(request.image, "照片要带上那一帧的全幅画面")
+        self.assertEqual(request.frame_sequence, 5)
+        # 圆圈是检测器**真的量到**的绿灯灯心/半径（合成图：圆心 (100,100)、半径 22）。
+        self.assertIsNotNone(request.circle, "量到了坐标就必须画圆")
+        cx, cy, radius = request.circle
+        self.assertLess(abs(cx - self.GREEN_LEFT_X), 6.0)
+        self.assertLess(abs(cy - self.LAMP_Y), 6.0)
+        self.assertGreater(radius, 10.0)
+        self.assertTrue(request.detection.valid)
+        self.assertEqual(request.detection.color, "green")
+        self.assertIsNotNone(request.detection.box)
+
+        # 同一个岔路事件只排一张：走完整个岔路也不会冒出第二张。
+        self._drive_to_completion(task, two_lamp_frame(green_on_left=True), now)
+        self.assertEqual(task.state, JunctionState.COMPLETED)
+        self.assertIs(task.take_evidence_request(), request)
+        self.assertIsNone(task.take_evidence_request(), "一个事件只存一张照片")
+
+    def test_green_light_on_the_right_queues_the_right_way(self):
+        """绿灯在右 → 走右；文案里的左右必须跟着画面走（不是写死的）。"""
+        task = GreenJunctionTask()
+        self._drive_to_turn(task, two_lamp_frame(green_on_left=False))
+        request = task.take_evidence_request()
+        self.assertIsNotNone(request)
+        self.assertEqual(
+            request.annotation, "Team 03 detects a green light » right way and right"
+        )
+        self.assertEqual(task.chosen_branch, Branch.RIGHT)
+        self.assertLess(abs(request.circle[0] - self.GREEN_RIGHT_X), 6.0)
+
+    def test_red_light_veto_queues_the_red_variant(self):
+        """红灯否决（A16：绿灯只知道存在、左边是红灯 → 走右边）写"红灯"那张。
+
+        文案就是老师给的第二种样例：``... detects a red light » left way and right``
+        —— ``side`` 是**红灯**在哪条路，``chosen`` 是我们走的那条路。
+        """
+        red = LightReading(
+            color=LightColor.RED,
+            branch=Branch.LEFT,
+            confidence=1.0,
+            center=(90.0, 96.0),
+            radius=20.0,
+        )
+
+        def probe(frame, now):
+            return [LightReading(color=LightColor.GREEN, branch=None), red]
+
+        task = GreenJunctionTask(light_probe=probe)
+        self._drive_to_turn(task, junction_frame())
+        request = task.take_evidence_request()
+        self.assertIsNotNone(request)
+        self.assertEqual(
+            request.annotation, "Team 03 detects a red light » left way and right"
+        )
+        self.assertEqual(request.kind, "green_junction:red")
+        self.assertEqual(task.chosen_branch, Branch.RIGHT)
+        self.assertEqual(request.detection.color, "red")
+        self.assertEqual(request.circle, (90.0, 96.0, 20.0))
+
+    def test_photo_keeps_the_text_when_no_lamp_coordinates_exist(self):
+        """读数里没有灯心坐标时：照片照排、文案照写，但**不画圆、不编坐标**。"""
+        task = GreenJunctionTask(light_probe=lambda frame, now: green(Branch.RIGHT))
+        self._drive_to_turn(task, junction_frame())
+        request = task.take_evidence_request()
+        self.assertIsNotNone(request)
+        self.assertEqual(
+            request.annotation, "Team 03 detects a green light » right way and right"
+        )
+        self.assertIsNotNone(request.image)
+        self.assertIsNone(request.circle, "没量到坐标就不许画圆")
+        self.assertIsNone(request.detection, "没量到坐标就不许编一个灯的位置")
+
+    def test_evidence_failure_does_not_change_the_turn(self):
+        """回执 ``False`` 后行为不变：照样转向、照样走完这个岔路。"""
+        task = GreenJunctionTask()
+        now = self._drive_to_turn(task, two_lamp_frame(green_on_left=False))
+        request = task.take_evidence_request()
+        self.assertIsNotNone(request)
+        # 第一次写盘失败 → 有界重试（attempt 2）；再失败就放弃，不再排。
+        self.assertTrue(task.acknowledge_evidence(request.request_id, False))
+        retry = task.take_evidence_request()
+        self.assertEqual(retry.attempt, 2)
+        self.assertTrue(task.acknowledge_evidence(retry.request_id, False))
+        self.assertIsNone(task.take_evidence_request())
+        self.assertFalse(task.acknowledge_evidence(request.request_id, True))
+
+        # 照片存不下来完全不改变状态机：这一帧照样给出转向请求（右分支 → 右转）。
+        update = task.step(
+            packet(two_lamp_frame(green_on_left=False), 30, now), now, fake_line(error=0.9)
+        )
+        self.assertEqual(update.status, TaskStatus.RUNNING)
+        self.assertNotEqual(update.motion, STOP)
+        self.assertGreater(update.motion.yaw, 0.0)
+        self.assertEqual(task.chosen_branch, Branch.RIGHT)
+
+        self._drive_to_completion(task, two_lamp_frame(green_on_left=False), now)
+        self.assertEqual(task.state, JunctionState.COMPLETED)
+        self.assertIsNotNone(task.chosen_bearing_deg)
+
+
 class LightProbeAdapterTests(unittest.TestCase):
     """v3 报告第三节那条断掉的链：3 号没有 ``reading()``，本模块给适配器（A13）。
 

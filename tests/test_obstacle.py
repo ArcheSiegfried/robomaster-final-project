@@ -24,6 +24,7 @@ from tests.task_harness import (  # noqa: E402
 )
 
 import obstacle  # noqa: E402
+from evidence import render_task_evidence  # noqa: E402
 from obstacle import ObstacleTask  # noqa: E402
 
 # 合成画面约定：蓝线是 (255, 0, 0)，灰度地面是 210，尺寸 640x360。
@@ -1078,6 +1079,119 @@ class ObstacleStateTests(unittest.TestCase):
             if update.status is not TaskStatus.RUNNING:
                 break
         self.assertEqual(update.status, TaskStatus.COMPLETED)
+
+
+class ObstacleEvidencePhotoTests(unittest.TestCase):
+    """7.1 得分照片：在"确认绕行、下第一脚侧移"那一帧排一张标注图。
+
+    老师按**保存的图片张数**算分，这一组对应 7.1（15 分）：
+    图上必须看得清障碍（矩形框）**并且**有一行字写清"测到障碍 + 选了哪边绕"
+    （文案模板在证据层 `evidence.ANNOTATION_TEMPLATES`，模块不自己拼）。
+
+    但同时钉死一条边界：照片只是**证据**。写盘失败（回执 False）**绝不允许**
+    改变绕行本身 —— 不 FAILED、不停车、不把 11 秒的绕行预算耗在等回执上。
+    """
+
+    # 文案照老师样例：`Team 10 detects obstacle » the left side`；样例队号 10，
+    # 我们是 03。模板在证据层，这里钉死**渲染出来的那句话**。
+    LEFT_TEXT = "Team 03 detects obstacle » the left side"
+    RIGHT_TEXT = "Team 03 detects obstacle » the right side"
+
+    @staticmethod
+    def _drive_to_the_dodge(task, image=None, now=1.0, seq=0, limit=200):
+        """喂障碍帧直到"连续帧确认完成、接管"；返回 (update, now, seq)。"""
+        update = None
+        for _ in range(limit):
+            seq += 1
+            image = obstacle_frame() if image is None else image
+            update = task.step(FramePacket(image, seq, now), now)
+            now += 0.05
+            if update.status is TaskStatus.RUNNING:
+                break
+        return update, now, seq
+
+    def test_confirmed_dodge_queues_the_obstacle_photo(self):
+        """确认绕行那一帧就排出一张照片：文字写 left、有画面、有框。"""
+        task = ObstacleTask()
+        update, _, _ = self._drive_to_the_dodge(task)
+        self.assertEqual(update.status, TaskStatus.RUNNING, "没有接管，没有得分那一刻")
+        self.assertEqual(task.last_side, "left", "正中间的障碍应该按默认往左")
+
+        request = task.take_evidence_request()
+        self.assertIsNotNone(request, "确认绕行那一刻没有排出得分照片")
+        self.assertEqual(request.annotation, self.LEFT_TEXT)
+        self.assertEqual(request.kind, obstacle.KIND)
+        self.assertEqual(request.shape, "rect", "障碍要用矩形框（圆圈是红绿灯的）")
+        self.assertIsNotNone(request.image, "请求里没有画面，证据层写不出图")
+        self.assertTrue(request.detection.valid)
+        self.assertIsNotNone(request.detection.box, "照片上没有框住障碍的矩形")
+
+        # 画框 + 写字真的能落到图上（证据层的画图函数认得这个请求）
+        rendered = render_task_evidence(request)
+        self.assertEqual(rendered.shape, request.image.shape)
+
+        # 同一个事件只排一张：取过一次就没了，继续绕也不会重新排
+        self.assertIsNone(task.take_evidence_request())
+        self.assertIsNone(task.pending_evidence_request)
+
+    def test_the_photo_writes_the_side_we_actually_dodge_to(self):
+        """障碍明显偏左 -> 从右边绕 -> 图上那句话必须写 right。"""
+        task = ObstacleTask()
+        update, _, _ = self._drive_to_the_dodge(
+            task, image=obstacle_frame(center=(270, 220), size=(190, 160))
+        )
+        self.assertEqual(update.status, TaskStatus.RUNNING)
+        self.assertEqual(task.last_side, "right")
+        request = task.take_evidence_request()
+        self.assertIsNotNone(request)
+        self.assertEqual(request.annotation, self.RIGHT_TEXT)
+
+    def test_a_failed_write_never_changes_the_dodge(self):
+        """回执 False（写盘失败）之后绕行行为不变：继续绕、不 FAILED、不停车。
+
+        老师按张数算分，但照片是**加分项**：证据层存不成，车也必须照原样绕过去，
+        而且不许把时间耗在重试上（重试次数有上限，超了就放弃照片）。
+        """
+        task = ObstacleTask()
+        update, now, seq = self._drive_to_the_dodge(task)
+        self.assertEqual(update.status, TaskStatus.RUNNING)
+        self.assertNotEqual(update.motion.lateral, 0.0, "确认那一帧就该在下发侧移")
+
+        # 别人家的 request_id 不该被当成我们自己的回执
+        self.assertFalse(task.acknowledge_evidence("not-this-request", True))
+
+        request = task.take_evidence_request()
+        self.assertIsNotNone(request)
+        # 证据层两次都报"没写成功"
+        self.assertTrue(task.acknowledge_evidence(request.request_id, False))
+        retry = task.take_evidence_request()
+        self.assertIsNotNone(retry, "第一次写盘失败应该重试一次")
+        self.assertEqual(retry.attempt, 2)
+        self.assertEqual(retry.annotation, self.LEFT_TEXT)
+        self.assertTrue(task.acknowledge_evidence(retry.request_id, False))
+        self.assertIsNone(task.take_evidence_request(), "重试次数用完就不该再排")
+        self.assertFalse(task.locked)
+
+        # 绕行照走：还在 OUT 段、还在往左让开
+        seq += 1
+        update = task.step(FramePacket(line_frame(), seq, now), now)
+        now += 0.05
+        self.assertEqual(update.status, TaskStatus.RUNNING, "照片写不成居然不绕了")
+        self.assertEqual(task.stage, "OUT")
+        self.assertEqual(update.motion.lateral, -obstacle.SIDE_SPEED)
+
+        # 整轮照常走完 -> COMPLETED（既没 FAILED，也没被照片拖到超时）
+        stages = []
+        for _ in range(400):
+            seq += 1
+            update = task.step(FramePacket(line_frame(), seq, now), now)
+            now += 0.05
+            stages.append(task.stage)
+            if update.status is not TaskStatus.RUNNING:
+                break
+        self.assertEqual(update.status, TaskStatus.COMPLETED, "写盘失败把绕行搞坏了")
+        self.assertIn("PASS", stages, "前进段没跑")
+        self.assertIn("SEEK", stages, "没有回到线上的收尾段")
 
 
 if __name__ == "__main__":

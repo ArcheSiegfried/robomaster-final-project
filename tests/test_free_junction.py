@@ -28,6 +28,7 @@ from free_junction import (  # noqa: E402
     BLOCKAGE_NONE,
     BLOCKAGE_RIGHT,
     Branch,
+    BlockageReading,
     ForkDetection,
     FreeJunctionConfig,
     FreeJunctionDetector,
@@ -152,6 +153,40 @@ def run_with_states(task, image, frames=400, dt=0.05, start=1.0):
         if update.status in (TaskStatus.COMPLETED, TaskStatus.FAILED):
             break
     return records
+
+
+def drive_to_branch_choice(task, image, frames=400, dt=0.05, start=1.0):
+    """喂帧直到**选定分支那一刻**（`chosen_branch` 已定），返回 (更新, 时间)。
+
+    证据照片就是在这个时刻排队/落盘的：再往后走 `step()` 会进入 APPROACH / TURN，
+    而主线根本等不到任务做完（集成层每帧 poll 一次就把它取走了），所以测试也必须
+    在这一刻取证 —— 否则拿到的就不是"得分那一刻"的东西。
+    """
+    now = start
+    update = None
+    for index in range(frames):
+        update = task.step(FramePacket(image, index + 1, now), now)
+        now += dt
+        if task.chosen_branch is not None or update.status in (
+            TaskStatus.COMPLETED, TaskStatus.FAILED,
+        ):
+            break
+    return update, now
+
+
+def box_iou(first, second):
+    """两个 (x0, y0, x1, y1) 框的交并比（只用来断言"框确实落在真车身上"）。"""
+    x0, y0 = max(first[0], second[0]), max(first[1], second[1])
+    x1, y1 = min(first[2], second[2]), min(first[3], second[3])
+    overlap = max(0, x1 - x0) * max(0, y1 - y0)
+    if overlap <= 0:
+        return 0.0
+    area = (
+        (first[2] - first[0]) * (first[3] - first[1])
+        + (second[2] - second[0]) * (second[3] - second[1])
+        - overlap
+    )
+    return overlap / float(max(1, area))
 
 
 def run_task(task, image, frames=400, dt=0.05, start=1.0):
@@ -942,6 +977,169 @@ class SpeedRegressionTests(unittest.TestCase):
         self.assertTrue(seen, "IDLE / DECIDE 阶段必须算判据")
         for state in (JunctionState.APPROACH, JunctionState.TURN, JunctionState.EXIT):
             self.assertNotIn(state, seen, "%s 阶段不该再算判据" % state)
+
+
+class JunctionEvidenceTests(unittest.TestCase):
+    """6.2 拥堵岔路的**得分截图**：老师后来明确要一张证据照片 ——
+    用矩形框出**堵路的那台机器人**，写明堵在哪条路 + 我们选了哪条
+    （样例文字 `Team 10 detects traffic jam » left way and right`，我们队号 03；
+    正确选择得 15 分）。
+
+    这条链是 `take_evidence_request()` → 集成层画框写字存盘 → `acknowledge_evidence()`，
+    和 `traffic_light.py` 完全同一套协议（`main.service_task_evidence()` 每帧 poll）。
+    **照片只是得分副作用，绝不是选路的门**：写盘失败、框拿不到，都不许改变往哪边拐。
+    """
+
+    def test_a_blocked_left_branch_queues_one_photo_at_the_choice_moment(self):
+        """左支有车 → 走右支 → 那一帧排一张"堵在左、我们走右"的照片。"""
+        task = FreeJunctionTask()
+        _update, _now = drive_to_branch_choice(task, fork_frame(car_left=True))
+        self.assertIs(task.chosen_branch, Branch.RIGHT)
+
+        request = task.take_evidence_request()
+        self.assertIsNotNone(request, "判出拥堵侧并选定分支那一刻应该排一张得分截图")
+        self.assertEqual(
+            request.annotation, "Team 03 detects traffic jam » left way and right"
+        )
+        self.assertEqual(request.shape, "rect", "老师要求用矩形框出堵路的那台车")
+        self.assertIsNotNone(request.image)
+        self.assertEqual(request.image.shape, (360, 640, 3))
+
+        # 框真的框在那台"停着的车"上，而且确实来自模块已有的读数（不另找一遍）
+        self.assertIsNotNone(request.detection, "画面判据这一步本来就拿得到框")
+        self.assertEqual(request.detection.box, task.last_blockage.left_box)
+        self.assertGreater(
+            box_iou(request.detection.box, CAR_LEFT_BOX), 0.5,
+            "框没落在堵路那台车上：%s（真车 %s）"
+            % (request.detection.box, (CAR_LEFT_BOX,)),
+        )
+        self.assertEqual(request.detection.target_id, "left")
+        self.assertIn("boxed", task.last_evidence_note)
+
+    def test_a_blocked_right_branch_writes_the_mirrored_sentence(self):
+        """右支有车 → 走左支 → 文字里的左右跟着换（`side` 是堵的那条）。"""
+        task = FreeJunctionTask()
+        drive_to_branch_choice(task, fork_frame(car_right=True))
+        self.assertIs(task.chosen_branch, Branch.LEFT)
+
+        request = task.take_evidence_request()
+        self.assertIsNotNone(request)
+        self.assertEqual(
+            request.annotation, "Team 03 detects traffic jam » right way and left"
+        )
+        self.assertEqual(request.detection.box, task.last_blockage.right_box)
+        self.assertGreater(box_iou(request.detection.box, CAR_RIGHT_BOX), 0.5)
+
+    def test_the_team_number_comes_from_the_module_settings(self):
+        """队号从配置来（样例是 `Team 10`，我们写 03），不由模块自己拼字符串。"""
+        task = FreeJunctionTask(FreeJunctionConfig(team_number="03"))
+        drive_to_branch_choice(task, fork_frame(car_left=True))
+        self.assertTrue(task.take_evidence_request().annotation.startswith("Team 03 "))
+
+    def test_a_failed_acknowledgement_does_not_change_the_route(self):
+        """**回执 False（写盘失败）之后行为不变**：选的路、走完的结局都一样，
+        因为这张图只是得分副作用。失败只触发一次有界重试。"""
+        task = FreeJunctionTask()
+        update, now = drive_to_branch_choice(task, fork_frame(car_left=True))
+        self.assertIs(task.chosen_branch, Branch.RIGHT)
+
+        request = task.take_evidence_request()
+        self.assertTrue(task.acknowledge_evidence(request.request_id, False))
+        retry = task.take_evidence_request()
+        self.assertIsNotNone(retry, "写盘失败应该按 max_evidence_attempts 重试一次")
+        self.assertEqual(retry.attempt, 2)
+        # `request_id` 是**派生属性**（label:frame:attempt），重试只是 attempt 加一
+        self.assertEqual(retry.request_id, "free_junction:frame:2:attempt:2")
+        self.assertNotEqual(retry.request_id, request.request_id)
+        self.assertEqual(retry.annotation, request.annotation)
+        self.assertIsNotNone(retry.image)
+
+        self.assertTrue(task.acknowledge_evidence(retry.request_id, False))
+        self.assertIsNone(task.take_evidence_request(), "重试用完就放弃，不无限重排")
+
+        # 行为不变：还是那条被选中的分支，还是正常走完
+        self.assertIs(task.chosen_branch, Branch.RIGHT)
+        self.assertIn("left branch blocked", task.last_reason)
+        records = []
+        for index in range(400):
+            step = task.step(FramePacket(fork_frame(car_left=True), 900 + index, now), now)
+            records.append(step)
+            now += 0.05
+            if step.status in (TaskStatus.COMPLETED, TaskStatus.FAILED):
+                break
+        self.assertIs(records[-1].status, TaskStatus.COMPLETED)
+        self.assertTrue(all(yaw > 0 for yaw in turn_yaws(
+            [(task.state, u, now) for u in records])), "选右支就该一直往右转")
+
+    def test_a_missing_evidence_layer_never_changes_the_route(self):
+        """**尽力而为**：连请求都构造不出来（证据层出问题）时，车照样选路、照样走完。"""
+        task = FreeJunctionTask()
+
+        def broken(*_args, **_kwargs):
+            raise RuntimeError("evidence layer down")
+
+        task._make_evidence_request = broken
+        drive_to_branch_choice(task, fork_frame(car_left=True))
+        self.assertIs(task.chosen_branch, Branch.RIGHT)
+        self.assertIsNone(task.take_evidence_request())
+        self.assertEqual(task.last_outcome, None)
+
+        updates, _now = run_task(task, fork_frame(car_left=True), start=5.0)
+        self.assertIs(updates[-1].status, TaskStatus.COMPLETED)
+
+    def test_a_degraded_photo_is_queued_when_no_box_is_available(self):
+        """读数里确实没有可用的框坐标 → 交**无框图**，并在 message 里写明降级。
+
+        绝不为了画框去编坐标：Final 按这些图算分，编一个框比没有框更糟。
+        """
+        task = FreeJunctionTask()
+        task.last_blockage = BlockageReading(BLOCKAGE_LEFT, 0.5, 0.0, None, None)
+        self.assertIsNone(task._evidence_from_reading(task.last_blockage))
+        # 退化成一个点的框同样不算"可用框"
+        self.assertIsNone(
+            task._evidence_from_reading(BlockageReading(BLOCKAGE_LEFT, 0.5, 0.0, (5, 5, 5, 5), None))
+        )
+        self.assertEqual(task._blocked_side(task.last_blockage), "left")
+
+        task.chosen_branch = Branch.RIGHT
+        task._blockage_stale = True          # 判据是上一帧的 → 那个框对不上这一帧
+        task._queue_junction_evidence(
+            FramePacket(fork_frame(car_left=True), 7, 1.0), task.last_blockage
+        )
+        request = task.take_evidence_request()
+        self.assertIsNotNone(request, "降级也要交图：文字仍然能证明判了拥堵、选了哪条")
+        self.assertIsNone(request.detection, "没有可用框就不许编坐标")
+        self.assertIsNotNone(request.image)
+        self.assertEqual(
+            request.annotation, "Team 03 detects traffic jam » left way and right"
+        )
+        self.assertIn("without a box", task.last_evidence_note)
+        self.assertIn("no usable blockage frame", task.last_evidence_note)
+
+    def test_only_one_photo_per_junction_event(self):
+        """老师按**保存的张数**算分：同一次拥堵事件只排一张，不重复排。"""
+        task = FreeJunctionTask()
+        image = fork_frame(car_left=True)
+        drive_to_branch_choice(task, image)
+        first = task.take_evidence_request()
+        self.assertIsNotNone(first)
+        self.assertTrue(task.acknowledge_evidence(first.request_id, True))
+        now = 20.0
+        for index in range(40):
+            task.step(FramePacket(image, 200 + index, now), now)
+            now += 0.05
+        self.assertIsNone(task.take_evidence_request(), "同一事件不许再排第二张")
+
+    def test_reset_drops_a_photo_from_the_interrupted_takeover(self):
+        """被迫结束（协调器 `reset()`）时把上一次接管留下的请求丢掉 ——
+        那张图绑的是上一次的帧，而那条接管已经被判为无效。"""
+        task = FreeJunctionTask()
+        drive_to_branch_choice(task, fork_frame(car_left=True))
+        pending = task.pending_evidence_request       # 取一眼，不消耗
+        self.assertIsNotNone(pending)
+        self.assertIsNotNone(pending.image)
+        task.reset()
+        self.assertIsNone(task.pending_evidence_request)
 
 
 class AimDirectionTests(unittest.TestCase):

@@ -14,6 +14,7 @@ from math import atan2, cos, degrees, hypot, radians, sin
 from typing import List, Optional, Tuple
 
 from config import CONFIG
+from evidence import make_evidence_photo
 from line_detector import LineDetector
 from models import (
     FramePacket,
@@ -142,6 +143,13 @@ HANDOFF_VIEW_TIMEOUT_SECONDS = 3.0
 MAX_INTEGRATION_STEP_SECONDS = 0.20
 LOCKED_TARGET_LOSS_SECONDS = 0.80
 
+# Scoring-photo config for 8.1 (recovery after a broken route).  The annotation
+# text comes from the evidence layer template ("route"); this module only hands
+# over the frame, the box and the team number.
+EVIDENCE_TEAM = "03"
+EVIDENCE_MAX_ATTEMPTS = 2
+EVIDENCE_EVENT = "route:recovered"
+
 
 class RouteTask:
     """Find and join a disconnected route with bounded camera-only motion."""
@@ -223,6 +231,20 @@ class RouteTask:
         self._low_target_tangent: Optional[float] = None
         self._low_centering = False
         self._reacquire_view_already_low = False
+        self._reset_evidence()
+
+    def _reset_evidence(self) -> None:
+        """Clear the scoring-photo slots for a new recovery attempt.
+
+        Kept separate from ``reset()`` so the evidence protocol is one small,
+        auditable block instead of state scattered through the state machine.
+        """
+        self._queued_evidence = None
+        self._active_evidence = None
+        #: 这一轮已经排过"恢复成功"照片的事件键；同一事件只排一张。
+        self._evidence_queued_events: set = set()
+        self._evidence_outcome = None
+        self._evidence_degraded = ""
 
     @property
     def active(self) -> bool:
@@ -287,6 +309,10 @@ class RouteTask:
         self._reacquire_view_already_low = False
         self.last_detection = VisualDetection.no_result(KIND)
         self._line_detector.reset()
+        # 注意：**故意不在这里清证据槽位**。COMPLETED 正好由 _finish() -> reset()
+        # 收尾，而主循环要到**下一帧**才会 take_evidence_request()；在这里清掉
+        # 就等于照片永远交不出去。证据槽位的一个生命周期 = 一次恢复尝试，只在
+        # 新一次恢复开始时（_begin_raise）重置。
 
     def _integrate_previous_command(self, now: float) -> None:
         if self._last_motion_at is None:
@@ -798,6 +824,9 @@ class RouteTask:
     def _begin_raise(self, now: float) -> None:
         if self.started_at is None:
             self.started_at = now
+        # 一次**新的**恢复尝试从这里开始，所以得分照片的槽位在这里重置：
+        # 上一次尝试留下的请求（或去重记录）绝不能压掉这一次的"找回路线"照片。
+        self._reset_evidence()
         # The departure gate is the physical endpoint, not the beginning of
         # END_APPROACH.  Reset the local pose when the bottom route vanishes.
         self._pose_forward = 0.0
@@ -980,6 +1009,123 @@ class RouteTask:
         if abs(yaw) < ALIGN_MIN_YAW:
             yaw = ALIGN_MIN_YAW if yaw > 0.0 else -ALIGN_MIN_YAW
         return float(yaw)
+
+    # ------------------------------------------------------------------
+    # Scoring-photo protocol
+    # (main.service_task_evidence polls take_evidence_request() every frame)
+    # ------------------------------------------------------------------
+
+    @property
+    def pending_evidence_request(self):
+        """Inspect the queued photo request without consuming it."""
+        return self._queued_evidence
+
+    def take_evidence_request(self):
+        """Transfer one request to the integration-owned evidence writer."""
+        request = self._queued_evidence
+        self._queued_evidence = None
+        return request
+
+    def acknowledge_evidence(self, request_id: str, saved: bool) -> bool:
+        """Record the real writer result; retry a bounded number of times.
+
+        Best effort only: whether the JPEG lands on disk or not, the task has
+        already handed control back to line following.  A failed screenshot must
+        never change the recovery outcome.
+        """
+        active = self._active_evidence
+        if active is None or active.request_id != request_id:
+            return False
+        if saved:
+            self._evidence_outcome = True
+            self._active_evidence = None
+            return True
+        if active.attempt >= EVIDENCE_MAX_ATTEMPTS:
+            self._evidence_outcome = False
+            self._active_evidence = None
+            return True
+        # ``request_id`` is a derived property of EvidencePhoto, not a field:
+        # it must never be passed to dataclasses.replace().
+        retry = replace(active, attempt=active.attempt + 1)
+        self._active_evidence = retry
+        self._queued_evidence = retry
+        self._evidence_outcome = None
+        return True
+
+    def _route_detection(self, line, frame: FramePacket) -> Optional[VisualDetection]:
+        """Full-frame detection for the recovered route, or None to degrade.
+
+        The route module's own ``LineDetection`` carries no bounding box (only
+        the fitted near/far points, the ROI and the mask contour), and at this
+        moment ``self._candidate`` is stale: it still holds the *raised-view*
+        pixel coordinates from DOCKING, which no longer match the lowered view
+        of frames fed here.  So the box is derived from the route the module
+        just accepted: the mask contour intersected with the base detector ROI,
+        clamped to the frame.  Keeping the ROI in the intersection means a
+        contour that is still ROI-local also lands in the right place, instead
+        of being offset twice.
+        """
+        try:
+            roi = getattr(line, "roi", None)
+            contour = getattr(line, "contour", None)
+            if roi is None or contour is None or frame is None:
+                return None
+            height, width = frame.image.shape[:2]
+            left, top, right, bottom = (int(value) for value in roi)
+            xs = contour[:, 0, 0]
+            ys = contour[:, 0, 1]
+            box = (
+                max(0, min(int(xs.min()), left)),
+                max(0, min(int(ys.min()), top)),
+                min(width - 1, max(int(xs.max()), right)),
+                min(height - 1, max(int(ys.max()), bottom)),
+            )
+            if box[2] <= box[0] or box[3] <= box[1]:
+                return None
+            center = getattr(line, "far_point", None)
+            if center is None:
+                center = ((box[0] + box[2]) // 2, (box[1] + box[3]) // 2)
+            return VisualDetection(
+                valid=True,
+                kind=KIND,
+                center=(int(center[0]), int(center[1])),
+                confidence=float(getattr(line, "confidence", 0.0) or 0.0),
+                box=box,
+            )
+        except Exception:
+            return None
+
+    def _queue_recovery_evidence(self, line, frame: FramePacket) -> None:
+        """Queue the single "route found again" photo for this event.
+
+        Best effort by contract: every failure path only records a reason and
+        returns, so the COMPLETED handoff happens either way.
+        """
+        if EVIDENCE_EVENT in self._evidence_queued_events:
+            return
+        if self._evidence_outcome is False:
+            return
+        if self._queued_evidence is not None or self._active_evidence is not None:
+            return
+        detection = self._route_detection(line, frame)
+        self._evidence_degraded = "" if detection is not None else (
+            "no bounding box available for the recovered route; "
+            "photo queued without a marked box"
+        )
+        try:
+            photo = make_evidence_photo(
+                "route",
+                frame,
+                detection=detection,
+                shape="rect",
+                team=EVIDENCE_TEAM,
+            )
+        except Exception as error:  # pragma: no cover - defensive
+            self._evidence_degraded = f"evidence request failed: {error!r}"
+            return
+        self._evidence_queued_events.add(EVIDENCE_EVENT)
+        self._active_evidence = photo
+        self._queued_evidence = photo
 
     def _line_view_running(self, now: float, message: str) -> TaskUpdate:
         self._record_motion(STOP_COMMAND, now)
@@ -1369,6 +1515,14 @@ class RouteTask:
             )
             self._stable_last_sequence = frame.sequence
         if self._stable_frames >= REACQUIRE_STABLE_FRAMES:
+            # 8.1 得分照片就在"确认重新找到正确路线"这一刻排队：这是 REACQUIRING
+            # 里连续 REACQUIRE_STABLE_FRAMES 帧、由正常巡线检测器确认新路线已经
+            # 居中且航向对齐的那一帧 —— 也就是本模块自己认定"恢复成功、准备交回
+            # 巡线"的那一处（紧接着就是 COMPLETED 交回控制权）。选它而不是更早的
+            # DOCKING 或 lowering 帧，是因为老师要求照片里显示的是**已经确认找回
+            # 的路线**，而不是仍在下降/试探中的画面。
+            # 写盘失败绝不影响这次交回：这里只排队，交回照常发生。
+            self._queue_recovery_evidence(line, frame)
             return self._finish(
                 TaskStatus.COMPLETED,
                 "base line detector confirmed centered new route",
