@@ -154,7 +154,7 @@ def run_demo(light_probe=green_right) -> List[str]:
     update = None
     car_yaw = 0.0
     travel = 0.0
-    for _ in range(24):
+    for _ in range(60):   # A28：偏置增益降到 0.6（偏置只当轻推），转完需要更多帧
         now += FRAME_DT
         if update is not None and update.motion is not None:
             car_yaw += float(update.motion.yaw) * FRAME_DT

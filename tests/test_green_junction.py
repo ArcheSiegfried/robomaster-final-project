@@ -1845,7 +1845,7 @@ class OfflineDemoTests(unittest.TestCase):
                 "owner:external",
                 "task:running",
                 "branch:right",
-                "motion:yaw=25.0",
+                "motion:yaw=18.0",
                 "task:completed",
                 "owner:line",
                 "line:TRACKING",
