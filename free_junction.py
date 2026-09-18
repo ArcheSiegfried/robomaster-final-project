@@ -144,7 +144,7 @@ BRANCH_LEFT = "left"
 BRANCH_RIGHT = "right"
 
 #: 得分截图的模板名（`evidence.ANNOTATION_TEMPLATES["free_junction"]` =
-#: `Team {team} detects traffic jam » {side} way and {chosen}`，6.2 拥堵岔路 15 分）。
+#: `Team {team} detects traffic jam on the {side} way and chooses {chosen}`，6.2 拥堵岔路 15 分）。
 EVIDENCE_KIND = KIND
 
 #: 零速度。未触发、等待判据、完成、失败都返回它。
@@ -681,7 +681,7 @@ class FreeJunctionConfig:
     # ---- 得分截图（6.2 拥堵岔路，老师后来明确要一张证据照片）----
     #: 图上那句话的队号。样例文字是 `Team 10 ...`（那是样例队号），我们按队号写 03；
     #: 与 `evidence.TEAM_NUMBER` 一致。文案模板在 `evidence.ANNOTATION_TEMPLATES`
-    #: （`free_junction` → `Team {team} detects traffic jam » {side} way and {chosen}`），
+    #: （`free_junction` → `Team {team} detects traffic jam on the {side} way and chooses {chosen}`），
     #: **不由本模块拼字符串**：五个模块各写一套必然口径不一，分数就丢在这上面。
     team_number: str = "10"
     #: 写盘失败后的重试上限（沿用 evidence.py 的回执约定，和 traffic_light 同值）。

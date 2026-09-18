@@ -1046,7 +1046,7 @@ class ObstacleTask:
         self.last_side = self._side_name()
         # 【7.1 得分照片】就是这一帧：连续帧确认完成、绕行方向刚定下来，
         # 紧接着就要下发第一脚侧移。图上要有障碍的矩形框 + 一行写清
-        # "Team 10 detects obstacle » the left/right side"（文案由证据层拼）。
+        # "Team 10 detects an obstacle and chooses the left/right side"（文案由证据层拼）。
         # 只是**排队**：证据层什么时候写、写不写得成，都不影响下面的动作。
         self._queue_evidence(frame, detection)
         if HOLD_BEFORE_GO > 0.0:

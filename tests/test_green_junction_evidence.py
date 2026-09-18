@@ -65,7 +65,7 @@ class WireEvidencePhotoTests(unittest.TestCase):
 
         request = task.take_evidence_request()
         self.assertIsNotNone(request, "选边那一刻没有排队照片")
-        self.assertEqual(request.annotation, "Team %s detects a green light » left way and left" % TEAM)
+        self.assertEqual(request.annotation, "Team %s detects a green light on the left way and chooses left" % TEAM)
         self.assertEqual(request.shape, "circle", "岔路照片要用圆圈标灯")
         self.assertIsNotNone(request.image)
         # 第二次取应该没有了（一个事件只排一张）

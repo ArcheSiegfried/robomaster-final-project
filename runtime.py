@@ -71,15 +71,19 @@ class LineFollower:
                 message="brief line miss",
             )
 
-        self.state = LINE_LOST
-        self.controller.stop(now)
-        self.detector.reset()
+        # [2026-09-18 集成侧代改（集成负责人裁决）] **取消丢线锁停**。
+        # 过去丢线超过 lost_grace_seconds 就转 LINE_LOST + 硬停 + force_stop，
+        # 必须人工复位才能再动。现在不再锁停 —— 继续用同一套滑行命令找线：
+        # forward 只减不增（≤ lost_forward_speed），yaw 按宽限期衰减到 0（低速直行），
+        # 线一回来立刻回 TRACKING。也**不再 reset 检测器的连续性锚点**，
+        # 让它带着"线原本在哪"的记忆去重新锁定。
+        # 仍然保留的兜底：视频丢失（process_video_gap）、人工 SPACE、任何任务接管。
+        self.state = COASTING
         return RuntimeDecision(
             self.state,
             detection,
-            STOP_COMMAND,
-            True,
-            "line-loss timeout; reset and resume required",
+            self.controller.coast(elapsed, now),
+            message="line lost; still searching (lock-stop cancelled)",
         )
 
     def process_video_gap(

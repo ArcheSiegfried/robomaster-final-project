@@ -66,7 +66,10 @@ class ControlConfig:
     max_forward_deceleration: float = 2.00
     curve_threshold: float = 0.15
     lost_grace_seconds: float = 0.30
-    lost_forward_speed: float = 0.14
+    # 2026-09-18 集成侧代改（集成负责人在实车测试后要求）：丢线滑行速度 0.14 → 0.10。
+    # 理由：模块接管期间"没在跑的车"横冲的距离要更小；这一项只影响丢线后的滑行，
+    # 不影响任何模块自己的动作（避障/岔路/恢复的速度常量在各自模块里）。
+    lost_forward_speed: float = 0.10
     lost_max_yaw: float = 90.0
     recovery_ramp_seconds: float = 0.20
 
@@ -85,8 +88,10 @@ class TaskConfig:
     # 记录各自想不想接管（胜负规则不变，仍是顺序里第一个 RUNNING），好让操作员看到
     # "谁在竞争、最后判给了谁"。设 0 = 关闭（不额外调用任何模块）。
     claim_probe_seconds: float = 3.0
-    # After a task releases, wait this long for a fresh valid line before
-    # giving up and requiring a human SPACE press.
+    # 2026-09-18 集成侧代改：这条超时**只**再管"云台没能回到巡线视角"那条路径
+    # （见 coordinator._step_releasing 的 _view_restore_failed 分支）。
+    # 任务释放后"等一张新鲜有效线"的等待**已经不再放弃**（取消丢线锁停，车会一直等到线
+    # 回来并自动恢复），所以这个值不再决定"要不要人工按 SPACE"。
     release_resume_timeout: float = 2.0
     # One step()/observe() call slower than this is recorded as an error.
     max_step_seconds: float = 0.02

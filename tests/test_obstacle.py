@@ -1092,10 +1092,10 @@ class ObstacleEvidencePhotoTests(unittest.TestCase):
     改变绕行本身 —— 不 FAILED、不停车、不把 11 秒的绕行预算耗在等回执上。
     """
 
-    # 文案照老师样例：`Team 10 detects obstacle » the left side`；样例队号 10，
+    # 文案照老师样例：`Team 10 detects an obstacle and chooses the left side`；样例队号 10，
     # 我们是 03。模板在证据层，这里钉死**渲染出来的那句话**。
-    LEFT_TEXT = "Team 10 detects obstacle » the left side"
-    RIGHT_TEXT = "Team 10 detects obstacle » the right side"
+    LEFT_TEXT = "Team 10 detects an obstacle and chooses the left side"
+    RIGHT_TEXT = "Team 10 detects an obstacle and chooses the right side"
 
     @staticmethod
     def _drive_to_the_dodge(task, image=None, now=1.0, seq=0, limit=200):

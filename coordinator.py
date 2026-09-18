@@ -4,11 +4,29 @@
 coordinator decides whether the base line follower or one external task owns
 the single motion outlet, and it is the only code that calls `MotionOutput`.
 
-Ownership rules (frozen for the whole project):
+Ownership rules (v0.3, 2026-09-18 — arbitration layer):
 
 * `MotionOutput` is the only motion outlet. Owner is `"line"` or `"external"`.
-* At most one motion task owns `"external"` at any moment. Tasks are asked in
-  `task_registry` order and the first one returning `RUNNING` wins.
+* Every module only *requests* motion by returning `RUNNING`; `ControlArbiter`
+  (`control_arbiter.py`) picks the single winner for the frame out of the
+  collected `ControlRequest`s. Tasks are asked in **priority** order
+  (`task_registry.TASK_PRIORITIES`, descending) and, when nobody owns motion,
+  the first `RUNNING` one wins — which is the highest-priority claimant.
+* Two owners are tracked separately and must not be conflated:
+  `active_task` (the task holding the logical takeover) and `motion_owner`
+  (who may command the chassis *this frame*). While a **safety-priority**
+  module (priority >= `SAFETY_PRIORITY`, i.e. the red light) claims control,
+  the task owner is frozen — it is not stepped and its motion is not sent —
+  and it resumes from its own state once the light clears.
+* Circuit breaker: one continuous run may not exceed `RUN_SECONDS` (6s, excluding
+  time it was frozen), and after a run ends the module is locked out of
+  taking control again for `COOLDOWN_SECONDS` (3s). Both apply to every module.
+* A request carries a `ttl` (lease). A module renews it by returning `RUNNING`
+  on a frame it is asked; a stale request is dropped and the frame falls back
+  to whoever else is valid, or to a hard stop when nobody is.
+* Non-safety preemption is **off by default** (`preempt_all=False`): a module
+  can only take control from another task when the arbiter is configured to
+  allow it. This keeps the current, field-confirmed takeover order intact.
 * A takeover is only possible while the base line is armed: the follower must
   be `TRACKING`, `COASTING` or `LINE_LOST`. It can never happen from `STOPPED`
   (the operator has not started the line, or a fault was just reset) or from
@@ -17,9 +35,10 @@ Ownership rules (frozen for the whole project):
   `COMPLETED` or `FAILED`. `NOT_TRIGGERED` while owning is treated as failure,
   because otherwise a task could silently keep control without commanding.
 * Returning control always means: hard stop, `claim("line")`, clear line
-  history, then wait for a fresh valid frame before resuming. If no fresh valid
-  line arrives within `release_resume_timeout`, the robot stays stopped and a
-  human must press SPACE.
+  history, then wait for a fresh valid frame before resuming. Since v0.3 the
+  wait no longer gives up: if no fresh valid line arrives, the robot stays
+  stopped and **resumes by itself as soon as one appears** (the old
+  "press SPACE" timeout was removed on the integration lead's call).
 * Human override always wins: `human_stop()` / `human_reset()` end any takeover
   immediately and require an explicit human resume.
 * Every task `MotionCommand` is clamped into the `TaskConfig` envelope, and
@@ -33,6 +52,14 @@ import time
 from dataclasses import dataclass
 from typing import Optional, Sequence, Tuple
 
+from control_arbiter import (
+    LINE_OWNER,
+    LINE_PRIORITY,
+    RUN_SECONDS,
+    SAFETY_PRIORITY,
+    ControlArbiter,
+    ControlRequest,
+)
 from config import RuntimeConfig
 from models import (
     FramePacket,
@@ -43,6 +70,7 @@ from models import (
     TaskUpdate,
 )
 from runtime import COASTING, LINE_LOST, TRACKING, LineFollower
+from task_registry import priority_of
 
 LINE_FOLLOWING = "LINE_FOLLOWING"
 TASK_ACTIVE = "TASK_ACTIVE"
@@ -51,15 +79,16 @@ RELEASING = "RELEASING"
 OWNER_LINE = "line"
 OWNER_EXTERNAL = "external"
 
-#: 红绿灯模块的注册名。有任务在接管时，协调器仍然每帧单独问它一次（红灯否决）。
-#: 2026-09-17：`traffic_light.py` 回来了（3 号重新提交，位置在注册表第 1 位），
-#: 所以下面这套"红灯否决权"**重新生效**：任何任务开车时遇到红灯都会被暂停
-#: （暂停的秒数不计入任务的超时预算），红灯消失后原任务继续。
-#: 机制本身没变过，找不到名为 traffic_light 的模块时会自动失效（`light_task=None`）。
+#: 红绿灯模块的注册名。v0.3 起"红灯否决"由通用机制实现（安全级模块每帧都被问，
+#: 见 `_ask_list`），这个常量保留给测试与诊断（"红灯否决需要一个可问的模块"）。
 LIGHT_TASK_NAME = "traffic_light"
 
 # The base line must be armed before any module may claim motion from it.
 TAKEOVER_ALLOWED_STATES = (TRACKING, COASTING, LINE_LOST)
+
+#: 连续这么多帧单步耗时都超 `max_step_seconds`，就认定这个模块卡住了并强制释放。
+#: 今天只记一条 error 不处理（模块卡死全靠 SDK 的 0.15s 命令超时兜底）。
+SLOW_STEP_FRAMES = 5
 
 
 @dataclass(frozen=True)
@@ -75,6 +104,10 @@ class CoordinatorDecision:
     force_stop: bool = False
     message: str = ""
     errors: Tuple[str, ...] = ()
+    #: 控制权变更时的终端日志行（`[ARB] owner changed: ...`）；没换人就是 None。
+    owner_change: Optional[str] = None
+    #: 探测帧的"竞争实况"：每个被问到的模块各自想不想接管。
+    claims: tuple = ()
 
 
 def _finite(value) -> float:
@@ -121,14 +154,10 @@ class TaskCoordinator:
         self.active_task_name: Optional[str] = None
         self._active_started: Optional[float] = None
         self._release_started: Optional[float] = None
-        # 红灯否决（见 _light_veto）：即使有任务在接管，也要每帧问一次红绿灯。
-        # 没有它，"一帧定生死、赢家通吃"就意味着任何模块先接管之后，红灯再亮也
-        # 没人问（实测：障碍接管期间红灯亮着，车仍以 forward=0.2 在走）。
-        self.light_task = next(
-            (task for task in self.motion_tasks
-             if getattr(task, "name", None) == LIGHT_TASK_NAME),
-            None,
-        )
+        # 红灯否决在 v0.3 里**不再是特判**：`_ask_list()` 让安全级（priority >=
+        # SAFETY_PRIORITY）模块在"有任务接管"时也每帧被问，而 `_collect()` 一旦
+        # 拿到安全级请求就短路，owner 那一帧根本不会被调用 —— 行为与老的红灯否决
+        # 等价（实测：障碍接管期间红灯亮着，车仍以 forward=0.2 在走，就是没有它）。
         #: 被红灯暂停掉的累计时间：等红灯不该算进任务的 max_task_seconds。
         self._paused_seconds = 0.0
         #: 最近一次"竞争探测"的结果（只有探测帧非空）。给终端显示用：
@@ -139,6 +168,37 @@ class TaskCoordinator:
         self._view_changed = False
         self._view_ready_at: Optional[float] = None
         self._view_restore_failed = False
+        # -- 仲裁层（v0.3）---------------------------------------------
+        # 仲裁器只决定"这一帧谁能下发运动指令"。任务的生命周期（active_task、
+        # 20s 超时、释放握手）仍然由本协调器负责 —— 两者分开是刻意的：
+        # task_owner 可以存在而 motion_owner 是别人（红灯把任务冻结住就是这种情形）。
+        self.arbiter = ControlArbiter(
+            safety_priority=SAFETY_PRIORITY,
+            preempt_margin=int(getattr(settings.tasks, "preempt_margin", 0)),
+            min_hold_seconds=float(getattr(settings.tasks, "min_hold_seconds", 0.2)),
+            preempt_all=bool(getattr(settings.tasks, "preempt_all", False)),
+        )
+        #: 这一帧真正能下发运动指令的人："line" 或模块名。
+        self.motion_owner = LINE_OWNER
+        self._owner_priority = LINE_PRIORITY
+        self._motion_owner_since: Optional[float] = None
+        #: 本帧每个被问到的模块的 TaskUpdate（None = 抛异常/没被问）。
+        self._last_step_updates = {}
+        #: 每个模块"连续多少帧单步超预算"（超 SLOW_STEP_FRAMES 就强制释放）。
+        self._slow_frames = {}
+        #: 熔断：单个模块一次连续运行最长 RUN_SECONDS（6s，**不含**被冻结的时段），
+        #: 到点强制释放；释放后由仲裁器把它冷却 COOLDOWN_SECONDS（3s）。
+        #: 2026-09-18 实车测试定稿（集成负责人）：6 秒上限 + 3 秒冷却。
+        self._breaker_run_seconds = RUN_SECONDS
+        # -- 任务时钟（v0.3）-------------------------------------------
+        # 每个模块的 `now` **只累计它真正被调用的时段**。被跳过的帧（它不是 owner，
+        # 也不是安全级）与被打断的帧（红灯把它冻结住）一律不计入 —— 否则模块会在
+        # "它根本没在跑"的时候被自己的墙钟超时判死（实车可复现：红灯把正在转向的
+        # 模块暂停 8 秒，它下一次被调用就 turn timeout）。
+        self._task_clock = {}
+        self._last_called = {}
+        self._called_last_frame = set()
+        self._called_this_frame = set()
 
     # -- introspection -------------------------------------------------
     @property
@@ -164,37 +224,14 @@ class TaskCoordinator:
                 f"{label} step was slow: {elapsed:.3f}s "
                 f"(limit {self.settings.tasks.max_step_seconds:.3f}s)"
             )
+            self._slow_frames[label] = self._slow_frames.get(label, 0) + 1
+        else:
+            self._slow_frames[label] = 0
         return result
 
     def _observe(self, frame, now, errors) -> None:
         for observer in self.observers:
             self._call(observer.observe, observer.name, frame, now, errors)
-
-    def _find_takeover(self, frame, now, errors, probe_all: bool = False):
-        """按顺序问模块，返回第一个"想接管"的。
-
-        `probe_all=True` 时**问完所有模块**（胜负规则不变，仍是第一个 RUNNING 赢），
-        并把各自的想法记进 `self.last_claims` 供终端显示"竞争实况"。
-        """
-        winner = None
-        claims = []
-        for task in self.motion_tasks:
-            update = self._call(task.step, task.name, frame, now, errors)
-            if update is not None and update.status is TaskStatus.RUNNING:
-                if winner is None:
-                    winner = (task, update)
-                if not probe_all:
-                    # 正常帧：遇到第一个 RUNNING 就停（保持既有开销与状态推进）。
-                    self.last_claims = ()
-                    return winner
-            if probe_all:
-                claims.append({
-                    "name": task.name,
-                    "status": "ERROR" if update is None else update.status.name,
-                    "message": "" if update is None else str(update.message or ""),
-                })
-        self.last_claims = tuple(claims) if probe_all else ()
-        return winner
 
     def _apply_task_motion(self, update: TaskUpdate, errors) -> MotionCommand:
         if update.motion is None:
@@ -299,17 +336,162 @@ class TaskCoordinator:
         except Exception as error:
             errors.append(f"gimbal poll failed: {error}")
 
+    # -- 仲裁辅助 --------------------------------------------------------
+    def _priority(self, task) -> int:
+        """任务优先级：类属性优先，否则查注册表，再否则按巡线处理。"""
+        value = getattr(task, "priority", None)
+        if isinstance(value, bool) or not isinstance(value, int):
+            return priority_of(task)
+        return int(value)
+
+    def _is_safety(self, task) -> bool:
+        return self._priority(task) >= self.arbiter.safety_priority
+
+    def _ranked_tasks(self):
+        return sorted(
+            self.motion_tasks,
+            key=lambda task: (-self._priority(task), self.motion_tasks.index(task)),
+        )
+
+    def _ask_list(self, forced_full: bool) -> tuple:
+        """这一帧有资格说话的模块。
+
+        * **无人接管**（巡线在开车）：按优先级顺序全部问，遇到第一个 RUNNING 就停
+          （`forced_full` 的探测帧问完所有人，只为终端显示竞争实况）。
+        * **有任务在接管**：只问**安全级**模块 + 当前任务。安全级必须每帧被问，
+          这是"红灯必须能停住正在开车的模块"的通用做法（替代原来的硬编码特判）。
+        * 打开 `preempt_all` 时，再补上优先级严格更高的模块。
+        """
+        ranked = self._ranked_tasks()
+        if self.active_task is None or forced_full:
+            return tuple(ranked)
+        asked = [task for task in ranked if self._is_safety(task)]
+        if self.active_task not in asked:
+            asked.append(self.active_task)
+        if self.arbiter.preempt_all:
+            for task in ranked:
+                if self._priority(task) > self._owner_priority and task not in asked:
+                    asked.append(task)
+        return tuple(asked)
+
+    def _collect(self, frame, now, errors, forced_full: bool = False):
+        """按 ask 顺序调 step，收集 RUNNING 的模块 → [(request, task, update), ...]。"""
+        collected = []
+        for task in self._ask_list(forced_full):
+            if self.arbiter.locked_out(task.name, now) > 0.0:
+                # 熔断冷却中：不 step、不收集请求（省 CPU；任务时钟也不会因此惩罚它）。
+                continue
+            task_now = self._task_now(task, now)
+            self._called_this_frame.add(task.name)
+            update = self._call(task.step, task.name, frame, task_now, errors)
+            self._last_step_updates[task.name] = update
+            if update is None or update.status is not TaskStatus.RUNNING:
+                continue
+            collected.append(
+                (
+                    ControlRequest(
+                        module=task.name,
+                        priority=self._priority(task),
+                        command=update.motion,
+                        ttl=float(getattr(self.settings.tasks, "lease_seconds", 0.5)),
+                        timestamp=now,
+                        state=str(update.message or ""),
+                        order=self.motion_tasks.index(task),
+                    ),
+                    task,
+                    update,
+                )
+            )
+            if forced_full:
+                continue
+            if self._is_safety(task):
+                # 安全级赢家已定：后面的模块（含当前 owner）这一帧不再被调，
+                # 这样"红灯期间任务真的被停住"而不是继续发速度。
+                break
+            if self.active_task is None:
+                # 无人接管：按优先级顺序扫，第一个 RUNNING 就是最高优先级。
+                break
+        return collected
+
+    @staticmethod
+    def _pick(collected, request):
+        for item in collected:
+            if item[0] is request:
+                return item[1], item[2]
+        return None, None
+
+    def _claim_rows(self, collected, asked, now: float = 0.0) -> tuple:
+        """终端"竞争实况"：本帧每个模块各自想不想接管（含"熔断冷却中"）。"""
+        claimed = {item[1].name: item for item in collected}
+        rows = []
+        for task in asked:
+            item = claimed.get(task.name)
+            update = self._last_step_updates.get(task.name)
+            remaining = self.arbiter.locked_out(task.name, now)
+            if remaining > 0.0:
+                status = "LOCKED_OUT"
+            elif item is not None:
+                status = "RUNNING"
+            elif update is None:
+                status = "ERROR"
+            else:
+                status = update.status.name
+            rows.append(
+                {
+                    "name": task.name,
+                    "priority": self._priority(task),
+                    "status": status,
+                    "message": "" if update is None else str(update.message or ""),
+                }
+            )
+        return tuple(rows)
+
+    def _note_owner(self, name: str, priority: int, now: float) -> None:
+        self.motion_owner = name
+        self._owner_priority = priority
+        self._motion_owner_since = now
+
+    def _task_now(self, task, real_now: float) -> float:
+        """给模块的 `now`：只在"上一帧也被调用过"时累加真实时间差。
+
+        这样被跳过/被冻结的时段不进它的时间线；连续被调用的正常情况与真实时钟一致。
+        只可能 ≤ 真实 `now`（因为它只累加真实差值），不会倒退。
+        """
+        current = self._task_clock.get(task.name)
+        if current is None:
+            current = real_now
+        elif task.name in self._called_last_frame:
+            current = current + (real_now - self._last_called[task.name])
+        self._task_clock[task.name] = current
+        self._last_called[task.name] = real_now
+        return current
+
+    def _owner_change_text(self, result, previous: str, previous_priority: int):
+        """把仲裁结果翻译成一行 `[ARB] ...`；没换人就返回 None。"""
+        if result is None or result.request is None or result.owner == previous:
+            return None
+        return self.arbiter.change_text(previous, result, previous_priority)
+
+    def _safety_winner(self, collected, task):
+        for request, candidate, update in collected:
+            if candidate is not task and self._is_safety(candidate):
+                return candidate, update, request
+        return None, None, None
+
     # -- per-cycle entry point -----------------------------------------
     def step(self, frame: FramePacket, now: float) -> CoordinatorDecision:
         errors = []
         delta = 0.0 if self._previous_frame_time is None else max(
             0.0, now - self._previous_frame_time)
         self._previous_frame_time = now
+        # 任务时钟的分帧边界：本帧被调用过的模块，下一帧才允许继续累加时间。
+        self._called_last_frame = self._called_this_frame
+        self._called_this_frame = set()
         self._poll_gimbal(errors)
         self._observe(frame, now, errors)
 
         if self.active_task is not None:
-            return self._step_active(frame, now, errors, delta)
+            return self._step_owned(frame, now, errors, delta)
         if self.state == RELEASING:
             return self._step_releasing(frame, now, errors)
         probe = self._claim_probe_due(now)
@@ -323,7 +505,7 @@ class TaskCoordinator:
         正常情况下协调器遇到第一个 RUNNING 就停，后面的模块**根本不会被问**，
         操作员看不到"还有谁想接管、为什么判给它"。这个探测帧就是为调优先级准备的：
         每 `claim_probe_seconds` 秒一次（默认 3 秒，设 0 关闭），**胜负规则不变**
-        （仍是顺序里第一个 RUNNING）；代价只是那一帧会让未接管的模块多推进一次
+        （仍是优先级最高的那个）；代价只是那一帧会让未接管的模块多推进一次
         内部计数，所以频率低、并且可以关。
         """
         interval = float(getattr(self.settings.tasks, "claim_probe_seconds", 0.0) or 0.0)
@@ -341,12 +523,24 @@ class TaskCoordinator:
         # hold its command until we know no task is taking over this cycle.
         decision = self.follower.process_frame(frame.image, frame.captured_at)
         self.last_line_decision = decision
+        self.last_claims = ()
+        self._last_step_updates = {}
 
         if self.takeover_allowed:
-            takeover = self._find_takeover(frame, now, errors, probe_all=probe)
-            if takeover is not None:
-                task, update = takeover
-                return self._begin_takeover(task, update, now, errors)
+            asked = self._ask_list(probe)
+            collected = self._collect(frame, now, errors, forced_full=probe)
+            if probe:
+                self.last_claims = self._claim_rows(collected, asked, now)
+            result = self.arbiter.select(
+                [item[0] for item in collected],
+                now,
+                current_owner=LINE_OWNER,
+                current_owner_since=self._motion_owner_since,
+            )
+            if result.request is not None:
+                task, update = self._pick(collected, result.request)
+                if task is not None:
+                    return self._begin_takeover(task, update, now, errors, result)
 
         if decision.force_stop:
             self.output.hard_stop()
@@ -362,7 +556,9 @@ class TaskCoordinator:
             errors=tuple(errors),
         )
 
-    def _begin_takeover(self, task, update, now, errors) -> CoordinatorDecision:
+    def _begin_takeover(self, task, update, now, errors, result=None) -> CoordinatorDecision:
+        previous = self.motion_owner
+        previous_priority = self._owner_priority
         self.follower.pause(now)
         self.output.claim(OWNER_EXTERNAL)
         self.active_task = task
@@ -370,6 +566,7 @@ class TaskCoordinator:
         self._active_started = now
         self._paused_seconds = 0.0
         self.state = TASK_ACTIVE
+        self._note_owner(task.name, self._priority(task), now)
         if not self._apply_task_gimbal(update, errors):
             return self._release(
                 now, errors, "task gimbal request failed", reset_task=True
@@ -384,12 +581,16 @@ class TaskCoordinator:
             command=command,
             message="task took over",
             errors=tuple(errors),
+            owner_change=self._owner_change_text(result, previous, previous_priority),
+            claims=self.last_claims,
         )
 
-    def _step_active(self, frame, now, errors, delta: float = 0.0) -> CoordinatorDecision:
+    def _step_owned(self, frame, now, errors, delta: float = 0.0) -> CoordinatorDecision:
+        """有任务在"逻辑上"持有任务：本帧唯一的运动指令由仲裁器决定。"""
         task = self.active_task
         # 有人在开车时不再报"竞争"（这一帧只有它被问，报出来会误导操作员）。
         self.last_claims = ()
+        self._last_step_updates = {}
         elapsed = now - self._active_started - self._paused_seconds
         if elapsed > self.settings.tasks.max_task_seconds:
             errors.append(
@@ -398,77 +599,151 @@ class TaskCoordinator:
             )
             return self._release(now, errors, "task timeout", reset_task=True)
 
-        veto = self._light_veto(frame, now, errors)
-        if veto is not None:
-            # 红灯：暂停当前任务（这一帧不调它的 step），只下发停车指令。
-            # 不做释放握手 —— 红灯不是故障，不需要人来按 SPACE；
-            # 等灯的时间也不计入任务的超时预算。
-            self._paused_seconds += delta
-            self.output.send(OWNER_EXTERNAL, STOP_COMMAND)
-            return CoordinatorDecision(
-                state=TASK_ACTIVE,
-                owner=self.output.owner,
-                line=self.last_line_decision,
-                task_name=task.name,
-                task_update=veto,
-                command=STOP_COMMAND,
-                message=f"red light veto: {task.name} paused",
-                errors=tuple(errors),
+        # 熔断：一次连续运行（不含被红灯等冻结掉的时段）超过 8 秒就强制释放。
+        if self._breaker_run_seconds > 0.0 and elapsed > self._breaker_run_seconds:
+            errors.append(
+                f"{task.name} exceeded the breaker run limit "
+                f"({self._breaker_run_seconds:.1f}s)"
+            )
+            return self._release(
+                now,
+                errors,
+                "task exceeded the breaker run limit (%.1fs)"
+                % self._breaker_run_seconds,
+                reset_task=True,
             )
 
-        update = self._call(task.step, task.name, frame, now, errors)
-        if update is None:
+        collected = self._collect(frame, now, errors, forced_full=False)
+        owner_update = self._last_step_updates.get(task.name)
+
+        # 情况 0：它连续多帧单步超预算 —— 判定卡住，主动夺权（不再只记一条 error）。
+        if self._slow_frames.get(task.name, 0) >= SLOW_STEP_FRAMES:
+            errors.append(
+                f"{task.name} exceeded the per-step budget for "
+                f"{SLOW_STEP_FRAMES} consecutive frames"
+            )
             return self._release(
-                now, errors, "task raised an exception", reset_task=True
+                now, errors, "task exceeded the per-step budget", reset_task=True
             )
-        if update.status is TaskStatus.RUNNING:
-            if not self._apply_task_gimbal(update, errors):
+
+        # 情况 1：当前任务这一帧没被调用（被安全级短路），或它抛异常了。
+        if owner_update is None:
+            rival, rival_update, _request = self._safety_winner(collected, task)
+            if rival is None:
                 return self._release(
-                    now, errors, "task gimbal request failed", reset_task=True
+                    now, errors, "task raised an exception", reset_task=True
                 )
-            command = self._apply_task_motion(update, errors)
-            return CoordinatorDecision(
-                state=TASK_ACTIVE,
-                owner=self.output.owner,
-                line=self.last_line_decision,
-                task_name=task.name,
-                task_update=update,
-                command=command,
-                message=update.message,
-                errors=tuple(errors),
-            )
-        if update.status is TaskStatus.NOT_TRIGGERED:
+            return self._safety_veto(task, rival, rival_update, collected, now, delta, errors)
+
+        # 情况 2：接管中却说自己"没触发" —— 违约，必须释放（契约不变）。
+        if owner_update.status is TaskStatus.NOT_TRIGGERED:
             errors.append(
                 f"{task.name} returned NOT_TRIGGERED while owning motion; "
                 f"a task must keep returning RUNNING until it completes or fails"
             )
             return self._release(
-                now,
-                errors,
-                "task gave up while owning motion",
-                reset_task=True,
+                now, errors, "task gave up while owning motion", reset_task=True
             )
-        return self._release(
-            now, errors, f"task {update.status.value}", update=update
+
+        # 情况 3：正常终态。
+        if owner_update.status is not TaskStatus.RUNNING:
+            return self._release(
+                now, errors, f"task {owner_update.status.value}", update=owner_update
+            )
+
+        # 情况 4：它还在 RUNNING —— 但仲裁器可能判给别人（安全级或 preempt_all 抢占）。
+        result = self.arbiter.select(
+            [item[0] for item in collected],
+            now,
+            current_owner=self.motion_owner,
+            current_owner_since=self._motion_owner_since,
+        )
+        winner, winner_update = self._pick(collected, result.request) if result.request else (None, None)
+        if winner is not None and winner is not task:
+            if self._is_safety(winner):
+                return self._safety_veto(task, winner, winner_update, collected, now, delta, errors)
+            return self._hand_off(task, winner, winner_update, now, errors, result)
+
+        # 情况 5：当前任务继续开车（也可能刚从否决/抢占里恢复）。
+        previous = self.motion_owner
+        previous_priority = self._owner_priority
+        if previous != task.name:
+            self._note_owner(task.name, self._priority(task), now)
+        if not self._apply_task_gimbal(owner_update, errors):
+            return self._release(
+                now, errors, "task gimbal request failed", reset_task=True
+            )
+        command = self._apply_task_motion(owner_update, errors)
+        return CoordinatorDecision(
+            state=TASK_ACTIVE,
+            owner=self.output.owner,
+            line=self.last_line_decision,
+            task_name=task.name,
+            task_update=owner_update,
+            command=command,
+            message=owner_update.message,
+            errors=tuple(errors),
+            owner_change=self._owner_change_text(result, previous, previous_priority),
         )
 
-    def _light_veto(self, frame, now, errors):
-        """红灯否决：有任务正在开车时，也每帧问一次红绿灯。
+    def _safety_veto(self, task, rival, rival_update, collected, now, delta, errors):
+        """安全级（红灯）接管：**冻结**当前任务，只下发安全级要求的指令。
 
-        正常情况下红绿灯模块排在最前面，自己就能接管；但它只能"从巡线手里"接管。
-        一旦别的模块先拿走运动出口，协调器整帧只调那一个模块，红绿灯模块再也
-        没机会说话 —— 于是红灯亮着车照样走。
-
-        这里只做两件事：问一次、以及把结果交回给调用方去执行停车。
-        **不结束任务、不做释放握手**：红灯结束（或它自己超时）之后原任务继续干。
+        不做释放握手 —— 红灯不是故障，不需要人来按 SPACE；等灯的时间也不计入任务的
+        超时预算。当前任务保持 active（状态不丢），灯一消失就继续从原状态跑。
         """
-        light = self.light_task
-        if light is None or light is self.active_task:
-            return None
-        update = self._call(light.step, light.name, frame, now, errors)
-        if update is None or update.status is not TaskStatus.RUNNING:
-            return None
-        return update
+        previous = self.motion_owner
+        previous_priority = self._owner_priority
+        result = self.arbiter.select(
+            [item[0] for item in collected],
+            now,
+            current_owner=previous,
+            current_owner_since=self._motion_owner_since,
+        )
+        self._paused_seconds += delta
+        self._note_owner(rival.name, self._priority(rival), now)
+        command = self._apply_task_motion(rival_update, errors)
+        return CoordinatorDecision(
+            state=TASK_ACTIVE,
+            owner=self.output.owner,
+            line=self.last_line_decision,
+            task_name=task.name,
+            task_update=rival_update,
+            command=command,
+            message=f"red light veto: {task.name} paused",
+            errors=tuple(errors),
+            owner_change=self._owner_change_text(result, previous, previous_priority),
+        )
+
+    def _hand_off(self, task, winner, winner_update, now, errors, result):
+        """非安全级抢占（只在 `preempt_all=True` 时发生）。
+
+        被抢的任务**不 reset、不丢状态**，只是暂时不再被调用；新赢家立刻接管。
+        释放握手不参与（那不是故障），motion_owner 直接换人。
+        """
+        previous = self.motion_owner
+        previous_priority = self._owner_priority
+        self.active_task = winner
+        self.active_task_name = winner.name
+        self._active_started = now
+        self._paused_seconds = 0.0
+        self._note_owner(winner.name, self._priority(winner), now)
+        if not self._apply_task_gimbal(winner_update, errors):
+            return self._release(
+                now, errors, "task gimbal request failed", reset_task=True
+            )
+        command = self._apply_task_motion(winner_update, errors)
+        return CoordinatorDecision(
+            state=TASK_ACTIVE,
+            owner=self.output.owner,
+            line=self.last_line_decision,
+            task_name=winner.name,
+            task_update=winner_update,
+            command=command,
+            message="task took over from %s" % previous,
+            errors=tuple(errors),
+            owner_change=self._owner_change_text(result, previous, previous_priority),
+        )
 
     def _release(
         self,
@@ -480,6 +755,15 @@ class TaskCoordinator:
     ) -> CoordinatorDecision:
         name = self.active_task_name
         task = self.active_task
+        # 熔断：这次运行结束了 → 让这个模块冷却 COOLDOWN_SECONDS 秒（每个模块一样，没有豁免）。
+        breaker_line = None
+        if name and self.arbiter.cooldown_seconds > 0.0:
+            self.arbiter.lock_out(name, now)
+            breaker_line = "[ARB] %s locked out for %.1fs (cooldown after: %s)" % (
+                name,
+                self.arbiter.cooldown_seconds,
+                message,
+            )
         self.output.hard_stop()
         self.output.claim(OWNER_LINE)
         self.follower.reset_fault(now)
@@ -492,6 +776,7 @@ class TaskCoordinator:
         self._active_started = None
         self._paused_seconds = 0.0
         self._release_started = now
+        self._note_owner(LINE_OWNER, LINE_PRIORITY, now)
         self._restore_line_view(now, errors)
         self.state = RELEASING
         return CoordinatorDecision(
@@ -504,6 +789,7 @@ class TaskCoordinator:
             force_stop=True,
             message=message,
             errors=tuple(errors),
+            owner_change=breaker_line,
         )
 
     def _step_releasing(self, frame, now, errors) -> CoordinatorDecision:
@@ -585,20 +871,11 @@ class TaskCoordinator:
                 errors=tuple(errors),
             )
 
-        if now - self._release_started > self.settings.tasks.release_resume_timeout:
-            self._release_started = None
-            self.state = LINE_FOLLOWING
-            self.output.hard_stop()
-            return CoordinatorDecision(
-                state=LINE_FOLLOWING,
-                owner=self.output.owner,
-                line=decision,
-                command=STOP_COMMAND,
-                force_stop=True,
-                message="auto-resume timed out; show a fresh line and press SPACE",
-                errors=tuple(errors),
-            )
-
+        # [2026-09-18 集成侧代改（集成负责人裁决）] **取消"等不到新鲜线就要人工按 SPACE"**：
+        # 过去超过 release_resume_timeout 就放弃、转 LINE_FOLLOWING + force_stop，
+        # 车会一直停着等人按键（实车卡过 36 秒）。现在无限期等下去，**线一回来就自动恢复**。
+        # 注意 `release_resume_timeout` 仍然管着另一条路径：云台没能回到巡线视角
+        # （见上面的 _view_restore_failed 分支）——那是云台故障，保持原样。
         return CoordinatorDecision(
             state=RELEASING,
             owner=self.output.owner,
@@ -657,6 +934,7 @@ class TaskCoordinator:
         self._paused_seconds = 0.0
         self._release_started = None
         self.state = LINE_FOLLOWING
+        self._note_owner(LINE_OWNER, LINE_PRIORITY, now)
         self._restore_line_view(now, [] if errors is None else errors)
         return name
 

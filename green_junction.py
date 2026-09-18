@@ -2181,7 +2181,7 @@ class GreenJunctionTask:
            <我们走哪条路>"）。A15 的主判据，两边各一盏灯时也走这一条。
         2. 否则是**某一边的红灯**把那条路排除掉的（A16 的降级判据：绿灯只知道
            存在、某一边是红灯 → 走另一边）→ ``green_junction:red``，圈那盏红灯，
-           ``side`` 是**红灯**在哪条路（文案 "detects a red light » left way and
+           ``side`` 是**红灯**在哪条路（文案 "detects a red light on the left way and chooses
            right" 正是老师给的第二种样例）。
         3. 剩下的降级路径（绿灯没定位 / 两边都报绿灯 / ``fallback_color="green"``）
            仍然记成绿灯：判据本身就是"按绿灯走"，只是照片上圈不出具体哪一盏，

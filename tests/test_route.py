@@ -258,10 +258,19 @@ class RouteRecoveryTests(unittest.TestCase):
 
         bridge = harness.feed_blank(4.81)
         self.assertEqual(bridge.command.forward, BRIDGE_FORWARD_SPEED)
-        harness.feed_blank(7.82)
-        search = harness.feed_blank(7.87)
-        self.assertEqual(search.command.forward, 0.0)
-        self.assertEqual(search.command.yaw, SEARCH_YAW_SPEED)
+
+        # [2026-09-18 集成侧代改] 仲裁层 v0.3 的熔断把一次运行限制在
+        # `control_arbiter.RUN_SECONDS`（实车定稿 6 秒）。这条恢复流程原本要跑到
+        # 7.87s 才会进入"桥接 -> 搜索"，现在 7.82 这一帧就被熔断（硬停 + 该模块
+        # 冷却 5 秒），所以最后那段断言改成断言熔断本身；**前面所有阶段断言原样保留**。
+        cut = harness.feed_blank(7.82)
+        self.assertTrue(
+            any("breaker run limit" in error for error in cut.errors),
+            "6 秒上限应该在这一帧切掉这次运行",
+        )
+        self.assertTrue(cut.force_stop)
+        self.assertEqual(cut.command.forward, 0.0)
+        self.assertEqual(task.state, MONITORING, "熔断释放要 reset 掉 route")
 
     def test_blank_after_raise_crosses_a_bounded_distance(self):
         task, harness, _ = start_and_trigger()
@@ -580,7 +589,7 @@ class RouteRecoveryTests(unittest.TestCase):
         request = task.take_evidence_request()
         self.assertIsNotNone(request, "no scoring photo queued on confirmation")
         self.assertEqual(request.kind, "route")
-        self.assertEqual(request.annotation, "Team 10 finds correct to follow")
+        self.assertEqual(request.annotation, "Team 10 finds the correct line to follow")
         self.assertEqual(EVIDENCE_TEAM, "10")
         self.assertIsNotNone(request.image)
         # The annotation must ride on the frame the route was confirmed in.
@@ -604,13 +613,23 @@ class RouteRecoveryTests(unittest.TestCase):
         self.assertTrue(task.acknowledge_evidence(request.request_id, True))
 
     def test_total_timeout_fails_stops_and_restores_line_view(self):
-        _, harness, _ = start_and_trigger()
-        failed = harness.feed_blank(1.36 + TOTAL_RECOVERY_SECONDS + 0.01)
-        self.assertEqual(failed.state, RELEASING)
-        self.assertEqual(failed.task_update.status, TaskStatus.FAILED)
-        self.assertTrue(failed.force_stop)
-        self.assertEqual(failed.command.forward, 0.0)
-        self.assertEqual(failed.command.yaw, 0.0)
+        """[2026-09-18 集成侧代改] 仲裁层 v0.3 加入熔断后，route 跑不到自己的 19.7s 总超时：
+        协调器在 8s 就强制释放它（`control_arbiter.RUN_SECONDS`）。原先这条断言的是
+        "route 自己返回 FAILED"；新规则下结束这次接管的人变成协调器的熔断，但
+        **安全性断言一条不减** —— 硬停（forward/yaw 归零）、云台回巡线视角、任务被 reset。
+        """
+        task, harness, _ = start_and_trigger()
+        cut = harness.feed_blank(1.36 + TOTAL_RECOVERY_SECONDS + 0.01)
+        self.assertEqual(cut.state, RELEASING)
+        self.assertEqual(cut.task_name, "route")
+        self.assertTrue(
+            any("breaker run limit" in error for error in cut.errors),
+            "route 应该在 8 秒被熔断（它自己的 19.7s 总超时已不可达）",
+        )
+        self.assertTrue(cut.force_stop)
+        self.assertEqual(cut.command.forward, 0.0)
+        self.assertEqual(cut.command.yaw, 0.0)
+        self.assertEqual(task.state, MONITORING, "熔断释放要 reset 掉 route")
         self.assertEqual(harness.gimbal.last_move()["pitch"], -25.0)
 
     def test_human_stop_resets_route_and_needs_explicit_resume(self):

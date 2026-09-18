@@ -1331,7 +1331,7 @@ class SpeedRegressionTests(unittest.TestCase):
 class JunctionEvidenceTests(unittest.TestCase):
     """6.2 拥堵岔路的**得分截图**：老师后来明确要一张证据照片 ——
     用矩形框出**堵路的那台机器人**，写明堵在哪条路 + 我们选了哪条
-    （样例文字 `Team 10 detects traffic jam » left way and right`，我们队号 03；
+    （样例文字 `Team 10 detects traffic jam on the left way and chooses right`，我们队号 10；
     正确选择得 15 分）。
 
     这条链是 `take_evidence_request()` → 集成层画框写字存盘 → `acknowledge_evidence()`，
@@ -1348,7 +1348,7 @@ class JunctionEvidenceTests(unittest.TestCase):
         request = task.take_evidence_request()
         self.assertIsNotNone(request, "判出拥堵侧并选定分支那一刻应该排一张得分截图")
         self.assertEqual(
-            request.annotation, "Team 10 detects traffic jam » left way and right"
+            request.annotation, "Team 10 detects traffic jam on the left way and chooses right"
         )
         self.assertEqual(request.shape, "rect", "老师要求用矩形框出堵路的那台车")
         self.assertIsNotNone(request.image)
@@ -1374,7 +1374,7 @@ class JunctionEvidenceTests(unittest.TestCase):
         request = task.take_evidence_request()
         self.assertIsNotNone(request)
         self.assertEqual(
-            request.annotation, "Team 10 detects traffic jam » right way and left"
+            request.annotation, "Team 10 detects traffic jam on the right way and chooses left"
         )
         self.assertEqual(request.detection.box, task.last_blockage.right_box)
         self.assertGreater(box_iou(request.detection.box, CAR_RIGHT_BOX), 0.5)
@@ -1464,7 +1464,7 @@ class JunctionEvidenceTests(unittest.TestCase):
         self.assertIsNone(request.detection, "没有可用框就不许编坐标")
         self.assertIsNotNone(request.image)
         self.assertEqual(
-            request.annotation, "Team 10 detects traffic jam » left way and right"
+            request.annotation, "Team 10 detects traffic jam on the left way and chooses right"
         )
         self.assertIn("without a box", task.last_evidence_note)
         self.assertIn("no usable blockage frame", task.last_evidence_note)

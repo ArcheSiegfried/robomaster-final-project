@@ -31,7 +31,7 @@ from models import (
     VisualDetection,
 )
 from motion_output import MotionOutput
-from runtime import LINE_LOST, STOPPED, TRACKING, VIDEO_LOST, LineFollower
+from runtime import COASTING, LINE_LOST, STOPPED, TRACKING, VIDEO_LOST, LineFollower
 
 
 def config_with(**task_overrides) -> RuntimeConfig:
@@ -337,7 +337,12 @@ class CoordinatorTests(unittest.TestCase):
         self.assertGreater(len(harness.chassis.motion_calls), before)
         self.assertEqual(harness.owner, "line")
 
-    def test_release_timeout_leaves_the_robot_stopped(self):
+    def test_release_keeps_waiting_for_a_line_instead_of_giving_up(self):
+        """[2026-09-18 集成侧代改] 取消"等不到新鲜线就放弃 + 要求人工按 SPACE"。
+
+        旧断言：超过 `release_resume_timeout` 后转 `LINE_FOLLOWING` + `force_stop`（必须人工按键）。
+        新行为：一直停在 `RELEASING` 等下去（不发速度、不要求人工），**线一回来就自动恢复**。
+        """
         task = ScriptedTask(
             [running(MotionCommand(forward=0.1)), TaskUpdate(TaskStatus.COMPLETED)]
         )
@@ -345,12 +350,17 @@ class CoordinatorTests(unittest.TestCase):
         harness.start_line(now=1.0)
         harness.feed_line(1.10)
         before = len(harness.chassis.motion_calls)
-        decision = harness.feed_blank(1.50)
-        self.assertEqual(harness.state, LINE_FOLLOWING)
-        self.assertTrue(decision.force_stop)
+
+        waiting = harness.feed_blank(1.50)          # 远超 0.1s 的释放超时
+        self.assertEqual(harness.state, RELEASING, "不再放弃，继续等线")
+        self.assertFalse(waiting.force_stop, "不再要求人工复位")
         self.assertFalse(harness.follower.motion_enabled)
         harness.feed_blank(1.60)
-        self.assertEqual(len(harness.chassis.motion_calls), before)
+        self.assertEqual(len(harness.chassis.motion_calls), before, "等待期间不发速度")
+
+        resumed = harness.feed_line(1.70)           # 线一回来自动恢复，无需人工
+        self.assertEqual(resumed.state, LINE_FOLLOWING)
+        self.assertTrue(harness.follower.motion_enabled)
 
     # -- command safety envelope ---------------------------------------
     def test_task_command_is_clamped_to_config_limits(self):
@@ -425,13 +435,15 @@ class CoordinatorTests(unittest.TestCase):
         self.assertIsNone(harness.task_name)
         self.assertFalse(harness.chassis.motion_calls)
 
-    def test_task_can_take_over_after_a_line_lost_lock(self):
-        """WP6 needs to take over a line that the base already gave up on."""
+    def test_task_can_take_over_while_the_base_is_coasting_after_a_loss(self):
+        """[2026-09-18 集成侧代改] 取消丢线锁停后，底座丢线时保持 `COASTING`（不再 `LINE_LOST`）；
+        任务仍然可以从这个状态接管（WP6 依赖这一点）。"""
         task = NeverTask()
         harness = TaskHarness(task=task)
         harness.start_line(now=1.0)
-        harness.feed_blank(1.6)
-        self.assertEqual(harness.follower.state, LINE_LOST)
+        decision = harness.feed_blank(1.6)
+        self.assertEqual(harness.follower.state, COASTING)
+        self.assertFalse(decision.force_stop, "丢线不再锁停")
         self.assertTrue(harness.coordinator.takeover_allowed)
 
     # -- line faults during a takeover ---------------------------------

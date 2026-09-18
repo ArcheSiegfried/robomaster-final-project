@@ -84,13 +84,13 @@ TEAM_NUMBER = "10"
 #: **文案属于证据层**：5 个模块各写一套必然口径不一，分数就丢在这上面。
 #: `{side}` = 目标（灯/堵车）在哪条路；`{chosen}` = 我们选哪条路/绕哪边。
 ANNOTATION_TEMPLATES = {
-    "traffic_light:red": "Team {team} detects a red light and the robot stops",
+    "traffic_light:red": "Team {team} detects a red light and stops the robot",
     "traffic_light:green": "Team {team} detects a green light and continues",
-    "green_junction:green": "Team {team} detects a green light » {side} way and {chosen}",
-    "green_junction:red": "Team {team} detects a red light » {side} way and {chosen}",
-    "free_junction": "Team {team} detects traffic jam » {side} way and {chosen}",
-    "obstacle": "Team {team} detects obstacle » the {side} side",
-    "route": "Team {team} finds correct to follow",
+    "green_junction:green": "Team {team} detects a green light on the {side} way and chooses {chosen}",
+    "green_junction:red": "Team {team} detects a red light on the {side} way and chooses {chosen}",
+    "free_junction": "Team {team} detects traffic jam on the {side} way and chooses {chosen}",
+    "obstacle": "Team {team} detects an obstacle and chooses the {side} side",
+    "route": "Team {team} finds the correct line to follow",
 }
 
 #: 真实运行时默认的输出目录（相对仓库根目录；已在 .gitignore 里排除）。
@@ -315,8 +315,13 @@ def render_task_evidence(request):
         )
         x = max(0, min(width - text_width, int(anchor[0]) - text_width // 2))
         y = max(text_height, min(height - 4, int(anchor[1])))
+        # 黄字压在浅色地面/白墙上几乎看不清（老师要求"照片中能清楚看到"），
+        # 所以先画一层黑色描边再叠黄字：不依赖背景色都能看清。
         cv2.putText(
-            shown, text, (x, y), font, scale, (0, 255, 255), thickness
+            shown, text, (x, y), font, scale, (0, 0, 0), thickness + 3, cv2.LINE_AA
+        )
+        cv2.putText(
+            shown, text, (x, y), font, scale, (0, 255, 255), thickness, cv2.LINE_AA
         )
     return shown
 

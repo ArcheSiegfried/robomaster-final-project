@@ -93,7 +93,13 @@ class OfflineTests(unittest.TestCase):
         self.assertTrue(detection.valid)
         self.assertLess(abs(detection.error), 0.10)
 
-    def test_brief_loss_slows_and_times_out_without_search(self):
+    def test_brief_loss_slows_and_keeps_coasting_without_search(self):
+        """[2026-09-18 集成侧代改] 取消丢线锁停：丢线超时后不再停车，继续低速直行找线。
+
+        原断言是 `LINE_LOST` + `force_stop` + 零命令；现在状态保持 `COASTING`，
+        命令仍是滑行命令（forward 不超过 `lost_forward_speed`、yaw 已衰减到 0），
+        而且线一回来就立刻恢复跟踪。
+        """
         follower = LineFollower(CONFIG)
         follower.process_frame(line_frame(), 1.0)
         self.assertTrue(follower.resume(1.0))
@@ -106,13 +112,21 @@ class OfflineTests(unittest.TestCase):
         self.assertLessEqual(
             abs(missed.command.yaw), CONFIG.control.lost_max_yaw
         )
-        timed_out = follower.process_frame(
+        long_lost = follower.process_frame(
             blank_frame(),
             1.05 + CONFIG.control.lost_grace_seconds + 0.01,
         )
-        self.assertEqual(timed_out.state, LINE_LOST)
-        self.assertTrue(timed_out.force_stop)
-        self.assertEqual(timed_out.command, MotionCommand())
+        self.assertEqual(long_lost.state, COASTING, "丢线不再锁停")
+        self.assertFalse(long_lost.force_stop, "不再要求人工复位")
+        self.assertLessEqual(
+            long_lost.command.forward, CONFIG.control.lost_forward_speed
+        )
+        self.assertEqual(long_lost.command.yaw, 0.0, "宽限期后 yaw 衰减为 0：低速直行找线")
+
+        back = follower.process_frame(
+            line_frame(360), 1.05 + CONFIG.control.lost_grace_seconds + 0.06
+        )
+        self.assertEqual(back.state, TRACKING, "线一回来立刻恢复")
 
     def test_recovery_is_rate_limited(self):
         follower = LineFollower(CONFIG)
