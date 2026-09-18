@@ -686,9 +686,12 @@ class JunctionConfig:
     # --- 转向（见 A5、A8） ---
     forward_speed: float = 0.10      # 转向时的前进速度（m/s），0 表示原地转
     yaw_gain: float = 2.0            # 偏角(度) → yaw(deg/s) 的比例
-    max_turn_yaw: float = 75.0       # 转向 yaw 上限（deg/s）
-    turn_timeout: float = 3.5        # 转向阶段最长耗时
-    turn_min_duration: float = 0.40  # 至少转这么久再判断线是否回来
+    # A26：转速**压慢**。2026-09-18 实测：75°/s 时按估计角度一口气转过去，转过头
+    # 63° 直接偏出带子；同一模块由组员写的版本是"慢慢转、边转边重判"（会卡顿一下），
+    # 反而能成。所以这里把上限降到 25°/s，并把时间放宽，让"边转边看"有机会生效。
+    max_turn_yaw: float = 25.0       # 转向 yaw 上限（deg/s）
+    turn_timeout: float = 8.0        # 转向阶段最长耗时（慢转需要更久）
+    turn_min_duration: float = 0.25  # 至少转这么久再判断线是否回来
     settle_timeout: float = 3.0      # 对准之后往前开、把口子顶到车后的最长时间
     #: （0.10 m/s × 3 秒 ≈ 30 cm，够把一个岔路口开过去；过不去就明确失败）
     #: 转向时车头已经对准选中分支的角度门槛：岔路口上线回中央可能一直不成立

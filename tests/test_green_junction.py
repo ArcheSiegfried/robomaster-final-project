@@ -910,7 +910,8 @@ class StateMachineTests(unittest.TestCase):
         )
         now = self._advance_until(task, JunctionState.TURN)
         update = None
-        for index in range(20):
+        # A26 转速压到 25°/s 之后，累积到目标角度需要更多帧
+        for index in range(120):
             now += FRAME_DT
             update = task.step(
                 packet(blank_frame(), 40 + index, now), now, fake_line(error=0.9)
@@ -1844,7 +1845,7 @@ class OfflineDemoTests(unittest.TestCase):
                 "owner:external",
                 "task:running",
                 "branch:right",
-                "motion:yaw=59.9",
+                "motion:yaw=25.0",
                 "task:completed",
                 "owner:line",
                 "line:TRACKING",
