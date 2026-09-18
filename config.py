@@ -107,11 +107,19 @@ class RuntimeConfig:
     # 都在 0.1 秒内被视频间隔误判踢掉（见 coordinator.video_gap）。
     consumer_wait_timeout: float = 0.05
     # AP 模式日志还出现过 0.41s 和 0.50s 后自行恢复的孤立传输间隙。
-    # 旧运动命令仍会在 0.15s 后失效（见下面 command_timeout），因此 0.60s 的
-    # 视频锁停阈值不会让底盘带着旧命令穿过长间隙。
-    # 来源：王炜嘉在 fix/route-only-realtest 的实车测试（2026-09-15）——
-    # 原来的 0.22s 会把这类能自恢复的孤立间隙当成视频丢失，任务被误杀。
-    video_gap_stop_seconds: float = 0.60
+    # 旧运动命令仍会在 0.15s 后失效（见下面 command_timeout），因此放宽这个
+    # 锁停阈值**不会**让底盘带着旧命令穿过长间隙 —— 帧一停，底座每帧都在发
+    # 停车命令（runtime.process_video_gap 的 `waiting for a new camera frame`
+    # 分支也是 STOP_COMMAND），安全边界不靠这个阈值守。
+    #
+    # 2026-09-18 从 0.60 放宽到 1.50：实测 run_20260918_180937 里断流前帧间隔
+    # 逐渐从 31ms 涨到 78/94/110ms，然后**一次 1.141s 的停顿**直接触发
+    # VIDEO_LOST。它是锁存状态（SPACE 不恢复，日志 `Resume refused`），
+    # 现场只能手动重启 —— 用户连续 5 次"自动断开"就是这么来的。
+    # 1.50s 能容忍那种 1.1s 级别的抖动，又短于"真的断网"给人的反应时间。
+    # 原来的值：王炜嘉在 fix/route-only-realtest 的实车测试（2026-09-15），
+    # 当时 0.22s 会把能自恢复的孤立间隙当成视频丢失、任务被误杀。
+    video_gap_stop_seconds: float = 1.50
     command_timeout: float = 0.15
     resume_detection_max_age: float = 0.15
     gimbal_pitch: int = -25
