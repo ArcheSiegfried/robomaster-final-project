@@ -112,18 +112,26 @@ test_saved_old_tangent_rejects_old_line_and_accepts_perpendicular
 
 ```
 task_registry.py
+traffic_light.py
+coordinator.py                     # 仅注释更正（见下），无逻辑改动
 tests/test_task_registry_order.py
 tests/test_traffic_light.py
-traffic_light.py
+tests/test_fork_light_competition.py
 ```
+
+`coordinator.py` 只有一处**注释**改动：原来写"`traffic_light` 位置在注册表第 1 位"，
+本次重排后已不成立，改为说明"按 name 查找、与位次无关，且正因为如此否决权会把正在
+接管的岔路模块按停"。**代码逻辑一行未改**，可用
+`git diff integration -- coordinator.py` 核对只有 `#` 开头的行发生变化。
 
 以下文件经 git blob 哈希比对，与 `integration` **逐字节相同**：
 
-`coordinator.py`、`models.py`、`runtime.py`、`main.py`、`config.py`、
+`models.py`、`runtime.py`、`main.py`、`config.py`、
 `green_junction.py`、`obstacle.py`、`free_junction.py`、`route.py`、
 `number_marker.py`、`evidence.py`
 
-即：**公共文件一行未改，六个模块里只有 `traffic_light.py` 改了**（它正是出问题的那个）。
+即：公共文件里只有 `coordinator.py` 动了（且只有注释），六个模块里只有
+`traffic_light.py` 改了逻辑（它正是出问题的那个）。
 
 ## 5. 未验证事项（必须如实说明）
 
