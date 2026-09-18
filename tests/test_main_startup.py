@@ -203,38 +203,45 @@ class ConnectPreflightTests(unittest.TestCase):
         self.addCleanup(setattr, main, "_local_ap_address", original_local)
         self.addCleanup(setattr, main, "_robot_reachable", original_probe)
 
-    def test_unreachable_robot_prints_guidance_and_exits_cleanly(self):
+    def test_unreachable_robot_does_not_block_but_warns(self):
+        """**回归（我自己的错）**：探测探不通**不许拦住连接**。
+
+        我第一版把探测做成了硬闸门（探不通就 SystemExit）。结果探针自己写错三次
+        （先探 TCP、再写死绑 .23、又用错 send_self），每次都把"网络本来是好的"
+        报成"连不上"，白白让现场去查网络。教训：**诊断不能有能力阻止一次
+        本来能成功的连接**。所以现在探不通也要继续往下走，让 SDK 自己判。
+        """
         import main
 
-        self._patch(local="192.168.2.23", reachable=False)
-        module = types.SimpleNamespace(Robot=lambda: object())
+        self._patch(local="192.168.2.24", reachable=False)
+        built = object()
+        module = types.SimpleNamespace(Robot=lambda: built)
 
         printed = io.StringIO()
         with contextlib.redirect_stdout(printed):
-            with self.assertRaises(SystemExit) as caught:
-                main._connect_robot(module)
+            robot = main._connect_robot(module)
 
+        self.assertIs(robot, built, "探测失败也必须继续建立机器人对象")
         text = printed.getvalue()
-        self.assertEqual(caught.exception.code, 2)
-        self.assertIn("连不上机器人", text)
-        self.assertIn("192.168.2.1", text)
-        self.assertIn("RMEP", text, "要提示去连机器人的热点")
-        self.assertIn("ping", text, "要给一条能自己验证的命令")
-        self.assertIn("192.168.2.23", text, "要把本机实际地址打出来便于对照")
+        self.assertIn("192.168.2.24", text, "要把本机实际地址打出来")
+        self.assertIn("没有应答", text, "要如实说明探测没收到应答")
 
-    def test_missing_local_ap_address_is_called_out(self):
-        """本机没有 192.168.2.x 时要**明说**，这是最常见的现场原因。"""
+    def test_missing_local_ap_address_warns_but_still_connects(self):
+        """本机没有 192.168.2.x 时也只提示、不拦路。"""
         import main
 
         self._patch(local=None, reachable=False)
-        module = types.SimpleNamespace(Robot=lambda: object())
+        built = object()
+        module = types.SimpleNamespace(Robot=lambda: built)
 
         printed = io.StringIO()
         with contextlib.redirect_stdout(printed):
-            with self.assertRaises(SystemExit):
-                main._connect_robot(module)
+            robot = main._connect_robot(module)
 
-        self.assertIn("不在车的热点里", printed.getvalue())
+        self.assertIs(robot, built)
+        text = printed.getvalue()
+        self.assertIn("没有 192.168.2.x", text)
+        self.assertIn("仍然继续尝试连接", text)
 
     def test_reachable_robot_builds_the_object(self):
         import main
@@ -256,16 +263,64 @@ class ConnectPreflightTests(unittest.TestCase):
 
         我第一版用的是 `socket.create_connection`（TCP 80/20001），实车"已经
         连上热点"也报连不上。车的控制通道是 UDP，这条钉住不再犯。
+
+        **只看代码，不看注释/docstring** —— 函数说明里正当地解释了
+        "为什么不能用 send_self"，用整段源码做断言会把自己讲过的坑当成违规。
         """
+        import ast
         import inspect
+        import re
 
         import main
 
         source = inspect.getsource(main._robot_reachable)
-        self.assertIn("udp", source.lower(), "探针必须显式用 UDP")
-        self.assertNotIn("create_connection", source,
+        # 去掉 docstring 与注释再看代码：函数说明里正当地写了
+        # "为什么不能用 send_self"，用整段源码断言会把自己讲过的坑当成违规。
+        code = re.sub(r'"""(?:.|\n)*?"""', "", source)
+        code = re.sub(r"'''(?:.|\n)*?'''", "", code)
+        code = "\n".join(line.split("#", 1)[0] for line in code.splitlines())
+        self.assertIn("udp", code.lower(), "探针必须显式用 UDP")
+        self.assertNotIn("create_connection", code,
                          "create_connection 是 TCP —— 会误报连不上车")
+        self.assertNotIn("send_self", code,
+                         "send_self 发给本机自己，机器人收不到")
         self.assertEqual(main.ROBOT_AP_PORT, 20020)
+
+    def test_alignment_fixes_the_hardcoded_local_address(self):
+        """**回归**：SDK 把本机地址写死成 192.168.2.23，实际是别的值时连不上。
+
+        现场是 `.24`：`Connection.create()` 的 `bind(('192.168.2.23', 10100))`
+        直接抛 OSError → `_conn=None` → 连不上，最后只剩一条
+        `AttributeError: 'NoneType' object has no attribute 'is_alive'`。
+        这里验证会把它对齐到实际地址。
+        """
+        import main
+        import robomaster.config as sdk_config
+
+        original_setting = sdk_config.LOCAL_IP_STR
+        original_local = main._local_ap_address
+        main._local_ap_address = lambda *a, **k: "192.168.2.24"
+        sdk_config.LOCAL_IP_STR = None
+        self.addCleanup(setattr, main, "_local_ap_address", original_local)
+        self.addCleanup(setattr, sdk_config, "LOCAL_IP_STR", original_setting)
+
+        self.assertEqual(main._align_local_address(), "192.168.2.24")
+        self.assertEqual(sdk_config.LOCAL_IP_STR, "192.168.2.24")
+
+    def test_alignment_respects_an_explicit_setting(self):
+        """用户显式设过 LOCAL_IP_STR 就不许被覆盖。"""
+        import main
+        import robomaster.config as sdk_config
+
+        original_setting = sdk_config.LOCAL_IP_STR
+        original_local = main._local_ap_address
+        main._local_ap_address = lambda *a, **k: "192.168.2.99"
+        sdk_config.LOCAL_IP_STR = "192.168.2.50"
+        self.addCleanup(setattr, main, "_local_ap_address", original_local)
+        self.addCleanup(setattr, sdk_config, "LOCAL_IP_STR", original_setting)
+
+        self.assertEqual(main._align_local_address(), "192.168.2.50")
+        self.assertEqual(sdk_config.LOCAL_IP_STR, "192.168.2.50")
 
 
 class ConsoleTeeTests(unittest.TestCase):
