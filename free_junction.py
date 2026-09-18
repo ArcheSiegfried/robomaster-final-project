@@ -393,6 +393,19 @@ class FreeJunctionConfig:
     #:
     #: 想恢复旧行为：改回 `"sdk_or_vision"`。
     blockage_source: str = "vision"
+
+    #: **预约钩子总开关，默认关**（2026-09-18 真实 run 离线验证后决定）。
+    #:
+    #: `wants_control()` 让本模块能从 `obstacle` 手里接过岔路口（任务 5 的正确
+    #: 做法是"选另一条路"而不是"往旁边让"）。但用恢复回来的真实 run
+    #: （`captures/run_20260918_191329`，35 张关键帧）逐帧验证后发现
+    #: **拥堵判据在真实场地上没有特异性**：4 个被检出岔路的真实帧**全部**
+    #: 返回 `reading=blocked`（100% 误报），包括"相机低头看自己车体"和
+    #: "地上一个数字标识盒"这种明显不是岔路停车的画面。
+    #:
+    #: 放它出去会让本模块到处抢岔路、选错边 —— 正是用户抱怨的"冲进去"。
+    #: 所以默认关；等拥堵判据有真实正负样本标定之后再打开。
+    enable_reservation_hook: bool = False
     #: 官方读数的保鲜窗口（秒）：回调比这还旧就当作"这一帧没看到"。
     #: 宁可退回"没有判据"（不接管），也不拿一条过期读数决定往哪边拐。
     sdk_observation_hold_seconds: float = 0.35
@@ -2123,19 +2136,26 @@ class FreeJunctionTask:
 
         `obstacle` 把"分支上停着的车"当成路中间的障碍去**往旁边让**，
         结果**拐进了被堵的那条分支**；而正确做法是**选另一条路**（任务 5）。
-        两个模块都会对这种画面触发，但只有本模块会"选路"。
 
-        所以本模块走预约通道：**只要确认了岔路、且读到某条分支有车**，就声明
-        想要控制权，协调器会让它从 `obstacle` 手里接管（见
-        `coordinator._find_reserved_takeover`）。
+        ⚠️ **2026-09-18 默认关闭（`enable_reservation_hook=False`）** ——
+        用恢复回来的真实 run（`run_20260918_191329`，35 张关键帧）离线验证后
+        发现**拥堵判据在真实场地上没有特异性**：
 
-        惰性保证（用户要求"跑完全程为先"）：
-        * 没看到岔路 → False，完全不干预巡线也不影响 obstacle；
-        * 看到岔路但两条分支都没车 → False（交给巡线 / 别的模块）；
-        * 只在"岔路 + 有车"同时成立才出手，这正是任务 5 的场景。
+            4 个被检出岔路的真实帧，**全部**返回 reading=blocked（100% 误报）：
+              frame_001216_0040.19s  画面是车自己的云台/轮子（相机低头看自己）→ both
+              frame_001518_0050.23s  画面是地上一个数字标识盒                 → both
+              frame_000551_0018.05s  空岔路                                   → both
+              frame_000491_0016.05s  第一个岔路（绿灯场景）                    → left
+            而合成的"空岔路"帧（tests/test_free_junction.fork_frame）返回 False ——
+            说明这个判据只在自己的合成图上对得上。
+
+        放它出去会让本模块**到处抢岔路并选错边**，正是用户抱怨的"冲进去"。
+        所以默认关；等拥堵判据在真实场地上有正负样本标定之后再打开。
 
         **必须只读**：协调器每帧都会调用它。这里只调检测器，不改状态机。
         """
+        if not bool(getattr(self.settings, "enable_reservation_hook", False)):
+            return False
         try:
             analysis = self.detector.analyze(frame.image)
         except Exception:
