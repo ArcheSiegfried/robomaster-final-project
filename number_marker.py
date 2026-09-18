@@ -88,7 +88,7 @@ class NumberMarkerConfig:
     pitch_direction_sign: float = PITCH_FOLLOW_SIGN
     max_pitch_integration_dt: float = MAX_PITCH_INTEGRATION_DT
     max_evidence_attempts: int = 1
-    team_number: Optional[str] = "03"
+    team_number: Optional[str] = "10"
 
 
 @dataclass(frozen=True)

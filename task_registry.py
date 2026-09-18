@@ -26,7 +26,7 @@ from traffic_light import TrafficLightTask
 #   * **"总停车时钟"（`max_hold_seconds=15`）不被绿灯闪断重置** → 卡死最终一定 FAILED，
 #     不会像老版本那样无限锁停；
 #   * **绿灯从 IDLE 状态永不接管**（绿灯只用来"放行"，不抢正在开车的车）；
-#   * 顺带把红灯的得分截图接上了 evidence 通道（`Team 03 detects a red light and stops the robot`）。
+#   * 顺带把红灯的得分截图接上了 evidence 通道（`Team 10 detects a red light and stops the robot`）。
 # 位置放回第 1 位（红绿灯是安全项）。两个副作用都要知道：
 #   1. `coordinator.py` 的"红灯否决权"**重新生效**：任何任务在开车时遇到红灯都会被暂停
 #      （暂停时间不计入任务预算），红灯消失后原任务继续；

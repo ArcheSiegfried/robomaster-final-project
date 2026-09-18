@@ -27,7 +27,7 @@ from models import TaskStatus  # noqa: E402
 from tests.task_harness import TaskHarness  # noqa: E402
 from tests.test_green_junction import fork_scene  # noqa: E402
 
-TEAM = "03"
+TEAM = "10"
 
 
 def drive_until_choice(task, harness, chosen: Branch, lamp_x: float, frames: int = 120):

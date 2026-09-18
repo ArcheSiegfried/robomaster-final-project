@@ -146,7 +146,7 @@ LOCKED_TARGET_LOSS_SECONDS = 0.80
 # Scoring-photo config for 8.1 (recovery after a broken route).  The annotation
 # text comes from the evidence layer template ("route"); this module only hands
 # over the frame, the box and the team number.
-EVIDENCE_TEAM = "03"
+EVIDENCE_TEAM = "10"
 EVIDENCE_MAX_ATTEMPTS = 2
 EVIDENCE_EVENT = "route:recovered"
 

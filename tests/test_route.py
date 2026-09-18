@@ -580,8 +580,8 @@ class RouteRecoveryTests(unittest.TestCase):
         request = task.take_evidence_request()
         self.assertIsNotNone(request, "no scoring photo queued on confirmation")
         self.assertEqual(request.kind, "route")
-        self.assertEqual(request.annotation, "Team 03 finds correct to follow")
-        self.assertEqual(EVIDENCE_TEAM, "03")
+        self.assertEqual(request.annotation, "Team 10 finds correct to follow")
+        self.assertEqual(EVIDENCE_TEAM, "10")
         self.assertIsNotNone(request.image)
         # The annotation must ride on the frame the route was confirmed in.
         self.assertEqual(request.image.shape, near_route_frame().shape)

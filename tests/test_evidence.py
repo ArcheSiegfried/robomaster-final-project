@@ -306,7 +306,7 @@ class _FakeRequest:
     def __init__(
         self,
         image,
-        annotation="Team 03 detects a marker with ID of 2",
+        annotation="Team 10 detects a marker with ID of 2",
         request_id="marker:2:frame:7:attempt:1",
         marker_id="2",
         sequence=7,
@@ -389,7 +389,7 @@ class TaskEvidenceTests(unittest.TestCase):
         with recorder.log_path.open(encoding="utf-8-sig") as handle:
             notes = [row["note"] for row in csv.DictReader(handle)]
         self.assertTrue(
-            any("Team 03 detects a marker with ID of 2" in note for note in notes),
+            any("Team 10 detects a marker with ID of 2" in note for note in notes),
             f"说明文字要进日志，实际日志 {notes}",
         )
         summary = json.loads(
@@ -480,7 +480,7 @@ class RunReportTests(unittest.TestCase):
         for expected in (
             "得分截图",
             "task_2_000007",
-            "Team 03 detects a marker with ID of 2",
+            "Team 10 detects a marker with ID of 2",
             "number_marker",
             "COMPLETED",
             "step was slow",

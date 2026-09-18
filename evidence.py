@@ -38,7 +38,7 @@
 ----------------------------------------------
 Final 原文："The count of the saved images will be the final task score"，
 而且每张图必须带"检测框/圆 + 指定的一行说明文字"（例如
-`Team 03 detects a marker with ID of 2`）。所以**画框写字属于证据层**，
+`Team 10 detects a marker with ID of 2`）。所以**画框写字属于证据层**，
 成员模块只负责在得分那一刻把"哪一帧、框在哪、写什么字"交出来：
 
     request = task.take_evidence_request()              # 任务交出请求
@@ -78,7 +78,7 @@ from models import FramePacket
 KIND = "evidence"
 
 #: 我们队的编号。老师给的样例文字是 `Team 10 ...`，那是样例队号；我们按队号写 03。
-TEAM_NUMBER = "03"
+TEAM_NUMBER = "10"
 
 #: 老师后来明确的"证据照片"文案模板（2026-09-17 新增，见 `EVIDENCE_PHOTOS.md`）。
 #: **文案属于证据层**：5 个模块各写一套必然口径不一，分数就丢在这上面。

@@ -564,7 +564,7 @@ class FreeJunctionConfig:
     #: 与 `evidence.TEAM_NUMBER` 一致。文案模板在 `evidence.ANNOTATION_TEMPLATES`
     #: （`free_junction` → `Team {team} detects traffic jam » {side} way and {chosen}`），
     #: **不由本模块拼字符串**：五个模块各写一套必然口径不一，分数就丢在这上面。
-    team_number: str = "03"
+    team_number: str = "10"
     #: 写盘失败后的重试上限（沿用 evidence.py 的回执约定，和 traffic_light 同值）。
     max_evidence_attempts: int = 2
 
