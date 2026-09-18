@@ -59,12 +59,18 @@ class MainStartupTests(unittest.TestCase):
         robot_instance = _FakeRobot()
         previous = sys.modules.get("robomaster")
         _install_fake_sdk(robot_instance)
+        # 让网络预检通过，这样才会真的走到 SDK 的 initialize（本测试的意图是
+        # "提示打在碰硬件之前"，不是测网络）。真实机器上连不上时预检会先给诊断，
+        # 那条路径由 ConnectPreflightTests 单独覆盖。
+        original_probe = main._robot_reachable
+        main._robot_reachable = lambda *a, **k: True
         buffer = io.StringIO()
         try:
             with contextlib.redirect_stdout(buffer):
                 with self.assertRaises(RuntimeError):
                     main.main()
         finally:
+            main._robot_reachable = original_probe
             if previous is not None:
                 sys.modules["robomaster"] = previous
             else:
@@ -168,6 +174,54 @@ class RuntimeDiagnosticsTests(unittest.TestCase):
         text = self._report(recorder)
         self.assertIn("数字标识", text)
         self.assertIn("没有建立", text)
+
+
+class ConnectPreflightTests(unittest.TestCase):
+    """连不上车时必须给**能照着做的**诊断，而不是 SDK 内部的 traceback。
+
+    2026-09-18 现场被误导过一次：真正原因是没连上车的热点，屏幕上却只有
+    `Exception ignored in: <function Client.__del__ ...>
+     AttributeError: 'NoneType' object has no attribute 'is_alive'`
+    —— 那条来自 SDK 的 `Client.__del__ → stop()`（建连接失败时 `_thread` 仍是
+    None），它会**盖住真正的原因**。所以现在在调 SDK 之前先探一次网络。
+    """
+
+    def test_unreachable_robot_prints_guidance_and_exits_cleanly(self):
+        import main
+
+        module = types.SimpleNamespace(Robot=lambda: object())
+        original = main._robot_reachable
+        main._robot_reachable = lambda *a, **k: False
+        self.addCleanup(setattr, main, "_robot_reachable", original)
+
+        printed = io.StringIO()
+        with contextlib.redirect_stdout(printed):
+            with self.assertRaises(SystemExit) as caught:
+                main._connect_robot(module)
+
+        text = printed.getvalue()
+        self.assertEqual(caught.exception.code, 2)
+        self.assertIn("连不上机器人", text)
+        self.assertIn("192.168.2.1", text)
+        self.assertIn("RMEP", text, "要提示去连机器人的热点")
+        self.assertIn("ping", text, "要给一条能自己验证的命令")
+
+    def test_reachable_robot_builds_the_object(self):
+        import main
+
+        built = object()
+        module = types.SimpleNamespace(Robot=lambda: built)
+        original = main._robot_reachable
+        main._robot_reachable = lambda *a, **k: True
+        self.addCleanup(setattr, main, "_robot_reachable", original)
+
+        self.assertIs(main._connect_robot(module), built)
+
+    def test_the_probe_never_raises(self):
+        """探测本身绝不能抛异常（没网、DNS 挂了都只该返回 False）。"""
+        import main
+
+        self.assertIn(main._robot_reachable(timeout=0.05), (True, False))
 
 
 class ConsoleTeeTests(unittest.TestCase):

@@ -1,5 +1,6 @@
 """RoboMaster entry point. Importing this module never connects to hardware."""
 
+import socket
 import sys
 import time
 
@@ -577,6 +578,49 @@ def _align_camera(ep_robot, output, robot_module) -> None:
         raise RuntimeError("cannot confirm chassis stop after camera alignment")
 
 
+#: 机器人 AP 模式下的固定地址。
+ROBOT_AP_ADDRESS = "192.168.2.1"
+
+
+def _robot_reachable(address: str = ROBOT_AP_ADDRESS, timeout: float = 1.0) -> bool:
+    """能不能连上机器人的地址（默认 192.168.2.1:20001 之类由 SDK 自己谈）。
+
+    只做一次 TCP 连接尝试，用来在调 SDK 之前给出**可执行的**诊断。绝不抛异常。
+    """
+    for port in (80, 20001):
+        try:
+            with socket.create_connection((address, port), timeout=timeout):
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _connect_robot(robot_module):
+    """建立机器人对象，并在连不上时**给出能照着做的诊断**。
+
+    为什么要这一层：`robot.Robot()` 内部建连接失败时会把 `Client._conn` 置 None
+    但 `_thread` 仍是 None，于是解释器退出时 `Client.__del__ → stop()` 会抛
+    `AttributeError: 'NoneType' object has no attribute 'is_alive'` —— 那条
+    "Exception ignored in ..." 会**盖住真正的原因**，现场只看到一堆 SDK 内部栈。
+    2026-09-18 现场就是这么被误导的：真实原因是没连上车的热点。
+
+    这里在调 SDK 之前先探一次网络，连不上就直接把该查的东西打出来。绝不吞异常：
+    探测通过但 SDK 仍失败时，原样抛出，好让真正的错误可见。
+    """
+    if not _robot_reachable():
+        print(
+            "[main] 连不上机器人 %s —— 没有开始连接 SDK。\n"
+            "[main]   1) 车是否开机、是否已连上它的热点（SSID 形如 RMEP-XXXX）？\n"
+            "[main]   2) 自检：ipconfig 里应出现 192.168.2.x；ping 192.168.2.1 应该通。\n"
+            "[main]   3) 换了网络/Wi-Fi 后要重新连回车的热点。"
+            % ROBOT_AP_ADDRESS,
+            flush=True,
+        )
+        raise SystemExit(2)
+    return robot_module.Robot()
+
+
 def main(
     motion_task_names=None,
     marker_subscription=True,
@@ -588,7 +632,7 @@ def main(
     # Keeping this import inside main makes every offline import hardware-safe.
     from robomaster import camera, robot
 
-    ep_robot = robot.Robot()
+    ep_robot = _connect_robot(robot)
     source = None
     output = None
     gimbal_output = None
