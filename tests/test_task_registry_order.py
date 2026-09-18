@@ -1,9 +1,11 @@
 """注册表顺序 = 撞车时的裁判顺序。这里把它钉死，改顺序必须先看见这条红。
 
-2026-09-18：按**期末考场场景顺序**重排（用户批准）。依据是决赛要求 PDF
-（16-Final_Project_Requirements v8）第 41 页的六项现场任务顺序，以及"第一个岔路口
-是左红右绿"这个现场事实：`traffic_light` 只认颜色不认位置，排第 1 时红灯 2 帧就原地
-锁停，会把 `green_junction` 的选路权整个吃掉（15 分），所以岔路选路必须排在它前面。
+2026-09-18：按**期末考场场景顺序**重排（用户批准）。**这不是 PDF 的任务编号顺序**：
+决赛要求 PDF（16-Final_Project_Requirements v8）第 41 页是按 1 标识 → 2 断线 →
+3 绕障 → 4 岔路选绿灯 → 5 岔路避拥堵 → 6 红灯停 逐条描述任务的，并没有规定接管优先级。
+本顺序来自用户给出的考场实际遭遇顺序，再叠加两条判断（断线恢复是"线消失"才触发的
+独立场景、优先级高于"选路"；标识只拍照不动作、排最后）。另外"第一个岔路口是左红右绿"
+这个现场事实要求岔路选路排在 `traffic_light` 前面。
 新顺序：green_junction → obstacle → free_junction → route → traffic_light → number_marker。
 `traffic_light` 移位**不影响红灯停车**：`coordinator.py` 的红灯否决权按 name 查找，
 与位次无关（见 `test_red_light_veto_has_a_module_to_ask`）。
@@ -42,13 +44,14 @@ class RegistryOrderTests(unittest.TestCase):
     def test_green_junction_is_first(self):
         """岔路选路排第 1：考场第一岔路是左红右绿，选路权必须先给岔路模块。
 
-        **注意这条只保证"岔路排在第一位被询问"，不保证锁停问题已解决。**
-        实测（合成 Y 形岔路 + 左红右绿 + 真协调器，600 帧）：`traffic_light`
-        只要 2 帧红灯就接管（`red_confirm_frames=2`），而 `green_junction`
-        要 3 帧才确认岔路，所以灯模块仍然赢下这场赛跑；随后 `coordinator.py`
-        的红灯否决权（`_step_active` 里先问红灯、否决时**不调用**当前任务的
-        `step()`）会把岔路模块按停 —— 实测 599/600 帧零指令。
-        排序对这件事**无能为力**，真正的修复要在灯模块/否决权那一层做。
+        注意这条只保证"岔路排在第一位被询问"。它**不是**岔路锁停问题的修复：
+        修复在同分支的 `traffic_light.py`（红绿同框闸门 `fork_light_competition`）。
+        修复前的实测（合成 Y 形岔路 + 左红右绿 + 真协调器，600 帧）：`traffic_light`
+        只要 2 帧红灯就接管（`red_confirm_frames=2`），而 `green_junction` 要 3 帧
+        才确认岔路，灯模块赢下赛跑后，`coordinator.py` 的红灯否决权（否决时
+        **不调用**当前任务的 `step()`）把岔路模块按成 599/600 帧零指令。
+        加上闸门后同一场景为 4/600，覆盖测试见
+        `tests/test_fork_light_competition.py`。
         """
         names = [cls.name for cls in task_registry.MOTION_TASK_CLASSES]
         self.assertEqual(names.index("green_junction"), 0)

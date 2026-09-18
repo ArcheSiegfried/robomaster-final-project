@@ -273,7 +273,7 @@ class TrafficLightDetector:
             # 红绿同框 = 岔路口的"左红右绿"（赛题 4），不是"自选地点的红灯停"
             # （赛题 6，那里只有一盏灯）。两盏同时可见时我们**不报**其中任何一盏：
             # 只认颜色不认位置的读数在岔路口必然把车按停（实测 599/600 帧零指令，
-            # 见 tests/test_red_light_veto.py 的 fork 用例），而"往绿灯那边走"的
+            # 见 tests/test_fork_light_competition.py 的 fork 用例），而"往绿灯那边走"的
             # 判据归 green_junction（它的 LampSpotter 会同时报出两盏和各自在哪边）。
             # 关掉 fork_light_competition 就退回旧的"红优先"行为。
             if s.fork_light_competition:
