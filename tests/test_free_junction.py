@@ -179,6 +179,64 @@ class ColorlessCarTests(unittest.TestCase):
         reading = self.reading(image)
         self.assertEqual(reading.reading, BLOCKAGE_NONE, reading.describe())
 
+    def test_a_one_frame_criterion_flicker_does_not_kill_the_decision(self):
+        """判据闪断一两帧不能把整个岔路判死（2026-09-18 run_121100 的教训）。
+
+        那次接管后 0.2~0.3 s 读数从"有车"闪成"没车"，旧版 0.25 s 超时立刻 FAILED，
+        整条岔路白跑；现在 `decide_hold_seconds` 内还能用最近一条可用读数继续判。
+        """
+        task = FreeJunctionTask()
+        good = fork_frame()
+        draw_dark_car(good, DARK_CAR_LEFT_BOX)
+        blank = fork_frame()
+        now = 1.0
+        for index in range(8):                       # 先让判据成立、接管
+            task.step(FramePacket(good, index + 1, now), now)
+            now += 0.05
+        self.assertTrue(task.active, "应该已经接管")
+        # 闪断：两帧读不到车，然后恢复
+        for index, image in enumerate([blank, blank, good, blank, good]):
+            update = task.step(FramePacket(image, 100 + index, now), now)
+            now += 0.05
+            self.assertIsNot(update.status, TaskStatus.FAILED,
+                             "闪断不该判失败：%s" % update.message)
+        # 继续走完（APPROACH/TURN/EXIT 需要时间）
+        for index in range(120):
+            update = task.step(FramePacket(good, 200 + index, now), now)
+            now += 0.05
+            if update.status in (TaskStatus.COMPLETED, TaskStatus.FAILED):
+                break
+        self.assertIs(update.status, TaskStatus.COMPLETED,
+                      "闪断之后应该照常完成：%s" % update.message)
+        self.assertIs(task.chosen_branch, Branch.RIGHT)
+
+    def test_a_vanishing_criterion_does_not_fail_the_task(self):
+        """接管后判据立刻消失：**不能 FAILED**，要用刚才那条可用读数继续走。
+
+        这就是 run_121100 的现场：接管后 0.2~0.3 s 读数从"有车"闪成"没车"，
+        旧版 0.25 s 超时立刻 FAILED（报告里 `criterion unavailable: no vehicle on
+        either branch`），整个岔路白跑。现在 `decide_hold_seconds` 内的可用读数
+        会直接把决策推进到 APPROACH，所以任务继续往下走。
+        """
+        task = FreeJunctionTask()
+        good = fork_frame()
+        draw_dark_car(good, DARK_CAR_LEFT_BOX)
+        blank = fork_frame()
+        now = 1.0
+        for index in range(8):
+            task.step(FramePacket(good, index + 1, now), now)
+            now += 0.05
+        self.assertTrue(task.active, "应该已经接管")
+        for index in range(12):                      # 判据一直读不到
+            update = task.step(FramePacket(blank, 100 + index, now), now)
+            now += 0.05
+            self.assertIsNot(update.status, TaskStatus.FAILED,
+                             "判据闪断不该判失败：%s" % update.message)
+        self.assertIsNot(task.state, JunctionState.FAILED)
+        # 软失败的兜底（判据在窗口内始终读不到才走）也要留着：冷却比硬失败短
+        settings = FreeJunctionConfig()
+        self.assertLess(settings.soft_rearm_cooldown, settings.rearm_cooldown)
+
     def test_the_colorless_path_can_be_switched_off(self):
         """`occluder_enabled=False` 时行为回到"只认颜色"（旧场地口径，便于对比）。"""
         settings = dataclasses.replace(FreeJunctionConfig(), occluder_enabled=False)
@@ -214,19 +272,30 @@ class ColorlessCarTests(unittest.TestCase):
                          "官方说左边有车，框小也必须采信：%s" % reading.describe())
         self.assertEqual(reading.source, "sdk")
 
-    def test_a_dark_floor_scene_is_documented_not_guessed(self):
-        """深色地面（合成 V=70）下固定阈值会失灵 —— 这里把**已知边界**锁住。
+    def test_the_darkness_rule_and_its_measured_boundary(self):
+        """亮度口径的**实测结论**锁在这里（换场地时照这条改）。
 
-        不是为了让它"通过"，而是为了让"换到深色地面要重标定"这件事在测试里可见：
-        真到那种场地，正解是让集成层把官方 robot 识别接上（`blockage_source="sdk"`），
-        而不是继续用画面判据猜。
+        * 绝对阈值 `V<=90`（``occluder_dark_mode="fixed"``）是 126 帧 A/B 里唯一
+          三条目标帧都不误判空侧的口径 —— 浅灰地面（考试场地）下车比地面暗得多，
+          固定阈值反而最稳；
+        * 试过的两种"自适应/相对"口径都**更差**：相对口径（块内亮度 vs 判据带 p60）
+          因为判据带里暗背景多、p60 被拉低，车和背景连片 → 三条目标帧**全漏**；
+          自适应口径（p60 - 40）在深色地面上会误判空侧。
         """
         settings = FreeJunctionConfig()
+        self.assertEqual(settings.occluder_dark_mode, "fixed",
+                         "相对/自适应口径实测更差，默认保持固定阈值")
         self.assertEqual(settings.blockage_source, "sdk_or_vision",
                          "默认必须官方优先 —— 换场地时靠它兜底")
         self.assertTrue(settings.occluder_enabled)
-        self.assertEqual(settings.occluder_dark_mode, "fixed",
-                         "自适应阈值实测会在深色地面上误判空侧（124 帧 A/B）")
+        # 1 米外实测深色占比 0.349，门槛不能高过它（否则 1 米外的车整辆被挡掉）
+        self.assertGreaterEqual(settings.occluder_dark_min_ratio, 0.25)
+        self.assertLessEqual(settings.occluder_dark_min_ratio, 0.40)
+        # 连拍两帧一样的读数才算数（压住单帧误报；A/B 里那 1 帧危险就靠它兜）
+        self.assertGreaterEqual(settings.blockage_confirm_frames, 2)
+        # 判据一时读不到 → 软失败 + 短冷却，别把整个岔路错过
+        self.assertLess(settings.soft_rearm_cooldown, settings.rearm_cooldown)
+        self.assertGreater(settings.decide_hold_seconds, 0.0)
 
 
 #: **1 米以外**的车（考试规范：障碍车停在岔路口外约 1 米）。按几何推算，
