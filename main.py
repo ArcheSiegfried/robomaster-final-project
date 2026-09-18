@@ -3,6 +3,7 @@
 import socket
 import sys
 import time
+from typing import Optional
 
 import cv2
 
@@ -578,43 +579,84 @@ def _align_camera(ep_robot, output, robot_module) -> None:
         raise RuntimeError("cannot confirm chassis stop after camera alignment")
 
 
-#: 机器人 AP 模式下的固定地址。
+#: 机器人 AP 模式下的固定地址（与 SDK 的 config 一致）。
 ROBOT_AP_ADDRESS = "192.168.2.1"
+#: SDK 的 UDP 控制端口。**注意不是 TCP** —— 车不会应答 TCP，
+#: 我第一版探的就是 TCP，结果"连上了也报连不上"，是误报。
+ROBOT_AP_PORT = 20020
+#: SDK 期望本机在热点里拿到的地址（`sock.bind` 用的就是它）。
+ROBOT_AP_LOCAL_ADDRESS = "192.168.2.23"
 
 
-def _robot_reachable(address: str = ROBOT_AP_ADDRESS, timeout: float = 1.0) -> bool:
-    """能不能连上机器人的地址（默认 192.168.2.1:20001 之类由 SDK 自己谈）。
+def _local_ap_address() -> Optional[str]:
+    """本机有没有 192.168.2.x 地址（= 连上了机器人的热点）。取不到返回 None。"""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+            probe.settimeout(0.5)
+            probe.connect((ROBOT_AP_ADDRESS, ROBOT_AP_PORT))
+            address = probe.getsockname()[0]
+    except Exception:
+        return None
+    return address if address.startswith("192.168.2.") else None
 
-    只做一次 TCP 连接尝试，用来在调 SDK 之前给出**可执行的**诊断。绝不抛异常。
+
+def _robot_reachable(
+    address: str = ROBOT_AP_ADDRESS,
+    port: int = ROBOT_AP_PORT,
+    timeout: float = 1.5,
+) -> bool:
+    """机器人应不应答（走 SDK **同一条** UDP 路）。
+
+    复刻 SDK 的握手：把本机绑到 `192.168.2.23:10100`（SDK 就是这么绑的），
+    发一条 `ProtoGetVersion` 到 `192.168.2.1:20020`，等一个回复。
+    连不上、绑不上、超时都只返回 False，**绝不抛异常**。
+
+    为什么不用 TCP：车的控制通道是 UDP，TCP 探测必然超时 → 误报"连不上"。
     """
-    for port in (80, 20001):
+    connection = None
+    try:
+        from robomaster import conn, protocol
+
+        connection = conn.Connection(
+            (ROBOT_AP_LOCAL_ADDRESS, 10100), (address, port), protocol="udp"
+        )
+        connection.create()
+        message = protocol.Msg(0x0B, 0x0B, protocol.ProtoGetVersion())
+        connection.send_self(message.pack())
+        connection._sock.settimeout(timeout)
+        return connection.recv() is not None
+    except Exception:
+        return False
+    finally:
         try:
-            with socket.create_connection((address, port), timeout=timeout):
-                return True
+            if connection is not None:
+                connection.close()
         except Exception:
-            continue
-    return False
+            pass
 
 
 def _connect_robot(robot_module):
     """建立机器人对象，并在连不上时**给出能照着做的诊断**。
 
-    为什么要这一层：`robot.Robot()` 内部建连接失败时会把 `Client._conn` 置 None
+    为什么要有这一层：`robot.Robot()` 内部建连接失败时会把 `Client._conn` 置 None
     但 `_thread` 仍是 None，于是解释器退出时 `Client.__del__ → stop()` 会抛
     `AttributeError: 'NoneType' object has no attribute 'is_alive'` —— 那条
     "Exception ignored in ..." 会**盖住真正的原因**，现场只看到一堆 SDK 内部栈。
     2026-09-18 现场就是这么被误导的：真实原因是没连上车的热点。
 
-    这里在调 SDK 之前先探一次网络，连不上就直接把该查的东西打出来。绝不吞异常：
-    探测通过但 SDK 仍失败时，原样抛出，好让真正的错误可见。
+    这里在调 SDK 之前先探一次（UDP，与 SDK 同路），连不上就把该查的打出来。
+    绝不吞异常：探测通过但 SDK 仍失败时原样抛出，好让真正的错误可见。
     """
-    if not _robot_reachable():
+    local = _local_ap_address()
+    if local is None or not _robot_reachable():
         print(
-            "[main] 连不上机器人 %s —— 没有开始连接 SDK。\n"
+            "[main] 连不上机器人 %s:%d —— 没有开始连接 SDK。\n"
+            "[main]   本机 192.168.2.x 地址：%s\n"
             "[main]   1) 车是否开机、是否已连上它的热点（SSID 形如 RMEP-XXXX）？\n"
             "[main]   2) 自检：ipconfig 里应出现 192.168.2.x；ping 192.168.2.1 应该通。\n"
             "[main]   3) 换了网络/Wi-Fi 后要重新连回车的热点。"
-            % ROBOT_AP_ADDRESS,
+            % (ROBOT_AP_ADDRESS, ROBOT_AP_PORT,
+               local or "（没有 —— 说明本机不在车的热点里）"),
             flush=True,
         )
         raise SystemExit(2)

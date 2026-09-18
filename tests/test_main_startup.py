@@ -62,7 +62,9 @@ class MainStartupTests(unittest.TestCase):
         # 让网络预检通过，这样才会真的走到 SDK 的 initialize（本测试的意图是
         # "提示打在碰硬件之前"，不是测网络）。真实机器上连不上时预检会先给诊断，
         # 那条路径由 ConnectPreflightTests 单独覆盖。
+        original_local = main._local_ap_address
         original_probe = main._robot_reachable
+        main._local_ap_address = lambda *a, **k: "192.168.2.23"
         main._robot_reachable = lambda *a, **k: True
         buffer = io.StringIO()
         try:
@@ -70,6 +72,7 @@ class MainStartupTests(unittest.TestCase):
                 with self.assertRaises(RuntimeError):
                     main.main()
         finally:
+            main._local_ap_address = original_local
             main._robot_reachable = original_probe
             if previous is not None:
                 sys.modules["robomaster"] = previous
@@ -183,16 +186,28 @@ class ConnectPreflightTests(unittest.TestCase):
     `Exception ignored in: <function Client.__del__ ...>
      AttributeError: 'NoneType' object has no attribute 'is_alive'`
     —— 那条来自 SDK 的 `Client.__del__ → stop()`（建连接失败时 `_thread` 仍是
-    None），它会**盖住真正的原因**。所以现在在调 SDK 之前先探一次网络。
+    None），它会**盖住真正的原因**。所以现在在调 SDK 之前先探一次。
+
+    ⚠️ 另一条教训：探针**必须走 UDP 20020**。我第一版探 TCP 80/20001，
+    结果"已经连上车了也报连不上"—— 车的控制通道是 UDP，TCP 必然超时。
+    `test_the_probe_uses_udp_not_tcp` 就是钉住这一点的。
     """
+
+    def _patch(self, local="192.168.2.23", reachable=True):
+        import main
+
+        original_local = main._local_ap_address
+        original_probe = main._robot_reachable
+        main._local_ap_address = lambda *a, **k: local
+        main._robot_reachable = lambda *a, **k: reachable
+        self.addCleanup(setattr, main, "_local_ap_address", original_local)
+        self.addCleanup(setattr, main, "_robot_reachable", original_probe)
 
     def test_unreachable_robot_prints_guidance_and_exits_cleanly(self):
         import main
 
+        self._patch(local="192.168.2.23", reachable=False)
         module = types.SimpleNamespace(Robot=lambda: object())
-        original = main._robot_reachable
-        main._robot_reachable = lambda *a, **k: False
-        self.addCleanup(setattr, main, "_robot_reachable", original)
 
         printed = io.StringIO()
         with contextlib.redirect_stdout(printed):
@@ -205,23 +220,52 @@ class ConnectPreflightTests(unittest.TestCase):
         self.assertIn("192.168.2.1", text)
         self.assertIn("RMEP", text, "要提示去连机器人的热点")
         self.assertIn("ping", text, "要给一条能自己验证的命令")
+        self.assertIn("192.168.2.23", text, "要把本机实际地址打出来便于对照")
+
+    def test_missing_local_ap_address_is_called_out(self):
+        """本机没有 192.168.2.x 时要**明说**，这是最常见的现场原因。"""
+        import main
+
+        self._patch(local=None, reachable=False)
+        module = types.SimpleNamespace(Robot=lambda: object())
+
+        printed = io.StringIO()
+        with contextlib.redirect_stdout(printed):
+            with self.assertRaises(SystemExit):
+                main._connect_robot(module)
+
+        self.assertIn("不在车的热点里", printed.getvalue())
 
     def test_reachable_robot_builds_the_object(self):
         import main
 
+        self._patch(local="192.168.2.23", reachable=True)
         built = object()
         module = types.SimpleNamespace(Robot=lambda: built)
-        original = main._robot_reachable
-        main._robot_reachable = lambda *a, **k: True
-        self.addCleanup(setattr, main, "_robot_reachable", original)
-
         self.assertIs(main._connect_robot(module), built)
 
     def test_the_probe_never_raises(self):
-        """探测本身绝不能抛异常（没网、DNS 挂了都只该返回 False）。"""
+        """探测本身绝不能抛异常（没网、SDK 不在、绑不上端口都只该返回 False）。"""
         import main
 
         self.assertIn(main._robot_reachable(timeout=0.05), (True, False))
+        self.assertIsInstance(main._local_ap_address(), (str, type(None)))
+
+    def test_the_probe_uses_udp_not_tcp(self):
+        """**回归**：探针必须走 UDP 20020，不能退回 TCP。
+
+        我第一版用的是 `socket.create_connection`（TCP 80/20001），实车"已经
+        连上热点"也报连不上。车的控制通道是 UDP，这条钉住不再犯。
+        """
+        import inspect
+
+        import main
+
+        source = inspect.getsource(main._robot_reachable)
+        self.assertIn("udp", source.lower(), "探针必须显式用 UDP")
+        self.assertNotIn("create_connection", source,
+                         "create_connection 是 TCP —— 会误报连不上车")
+        self.assertEqual(main.ROBOT_AP_PORT, 20020)
 
 
 class ConsoleTeeTests(unittest.TestCase):
