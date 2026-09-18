@@ -139,6 +139,69 @@ def draw_dark_car(image, box):
     cv2.rectangle(image, (x0, y0), (x1, y1), CAR_BODY, -1)
 
 
+class ExamObstacleTests(unittest.TestCase):
+    """**考试摆法**回归：关机/只剩底盘的 EP 停在岔路蓝线上、离岔路口约 1 米。
+
+    用户 2026-09-18 更正：不是"车身上有蓝线"，而是**车停在蓝线上**；
+    而且障碍车**不一定开机、不一定有视觉标签**，甚至可能只剩底盘（云台顶缺失）。
+    所以官方 SDK 可能一次都认不出来（练习场地 `robots_in_snapshot 0` 就是这么回事），
+    判据必须能只靠"一个压在蓝线上的深色物体"成立 —— 这一组用例锁住这件事，
+    并且**不许**依赖练习场地量出来的固定亮度/颜色。
+    """
+
+    def reading(self, image, settings=None):
+        task = FreeJunctionTask(settings) if settings is not None else FreeJunctionTask()
+        fork, _roi, _line, rect = task.detector.analyze(image)
+        self.assertTrue(fork.valid, "这一帧应该能判出岔路")
+        return task._read_blockage(fork, image, rect, 1.0)
+
+    def test_powered_off_chassis_on_the_tape_is_seen_on_any_floor(self):
+        """同一个障碍物、三种地面亮度（很亮的浅灰 / 浅灰 / 深色）都必须认出来。"""
+        for floor in (235, 210, 120):
+            image = fork_frame(floor=floor)
+            draw_powered_off_obstacle(image, EXAM_OBSTACLE_LEFT)
+            reading = self.reading(image)
+            self.assertEqual(reading.reading, BLOCKAGE_LEFT,
+                             "地面亮度 %d 时漏检：%s" % (floor, reading.describe()))
+            self.assertIsNotNone(reading.left_box)
+
+    def test_a_bare_chassis_without_visible_tracks_is_still_seen(self):
+        """连履带都不明显、只有一块深色底盘 → 也要认（顶部缺失/低视角的情形）。"""
+        image = fork_frame(floor=235)
+        draw_powered_off_obstacle(image, EXAM_OBSTACLE_LEFT, wheels=False)
+        self.assertEqual(self.reading(image).reading, BLOCKAGE_LEFT)
+
+    def test_the_obstacle_is_seen_across_the_exam_distance_range(self):
+        """考试距离 0.9~1.1 米，判据的有效范围实测到约 1.3 米（更远就超出设计范围）。"""
+        for label, box in (
+            ("约 1.0 米", (190, 188, 280, 233)),
+            ("约 1.1 米", (195, 190, 275, 230)),
+            ("约 1.3 米", EXAM_OBSTACLE_FAR_LEFT),
+        ):
+            image = fork_frame(floor=235)
+            draw_powered_off_obstacle(image, box)
+            self.assertEqual(self.reading(image).reading, BLOCKAGE_LEFT,
+                             "%s 的车漏检了" % label)
+
+    def test_the_side_is_reported_correctly_and_empty_junctions_are_quiet(self):
+        right = fork_frame(floor=235)
+        draw_powered_off_obstacle(right, EXAM_OBSTACLE_RIGHT)
+        self.assertEqual(self.reading(right).reading, BLOCKAGE_RIGHT)
+        empty = fork_frame(floor=235)
+        self.assertEqual(self.reading(empty).reading, BLOCKAGE_NONE,
+                         "空岔路不该报拥堵")
+
+    def test_the_official_sdk_reading_still_wins_when_it_exists(self):
+        """障碍车万一被官方识别认出来（开机/带视觉标签），官方读数优先、且不看尺寸。"""
+        task = FreeJunctionTask()
+        image = fork_frame(floor=235)
+        task.update_robot_observations([(0.22, 0.45, 0.10, 0.06)], observed_at=1.0)
+        fork, _roi, _line, rect = task.detector.analyze(image)
+        reading = task._read_blockage(fork, image, rect, 1.0)
+        self.assertEqual(reading.reading, BLOCKAGE_LEFT)
+        self.assertEqual(reading.source, "sdk")
+
+
 class ColorlessCarTests(unittest.TestCase):
     """2026-09-18 新场地：停着的车**完全没有彩色装甲**，只能靠"深色块挡在胶带前"认出来。
 
@@ -335,6 +398,33 @@ def draw_far_car(image, box):
     """画一辆"停在约 1 米外、没有彩色装甲"的车（比近处那辆小一半左右）。"""
     x0, y0, x1, y1 = box
     cv2.rectangle(image, (x0, y0), (x1, y1), CAR_BODY, -1)
+
+
+#: 考试摆法（用户 2026-09-18 明确）：障碍物是 RoboMaster EP，**关机也可能**、
+#: 甚至**只剩底盘**（云台顶缺失），**停在岔路的蓝线上**、离岔路口 **0.9~1.1 米**。
+#: 尺寸按 1 米外 EP 底盘（约 30cm 宽）折算：约 90x45 像素。
+EXAM_OBSTACLE_LEFT = (190, 188, 280, 233)
+EXAM_OBSTACLE_RIGHT = (360, 188, 450, 233)
+#: 更远一点的同一辆车（约 1.3 米）—— 用来记录判据的有效距离范围。
+EXAM_OBSTACLE_FAR_LEFT = (200, 192, 270, 227)
+
+
+def draw_powered_off_obstacle(image, box, wheels=True):
+    """画一辆**关机、没有灯、没有云台顶**的 EP：只有深灰底盘（+ 两条更黑的履带）。
+
+    这就是考试现场可能的样子：没有高饱和彩色装甲（灯没亮）、顶部缺失、可能没通电。
+    所以判据只能靠"**一个压在蓝线上的深色物体**"这个与外观无关的特征。
+    """
+    x0, y0, x1, y1 = box
+    cv2.rectangle(image, (x0, y0), (x1, y1), (72, 72, 72), -1)          # 深灰底盘
+    height = y1 - y0
+    width = x1 - x0
+    if wheels:
+        wheel_w = max(4, width // 6)
+        cv2.rectangle(image, (x0 + 2, y0 + height // 2), (x0 + 2 + wheel_w, y1 - 2),
+                      (28, 28, 28), -1)
+        cv2.rectangle(image, (x1 - 2 - wheel_w, y0 + height // 2), (x1 - 2, y1 - 2),
+                      (28, 28, 28), -1)
 
 
 def noise_split_frame():
